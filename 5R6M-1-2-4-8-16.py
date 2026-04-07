@@ -2154,21 +2154,6 @@ anexar_incremental_desde_bot = _anexar_incremental_desde_bot_CANON
 # === BLOQUE 7 — ORDEN DE REAL Y CONTROL DE TOKEN ===
 # === ORDEN DE REAL (handshake maestro→bot) ===
 ORDEN_DIR = "orden_real"
-MODO_PURIFICACION_REAL = True
-_PURIFICACION_REAL_LOG_TS = 0.0
-
-def _purificacion_real_activa() -> bool:
-    return bool(globals().get("MODO_PURIFICACION_REAL", False))
-
-def _log_purificacion_real(msg: str = "MODO PURIFICACION REAL ACTIVO · CAPA REAL DESACTIVADA POR BYPASS SEGURO", cooldown_s: float = 90.0):
-    global _PURIFICACION_REAL_LOG_TS
-    try:
-        now = float(time.time())
-        if (now - float(_PURIFICACION_REAL_LOG_TS or 0.0)) >= float(cooldown_s):
-            _PURIFICACION_REAL_LOG_TS = now
-            agregar_evento(f"🧪 {msg}")
-    except Exception:
-        pass
 
 def _ensure_dir(p):
     try:
@@ -2195,25 +2180,6 @@ def path_orden(bot: str) -> str:
 #   asegurar que el bot tenga también su orden_real.json escrita (sin recursión).
 
 _last_real_push_ts = {bot: 0.0 for bot in BOT_NAMES}
-
-def _aplicar_purificacion_real_tick():
-    """Bypass centralizado: evita owner/trigger REAL fantasma sin romper compatibilidad."""
-    global REAL_OWNER_LOCK
-    if not _purificacion_real_activa():
-        return
-    try:
-        REAL_OWNER_LOCK = None
-    except Exception:
-        pass
-    try:
-        _set_ui_token_holder(None)
-    except Exception:
-        pass
-    try:
-        for b in BOT_NAMES:
-            estado_bots[b]["trigger_real"] = False
-    except Exception:
-        pass
 
 def limpiar_orden_real(bot: str):
     """
@@ -2296,9 +2262,6 @@ def _escribir_orden_real_raw(bot: str, ciclo: int):
     """
     Escritura RAW de orden_real (sin activar_real_inmediato, sin recursión).
     """
-    if _purificacion_real_activa():
-        _log_purificacion_real("Bypass emisión orden REAL: orden_real no se escribe")
-        return
     ciclo = max(1, min(int(ciclo), MAX_CICLOS))
     payload = {"bot": bot, "ciclo": ciclo, "ts": time.time()}
     try:
@@ -2323,13 +2286,6 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
     global LIMPIEZA_PANEL_HASTA, sonido_disparado, marti_paso, REAL_OWNER_LOCK, REAL_ENTRY_BASELINE
 
     try:
-        if _purificacion_real_activa():
-            try:
-                cyc_log = int(ciclo)
-            except Exception:
-                cyc_log = 1
-            _log_purificacion_real(f"Bypass activar_real_inmediato({bot}, C{max(1, cyc_log)}, {origen})")
-            return False
         if bot not in BOT_NAMES:
             return False
 
@@ -2489,9 +2445,6 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
     - Activa REAL inmediato en HUD + token file
     """
     ciclo = max(1, min(int(ciclo), MAX_CICLOS))
-    if _purificacion_real_activa():
-        _log_purificacion_real(f"Bypass escribir_orden_real({bot}, C{ciclo})")
-        return False
 
     # 🔒 No crear orden si ya hay otro owner REAL activo.
     try:
@@ -13343,8 +13296,6 @@ def forzar_real_manual(bot: str, ciclo: int):
         FORZAR_LOCK.release()
 
 def evaluar_semaforo():
-    if _purificacion_real_activa():
-        return "🟣", "REAL OFF", "MODO PURIFICACION REAL ACTIVO"
     thr = float(get_umbral_operativo())
     emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
     dec = str(emb.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
@@ -14554,35 +14505,6 @@ def _registrar_estado_embudo(data: dict | None = None) -> dict:
 
 def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real: str, meta_live: dict | None) -> dict:
     """Embudo unificado: selección -> calidad blanda -> modulación -> estado final."""
-    if _purificacion_real_activa():
-        _log_purificacion_real("Bypass embudo final: promoción REAL desactivada")
-        top1_bot = None
-        top1_prob = 0.0
-        if candidatos:
-            try:
-                ordered = sorted(candidatos, key=lambda x: float(x[2] if len(x) > 2 else 0.0), reverse=True)
-                top1 = ordered[0]
-                top1_bot = str(top1[1])
-                top1_prob = float(top1[2] or 0.0)
-            except Exception:
-                pass
-        return _registrar_estado_embudo({
-            "decision_final": EMBUDO_FINAL_WAIT_SOFT,
-            "decision_reason": "REAL_DISABLED_PURIFICACION",
-            "gate_quality": "real_disabled",
-            "risk_mode": "REAL_DISABLED",
-            "hard_block_reason": "",
-            "soft_wait_reason": "real_disabled_purificacion",
-            "top1_bot": top1_bot,
-            "top2_bot": None,
-            "gap_value": 0.0,
-            "top1_prob": float(top1_prob),
-            "top2_prob": 0.0,
-            "degrade_from": "purificacion_real",
-            "ia_real_backed": 0,
-            "real_source": "DISABLED",
-            "ia_model_mature": 0,
-        })
     out = _registrar_estado_embudo({
         "decision_final": EMBUDO_FINAL_WAIT_SOFT,
         "decision_reason": "sin_candidatos",
@@ -15753,8 +15675,6 @@ async def main():
                 agregar_evento(_msg)
             except Exception:
                 pass
-        if _purificacion_real_activa():
-            _log_purificacion_real()
 
         if DIAGNOSTIC_MODE:
             print("🧪 MODO DIAGNÓSTICO activo: sin auto-operación REAL.")
@@ -15824,7 +15744,6 @@ async def main():
 
             try:  
                 set_etapa("TICK_01")
-                _aplicar_purificacion_real_tick()
                 token_actual_loop = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else (leer_token_actual() or next((b for b in BOT_NAMES if estado_bots.get(b, {}).get("token") == "REAL"), None))
 
                 # Reconciliación anti-desincronía maestro↔bots:
