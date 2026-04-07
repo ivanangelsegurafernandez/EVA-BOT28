@@ -15,8 +15,10 @@ import random  # Added for jitter in BLOQUE 1.3
 import itertools  # For req_counter in api_call
 import math
 import unicodedata
+import traceback
 
 os.environ.setdefault("PYTHONUTF8", "1")
+BOOT_SMOKE_TEST = str(os.getenv("BOOT_SMOKE_TEST", os.getenv("DRY_BOOT_ONLY", "0"))).strip() == "1"
 
 def _configure_console_output_safe():
     for _stream_name in ("stdout", "stderr"):
@@ -73,7 +75,7 @@ except Exception as _e:
 SFX_FILES = {
     "FELICITACIONES": "ia_scifi_01_felicitaciones_ivan_dry.wav",
     "LO_SIENTO": "ia_scifi_02_losiento_ivan_dry.wav",
-    "PASO_A_REAL": "ia_scifi_03_paso_a_real_dry.wav",
+    "PASO_A_DEMO_DISABLED": "ia_scifi_03_paso_a_real_dry.wav",
     "REINTENTA": "ia_scifi_05_reintenta_dry.wav",
     "NO_CONCLUYO": "ia_scifi_06_no_concluyo_dry.wav",
     "NO_PASAR_REAL": "ia_scifi_07_no_pasar_real_dry.wav",
@@ -83,7 +85,7 @@ _SFX_LAST_TS = {}
 _SFX_MIN_INTERVAL = {
     "FELICITACIONES": 4.0,
     "LO_SIENTO": 4.0,
-    "PASO_A_REAL": 2.0,   # ✅ más sensible
+    "PASO_A_DEMO_DISABLED": 2.0,   # desactivado en DEMO-only
     "REINTENTA": 6.0,
     "NO_CONCLUYO": 10.0,
     "NO_PASAR_REAL": 6.0,
@@ -125,8 +127,8 @@ def play_sfx(key: str, vol: float = 0.9):
     except NameError:
         manual = False
     # Si el usuario forzó silencio (MANUAL), no sonar...
-    # ...PERO no silenciamos el "PASO_A_REAL" ni sonidos de resultado (clave para tu lógica).
-    if 'MODO_SILENCIOSO' in globals() and MODO_SILENCIOSO and manual and key not in ("PASO_A_REAL", "FELICITACIONES", "LO_SIENTO"):
+    # ...PERO no silenciamos el "PASO_A_DEMO" ni sonidos de resultado (clave para tu lógica).
+    if 'MODO_SILENCIOSO' in globals() and MODO_SILENCIOSO and manual and key not in ("FELICITACIONES", "LO_SIENTO"):
         return
 
     try:
@@ -188,15 +190,15 @@ estado_bot = {
 racha_actual_bot = 0  # racha del bot: >0 = racha de GANANCIAS, <0 = racha de PÉRDIDAS
 
 # === Handshake con 5R6M ===
-primer_ingreso_real = False  # Sonido solo 1 vez por ventana
+primer_ingreso_demo = False  # Sonido solo 1 vez por ventana
 
 # Variables persistentes para saldos últimos válidos
 saldo_demo_last = None
 saldo_real_last = None
 saldo_demo_last_ts = 0.0
 saldo_real_last_ts = 0.0
-real_activado_en_bot = 0.0  # BLOQUE 5: Global for activation timestamp
-real_activation_confirmed = False
+demo_activado_en_bot = 0.0  # BLOQUE 5: Global for activation timestamp
+demo_activation_confirmed = False
 
 # BLOQUE 2: Commit guard for REAL operations
 REAL_COMMIT_WINDOW_S = 20
@@ -206,18 +208,14 @@ real_buy_commit_until = 0.0
 # Compat: se mantiene la bandera, pero por política vigente manda siempre la orden fresca del maestro.
 RESET_CICLO_EN_ENTRADA_REAL = False
 
-def commit_guard_active() -> bool:
-    return (last_real_contract_id is not None) and (time.time() < real_buy_commit_until)
+def demo_guard_active() -> bool:
+    return False
 
-def commit_guard_set(contract_id: int):
-    global last_real_contract_id, real_buy_commit_until
-    last_real_contract_id = contract_id
-    real_buy_commit_until = time.time() + REAL_COMMIT_WINDOW_S
+def demo_guard_set(contract_id: int):
+    return None
 
-def commit_guard_clear():
-    global last_real_contract_id, real_buy_commit_until
-    last_real_contract_id = None
-    real_buy_commit_until = 0.0
+def demo_guard_clear():
+    return None
 
 def _bg_close_guard_path() -> str:
     return os.path.join(BG_CLOSE_GUARD_DIR, f"{NOMBRE_BOT}.json")
@@ -280,40 +278,22 @@ def _has_bg_close_pending() -> bool:
         return False
 
 # >>> PATCH 1 — Helpers de orden de ciclo
-ORDEN_DIR = "orden_real"  # misma carpeta usada por el maestro
+ORDEN_DIR = "orden_real_disabled"  # compat: sin uso operativo en DEMO-only
 # === IA ACK (handshake maestro→bot) ===
-IA_ACK_DIR = "ia_ack"
+IA_ACK_DIR = "ia_ack_disabled"
 try:
     os.makedirs(IA_ACK_DIR, exist_ok=True)
 except Exception:
     pass
 
-LXV_CONSUMED_ACK_DIR = "lxv_consumed_ack"
+LXV_CONSUMED_ACK_DIR = "lxv_consumed_ack_disabled"
 try:
     os.makedirs(LXV_CONSUMED_ACK_DIR, exist_ok=True)
 except Exception:
     pass
 
 def escribir_ack_consumed_real_lxv(bot: str, round_lxv: int, snapshot_id: str, contract_id=None):
-    try:
-        payload = {
-            "bot": str(bot or ""),
-            "round_lxv": int(round_lxv or 0),
-            "snapshot_id": str(snapshot_id or ""),
-            "ts": float(time.time()),
-            "contract_id": str(contract_id or ""),
-            "estado": "consumed_real",
-        }
-        path = os.path.join(LXV_CONSUMED_ACK_DIR, f"{bot}.json")
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        return True
-    except Exception:
-        return False
+    return False
 
 def leer_ia_ack(bot: str):
     path = os.path.join(IA_ACK_DIR, f"{bot}.json")
@@ -332,10 +312,10 @@ try:
 except Exception:
     pass
 
-SYNC_ROUND_DIR = "sync_round"
-BARRIER_ENABLED = True
-LXV_CORE_ENABLE = True
-LXV_SOFT_LEVEL_ENABLE = True
+SYNC_ROUND_DIR = "sync_round_disabled"
+BARRIER_ENABLED = False
+LXV_CORE_ENABLE = False
+LXV_SOFT_LEVEL_ENABLE = False
 LXV_SOFT_LEVEL_MAX_WAIT_S = 20.0
 LXV_SOFT_LEVEL_POLL_S = 0.5
 
@@ -481,173 +461,47 @@ def escribir_ack_cierre_ronda(round_id: int, resultado: str, trade_uid: str = ""
 
 
 def _is_real_owner_valid_now() -> bool:
-    try:
-        with open(ARCHIVO_TOKEN, "r", encoding="utf-8") as f:
-            linea = (f.read() or "").strip()
-        return linea == f"REAL:{NOMBRE_BOT}"
-    except Exception:
-        return False
+    return False
 
 def _lxv_post_real_confirmed() -> bool:
-    try:
-        return bool(real_activation_confirmed and _es_token_real(leer_token_desde_archivo()) and _is_real_owner_valid_now())
-    except Exception:
-        return False
-
+    return False
 
 def _lxv_sync_tiene_pendiente_abierta(archivo_csv: str) -> bool:
-    """True si hay operación PRE_TRADE/PENDIENTE sin cierre definitivo asociado."""
-    try:
-        rec = {}
-        with open(archivo_csv, "r", encoding="utf-8", newline="") as fh:
-            reader = csv.DictReader(fh)
-            for row in reader:
-                key = _trade_key_from_row(row)
-                if not key:
-                    continue
-                st = str(row.get("trade_status", "") or "").strip().upper()
-                cur = rec.get(key, {"has_pre": False, "has_close": False})
-                if st in {"PRE_TRADE", "PENDIENTE", "OPEN", "ABIERTO"}:
-                    cur["has_pre"] = True
-                elif st == "CERRADO":
-                    cur["has_close"] = True
-                rec[key] = cur
-        return any(bool(v.get("has_pre")) and not bool(v.get("has_close")) for v in rec.values())
-    except Exception:
-        return False
+    return False
 
 # Compat temporal (naming previo LXB)
 def _lxb_sync_tiene_pendiente_abierta(archivo_csv: str) -> bool:
-    return _lxv_sync_tiene_pendiente_abierta(archivo_csv)
+    return False
 
-def leer_orden_real_full(bot: str):
-    """Lee JSON completo de orden_real de forma tolerante/atómica."""
-    ruta = os.path.join(ORDEN_DIR, f"{bot}.json")
-    tmp = ruta + ".tmp"
-    try:
-        if not os.path.exists(ruta):
-            return None
-        with open(ruta, "r", encoding="utf-8") as f, open(tmp, "w", encoding="utf-8") as t:
-            t.write(f.read())
-        with open(tmp, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        os.remove(tmp)
-        if not isinstance(data, dict):
-            return None
-        return data
-    except Exception:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        return None
+def leer_orden_demo_full(bot: str):
+    return None
 
-def leer_orden_real(bot: str):
-    """
-    Devuelve (ciclo, ts, quiet, src) si existe orden fresca, o (None, None, 0, None) si no.
-    """
-    data = leer_orden_real_full(bot)
-    if not isinstance(data, dict):
-        return None, None, 0, None
-    if data.get("bot") != bot:
-        return None, None, 0, None
-    cyc = int(data.get("ciclo", 1))
-    ts = float(data.get("ts", 0.0))
-    ttl = int(data.get("ttl", 120))
-    quiet = 1 if int(data.get("quiet", 0)) == 1 else 0
-    src = str(data.get("src", "") or "").upper() or None
-    if src in {"LXV_SYNC", "LXV_SINCRONIZADO", "LXB_SYNC", "LXB_SINCRONIZADO", "LXV_CORE"}:
-        if _lxv_sync_tiene_pendiente_abierta(ARCHIVO_CSV):
-            if _print_once("lxv-sync-skip-pendiente", ttl=10):
-                print(Fore.YELLOW + "LXV_SYNC_SKIP: ronda=0 | motivo=pendiente_abierta")
-            return None, None, 0, src
-    lim = max(30, min(ttl, 300))  # margen seguro
-    if time.time() - ts > lim:
-        if src in {"LXV_SYNC", "LXV_SINCRONIZADO", "LXB_SYNC", "LXB_SINCRONIZADO", "LXV_CORE"}:
-            if _print_once("lxv-snapshot-exp-hard-block", ttl=15):
-                print(Fore.YELLOW + "LXV_SYNC_ABORT: orden_vencida")
-            return None, None, 0, src
-        return None, None, 0, None
-    return max(1, min(cyc, MAX_CICLOS)), ts, quiet, src
+def leer_orden_demo(bot: str):
+    return None, None, 0, None
 
 def _es_token_real(token_val) -> bool:
-    return str(token_val or "").strip() == str(TOKEN_REAL).strip()
+    return False
 
 def _cuenta_label(token_val) -> str:
-    return "REAL" if _es_token_real(token_val) else "DEMO"
+    return "DEMO"
 
 def _csv_account_fields(token_val) -> dict:
-    lbl = _cuenta_label(token_val)
-    return {"token": lbl, "cuenta": lbl, "modo": lbl}
+    return {"token": "DEMO", "cuenta": "DEMO", "modo": "DEMO"}
 
 def _resolver_ciclo_prioritario(fallback: int = 1):
-    ciclo_orden, _ts, _quiet, _src = leer_orden_real(NOMBRE_BOT)
-    if ciclo_orden:
-        return int(ciclo_orden), "orden"
     ciclo_forzado = estado_bot.get("ciclo_forzado")
     if ciclo_forzado:
         return int(ciclo_forzado), "retenido"
-    if _es_token_real(leer_token_desde_archivo()):
-        return None, "sin_orden"
     return int(fallback), "fallback"
 
 def _retener_ciclo_para_reinicio(ciclo_actual: int):
-    ciclo_orden, _ts, _quiet, _src = leer_orden_real(NOMBRE_BOT)
-    if ciclo_orden:
-        estado_bot["ciclo_forzado"] = int(ciclo_orden)
-        return int(ciclo_orden), "orden"
-    ciclo_forzado = estado_bot.get("ciclo_forzado")
-    if ciclo_forzado:
-        return int(ciclo_forzado), "retenido"
     estado_bot["ciclo_forzado"] = int(ciclo_actual or 1)
     return int(estado_bot["ciclo_forzado"]), "actual"
 
-def validar_permiso_buy_lxv_sync(bot: str, ciclo: int, token_actual, owner_ok: bool = True):
-    data = leer_orden_real_full(bot)
-    if _es_token_real(token_actual) and not isinstance(data, dict):
-        return False, "token_real_sin_orden_valida", None
-    src = str((data or {}).get("src", "") or "").upper()
-    if src not in {"LXV_SYNC", "LXV_SINCRONIZADO", "LXB_SYNC", "LXB_SINCRONIZADO", "LXV_CORE"}:
-        return True, "not_lxv_sync", None
-    if not _es_token_real(token_actual):
-        return False, "token_no_real", data
-    if not bool(owner_ok and _is_real_owner_valid_now()):
-        return False, "owner_lock_invalido", data
-    if not isinstance(data, dict):
-        return False, "orden_ausente", None
-    if str(data.get("bot", "")).strip() != str(bot):
-        return False, "bot_mismatch", data
-    if str(data.get("selected_bot", "")).strip() != str(bot):
-        return False, "selected_bot_mismatch", data
-    round_lxv = int(data.get("round_lxv", 0) or 0)
-    snapshot_id = str(data.get("snapshot_id", "") or "").strip()
-    if round_lxv <= 0:
-        return False, "round_lxv_missing", data
-    if not snapshot_id:
-        return False, "snapshot_id_missing", data
-    if int(ciclo or 0) != int(data.get("ciclo", 0) or 0):
-        return False, "ciclo_mismatch", data
-    ts = float(data.get("ts", 0.0) or 0.0)
-    ttl = int(data.get("ttl", 120) or 120)
-    lim = max(30, min(ttl, 300))
-    if (time.time() - ts) > lim:
-        return False, "ttl_vencido", data
-    if str(estado_bot.get("last_lxv_snapshot_consumed", "") or "") == snapshot_id:
-        if _print_once(f"lxv-skip-consumed-{round_lxv}-{snapshot_id}", ttl=8):
-            print(Fore.YELLOW + f"LXV_SYNC_SKIP_CONSUMED_REAL bot={bot} round={int(round_lxv)} snapshot={snapshot_id}")
-        return False, "snapshot_ya_consumido", data
-    if int(round_lxv) <= int(estado_bot.get("last_lxv_round_consumed", 0) or 0):
-        if _print_once(f"lxv-skip-consumed-round-{round_lxv}", ttl=8):
-            print(Fore.YELLOW + f"LXV_SYNC_SKIP_CONSUMED_REAL bot={bot} round={int(round_lxv)} snapshot={snapshot_id}")
-        return False, "ronda_ya_consumida", data
-    if _lxv_sync_tiene_pendiente_abierta(ARCHIVO_CSV):
-        return False, "pendiente_abierta_local", data
-    if _has_bg_close_pending():
-        return False, "bg_close_pending", data
-    if commit_guard_active():
-        return False, "commit_guard_activo", data
-    return True, "ok", data
+def validar_permiso_buy_demo(bot: str, ciclo: int, token_actual, owner_ok: bool = True):
+    return True, "demo_only", None
 
-
-LXV_CANONICAL_SRCS = {"LXV_CORE", "LXV_SYNC", "LXV_SINCRONIZADO", "LXB_SYNC", "LXB_SINCRONIZADO"}
+LXV_CANONICAL_SRCS =LXV_CANONICAL_SRCS = {"LXV_CORE", "LXV_SYNC", "LXV_SINCRONIZADO", "LXB_SYNC", "LXB_SINCRONIZADO"}
 
 
 def _build_trade_ack_ctx(round_local: int, data_lxv_buy) -> dict:
@@ -1699,6 +1553,7 @@ def cargar_tokens():
             time.sleep(3)
 
 TOKEN_DEMO, TOKEN_REAL = cargar_tokens()
+TOKEN_REAL = TOKEN_DEMO  # DEMO-only operativo
 
 def reset_csv_and_total():
     """
@@ -1721,16 +1576,15 @@ if not os.path.exists(ARCHIVO_CSV):
         writer.writerow(CSV_HEADER)
 
 def leer_token_desde_archivo():
-    """
-    Lee ARCHIVO_TOKEN. Si contiene 'REAL:fulll45' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
-    """
+    """Compatibilidad visual: siempre opera en DEMO."""
     try:
-        with open(ARCHIVO_TOKEN, "r", encoding="utf-8", errors="replace") as f:
-            linea = f.read().strip()
-            if linea == f"REAL:{NOMBRE_BOT}":
-                return TOKEN_REAL
-    except:
+        if not os.path.exists(ARCHIVO_TOKEN):
+            write_token_atomic(ARCHIVO_TOKEN, "REAL:none")
+    except Exception:
         pass
+    return TOKEN_DEMO
+
+def token_operativo():
     return TOKEN_DEMO
 
 def calcular_rsi(cierres, periodo=14):
@@ -1972,164 +1826,14 @@ async def obtener_velas(ws, symbol, token, reintentos=4):
     return []
 
 async def check_token_and_reconnect(ws, current_token):
-    global ultimo_token
-    global primer_ingreso_real, real_activado_en_bot, real_activation_confirmed
-    token_desde_archivo = leer_token_desde_archivo()
-    if token_desde_archivo != current_token:
-        # BLOQUE 2 y 9: Anti-rebote + commit guard
-        if current_token == TOKEN_REAL and token_desde_archivo == TOKEN_DEMO:
-            # SOLO ignorar "rebote a DEMO" si hay ciclo en progreso.
-            if estado_bot.get("ciclo_en_progreso") and (commit_guard_active() or (time.time() - real_activado_en_bot < COOLDOWN_REAL_S)):
-                key = _commit_notice_key()
-                if not estado_bot.get("barra_activa", False) and _print_once(key, ttl=180):
-                    print(Fore.YELLOW + "Commit REAL o cooldown activo: ignorando rebote a DEMO.")
-                return ws, current_token
-
-        if estado_bot["ciclo_en_progreso"]:
-            # Corte en caliente: interrumpe el reloj YA
-            if not estado_bot.get("token_msg_mostrado", False):
-                if not (MODO_SILENCIOSO and estado_bot.get("modo_manual")):
-                    print(Fore.MAGENTA + Style.BRIGHT + "Cambio de token detectado: cortando ciclo y aplicando de inmediato.")
-                estado_bot["token_msg_mostrado"] = True
-            estado_bot["interrumpir_ciclo"] = True
-            reinicio_forzado.set()
-            return ws, current_token  # dejar que esperar_resultado lo desprenda
-        else:
-            print(Fore.YELLOW + Style.BRIGHT + f"Token cambió a {'REAL' if token_desde_archivo == TOKEN_REAL else 'DEMO'}. Reconectando...")
-            try:
-                await ws.close()
-            except:
-                pass
-            ws = await websockets.connect(DERIV_WS_URL, **WS_KW)  # BLOQUE 1.2
-            await authorize_ws(ws, token_desde_archivo)
-            await asyncio.sleep(0.6 + random.uniform(0.0, 0.5))  # BLOQUE 4: micro-cooldown
-            if token_desde_archivo == TOKEN_REAL:
-                # >>> PATCH 4 — Al entrar a REAL, preconfigura el ciclo forzado
-                if not primer_ingreso_real:
-                    print(Fore.LIGHTRED_EX + Back.WHITE + Style.BRIGHT + f"\n{NOMBRE_BOT.upper()} ENTRÓ EN CUENTA REAL {datetime.now().strftime('%H:%M:%S')}")
-                    # SFX: PASO_A_REAL (reemplaza racha_detectada.wav)
-                    try:
-                        play_sfx("PASO_A_REAL", vol=0.9)
-                    except Exception:
-                        pass
-                    primer_ingreso_real = True
-                    real_activado_en_bot = time.time()  # BLOQUE 5 and 2: Set activation time
-                    real_activation_confirmed = True
-                    if _print_once("lxv-activation-ok", ttl=10):
-                        print(Fore.YELLOW + f"LXV_SYNC_ACTIVATION: orden válida -> REAL habilitado para {NOMBRE_BOT}")
-                    # Lee la orden del maestro y deja seteado el ciclo para la siguiente vuelta
-                    cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
-                    if cyc:
-                        estado_bot["ciclo_forzado"] = cyc
-                        print(Fore.YELLOW + f"Orden maestro detectada: arrancaré en ciclo #{cyc}.")
-                    else:
-                        estado_bot["ciclo_forzado"] = None
-                        if _print_once("lxv-token-real-sin-orden", ttl=10):
-                            print(Fore.YELLOW + "LXV_SYNC_ABORT: token_real_sin_orden_valida")
-
-                    # Silenciar ruido guiado por maestro (BLOQUE 3)
-                    if quiet or (str(src).upper() == "MANUAL"):
-                        asyncio.create_task(_silencio_temporal(90, fuente=src))
-                    else:
-                        asyncio.create_task(_desactivar_silencioso_en(90))
-                    reinicio_forzado.set()
-                else:
-                    if not (MODO_SILENCIOSO and estado_bot.get("modo_manual")) and not estado_bot.get("barra_activa", False):
-                        if _print_once("rea-REAL", ttl=180):
-                            print(Fore.YELLOW + "Reafirmación de REAL (sin reset de martingala)")
-                    cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
-                    if cyc:
-                        estado_bot["ciclo_forzado"] = cyc
-                        if not estado_bot.get("barra_activa", False):
-                            print(Fore.YELLOW + f"Orden maestro detectada: continuaré en ciclo #{cyc}.")
-                    else:
-                        estado_bot["ciclo_forzado"] = None
-                        if not estado_bot.get("barra_activa", False) and _print_once("lxv-token-real-sin-orden-2", ttl=10):
-                            print(Fore.YELLOW + "LXV_SYNC_ABORT: token_real_sin_orden_valida")
-
-                    if quiet or (str(src).upper() == "MANUAL"):
-                        asyncio.create_task(_silencio_temporal(90, fuente=src))
-                    else:
-                        asyncio.create_task(_desactivar_silencioso_en(90))
-                # <<< PATCH 4
-            else:
-                # Saliste de REAL: prepara el sonido para la próxima ventana
-                primer_ingreso_real = False
-                real_activation_confirmed = False
-                reinicio_forzado.set()
-            ultimo_token = token_desde_archivo  # mantén vigilante y lazo alineados
-            return ws, token_desde_archivo
-    else:
-        if token_desde_archivo == TOKEN_REAL:
-            # ✅ FIX: si el bot arranca/reconecta y ya está en REAL, igual debe "hablar" 1 vez
-            if not primer_ingreso_real:
-                if not estado_bot.get("barra_activa", False):
-                    try:
-                        print(
-                            Fore.LIGHTRED_EX + Back.WHITE + Style.BRIGHT
-                            + f"\n{NOMBRE_BOT.upper()} INICIÓ EN CUENTA REAL"
-                            + Style.RESET_ALL
-                        )
-                    except Exception:
-                        pass
-
-                # Audio PASO_A_REAL (blindado)
-                try:
-                    play_sfx("PASO_A_REAL", vol=0.95)
-                except Exception:
-                    pass
-
-                primer_ingreso_real = True
-                real_activation_confirmed = True
-                if _print_once("lxv-activation-ok", ttl=10):
-                    print(Fore.YELLOW + f"LXV_SYNC_ACTIVATION: orden válida -> REAL habilitado para {NOMBRE_BOT}")
-                try:
-                    real_activado_en_bot = time.time()
-                except Exception:
-                        pass
-
-            else:
-                # Mantén tu mensaje de reafirmación como estaba (sin tocar otras lógicas)
-                if not (MODO_SILENCIOSO and estado_bot.get("modo_manual")) and not estado_bot.get("barra_activa", False):
-                    if _print_once("rea-REAL", ttl=180):
-                        print(Fore.YELLOW + "Reafirmación de REAL (sin reset de martingala)")
-            cyc, _, _quiet, _src = leer_orden_real(NOMBRE_BOT)
-            if cyc:
-                estado_bot["ciclo_forzado"] = cyc
-            else:
-                estado_bot["ciclo_forzado"] = None
-                if not estado_bot.get("barra_activa", False) and _print_once("lxv-token-real-sin-orden-3", ttl=10):
-                    print(Fore.YELLOW + "LXV_SYNC_ABORT: token_real_sin_orden_valida")
-
-        ultimo_token = token_desde_archivo  # mantén vigilante y lazo alineados
-        return ws, current_token
+    return ws, token_operativo()
 
 async def vigilar_token():
-    """Dispara reinicio cuando cambia el archivo token_actual.txt"""
+    """Sin transición DEMO/REAL en modo limpio."""
     global ultimo_token
     while not stop_event.is_set():
         await asyncio.sleep(2)
-        token_desde_archivo = leer_token_desde_archivo()
-        if token_desde_archivo != ultimo_token:
-            # BLOQUE 2 y 9: Anti-rebote + commit guard in watcher
-            if ultimo_token == TOKEN_REAL and token_desde_archivo == TOKEN_DEMO:
-                # SOLO ignorar "rebote a DEMO" si hay ciclo en progreso.
-                if estado_bot.get("ciclo_en_progreso") and (commit_guard_active() or (time.time() - real_activado_en_bot < COOLDOWN_REAL_S)):
-                    key = _commit_notice_key()
-                    if not estado_bot.get("barra_activa", False) and _print_once(key, ttl=180):
-                        print(Fore.YELLOW + "Commit REAL o cooldown activo: ignorando rebote a DEMO.")
-                    continue
-                        
-            if estado_bot["ciclo_en_progreso"]:
-                if not estado_bot.get("token_msg_mostrado", False):
-                    if not (MODO_SILENCIOSO and estado_bot.get("modo_manual")):
-                        print(Fore.MAGENTA + Style.BRIGHT + "Cambio de token detectado: cortando ciclo y aplicando de inmediato.")
-                    estado_bot["token_msg_mostrado"] = True
-                estado_bot["interrumpir_ciclo"] = True
-                reinicio_forzado.set()
-            else:
-                ultimo_token = token_desde_archivo
-                reinicio_forzado.set()
+        ultimo_token = token_operativo()
 
 async def consultar_saldo_real(ws):
     global saldo_real_last, saldo_real_last_ts
@@ -2148,7 +1852,7 @@ async def consultar_saldo_real(ws):
     # Conexión dedicada
     try:
         async with websockets.connect(DERIV_WS_URL, **WS_KW) as ws2:
-            await authorize_ws(ws2, TOKEN_REAL, tries=2, timeout=6.0)
+            await authorize_ws(ws2, TOKEN_DEMO, tries=2, timeout=6.0)
             data2 = await api_call(ws2, {"balance": 1}, expect_msg_type="balance", timeout=6.0)
             b2 = data2.get("balance", {}).get("balance")
             if b2 is not None:
@@ -2448,7 +2152,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                 print(Fore.GREEN + Style.BRIGHT + "GANANCIA en cuenta REAL! (token lo maneja 5R6M; sigo en sesión)")
             # BLOQUE 2: Clear commit guard after REAL result
             if token_antes == TOKEN_REAL:
-                commit_guard_clear()
+                demo_guard_clear()
             # >>> PATCH BLOQUE 5
             print(Fore.CYAN + f"Ciclo #{ciclo} | {symbol} {direccion} | payout={float(payout or 0):.2f} | {resultado} {profit:+.2f} USD")
             # <<< PATCH
@@ -2652,7 +2356,7 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
 
         # Clear commit guard cuando REAL finaliza en BG
         if token_usado == TOKEN_REAL:
-            commit_guard_clear()
+            demo_guard_clear()
 
         msg2 = Fore.CYAN + (
             f"Ciclo #{ciclo} | {symbol} {direccion} | payout={float(payout or 0):.2f} | "
@@ -2842,7 +2546,7 @@ async def ejecutar_panel():
                     else:
                         estado_bot["ciclo_forzado"] = None
                         if _print_once("lxv-sync-abort-reinicio", ttl=5):
-                            print(Fore.YELLOW + "LXV_SYNC_ABORT: token_real_sin_orden_valida")
+                            print(Fore.YELLOW + "LXV_SYNC_ABORT: demo_only_sin_orden")
                     estado_bot["reinicios_consecutivos"] = 0
                     await asyncio.sleep(5)
 
@@ -2891,7 +2595,7 @@ async def ejecutar_panel():
                 if modo_real:
                     estado_bot["ciclo_forzado"] = None
                     if _print_once("lxv-sync-abort-c1", ttl=5):
-                        print(Fore.YELLOW + "LXV_SYNC_ABORT: token_real_sin_orden_valida")
+                        print(Fore.YELLOW + "LXV_SYNC_ABORT: demo_only_sin_orden")
                     await asyncio.sleep(0.35)
                     continue
                 if _print_once("ciclo-fallback-c1", ttl=30):
@@ -3206,7 +2910,7 @@ async def ejecutar_panel():
 
                 data_lxv_buy = None
                 if modo_real:
-                    ok_lxv_buy, motivo_lxv_buy, data_lxv_buy = validar_permiso_buy_lxv_sync(
+                    ok_lxv_buy, motivo_lxv_buy, data_lxv_buy = validar_permiso_buy_demo(
                         NOMBRE_BOT,
                         ciclo=int(ciclo),
                         token_actual=current_token,
@@ -3293,7 +2997,7 @@ async def ejecutar_panel():
 
                 # Commit guard REAL
                 if modo_real:
-                    commit_guard_set(contract_id)
+                    demo_guard_set(contract_id)
 
                 # Si justo hubo cambio de token y pidieron reinicio, forzamos detach inmediato
                 if reinicio_forzado.is_set():
@@ -3409,19 +3113,19 @@ async def ejecutar_panel():
                     except Exception:
                         pass
 
-                    # ✅ Importantísimo: resetear ventana para que PASO_A_REAL suene la próxima vez
+                    # ✅ Importantísimo: resetear ventana para que PASO_A_DEMO suene la próxima vez
                     try:
-                        globals()["primer_ingreso_real"] = False
+                        globals()["primer_ingreso_demo"] = False
                     except Exception:
                         pass
                     try:
-                        globals()["real_activado_en_bot"] = 0.0
+                        globals()["demo_activado_en_bot"] = 0.0
                     except Exception:
                         pass
 
                     # ✅ Limpia commit-guard por si quedó armado (no afecta otras lógicas)
                     try:
-                        commit_guard_clear()
+                        demo_guard_clear()
                     except Exception:
                         pass
 
@@ -3471,6 +3175,10 @@ async def monitor():
         await asyncio.sleep(2)
 
 async def main():
+    if BOOT_SMOKE_TEST:
+        print(Fore.GREEN + Style.BRIGHT + f"[BOOT OK] {NOMBRE_BOT} smoke test DEMO-only")
+        return
+
     # watcher del token (CRÍTICO para GateWin)
     try:
         asyncio.create_task(vigilar_token())
@@ -3493,3 +3201,8 @@ if __name__ == "__main__":
         except Exception:
             pass
         print(Fore.YELLOW + "\n⛔ Interrumpido por usuario.")
+    except Exception as e:
+        print(Fore.RED + Style.BRIGHT + f"[FATAL] bot {NOMBRE_BOT} falló al arrancar: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        time.sleep(4)
+        raise
