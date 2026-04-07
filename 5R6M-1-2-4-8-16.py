@@ -2207,8 +2207,6 @@ def path_orden(bot: str) -> str:
 # === LXV_SYNC_COLUMN: sincronización de ronda/columna maestro↔bots ===
 SYNC_ROUND_DIR = "sync_round"
 SYNC_ROUND_STATE_PATH = os.path.join(SYNC_ROUND_DIR, "state.json")
-TTL_ACK_SYNC_ROUND_S = 300.0
-ACK_SYNC_ROUND_FUTURE_DRIFT_S = 20.0
 _SYNC_ROUND_LAST_ANNOUNCED = None
 _SYNC_ROUND_LAST_CLOSED_COUNT = {}
 
@@ -2249,29 +2247,6 @@ def _sync_round_bootstrap_state(force: bool = False):
     }
     _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
 
-def _sync_round_apply_visual_heartbeat(bot: str):
-    """
-    Mantiene señal visual de vida/standby sin releer CSV completo.
-    """
-    try:
-        st = estado_bots.get(bot, {})
-        ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
-        gstate = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
-        round_id = int(gstate.get("round_id", 1) or 1)
-        released = int(gstate.get("released_round", 1) or 1)
-        wait_flag = bool(ack.get("sync_wait", False))
-        wait_round = int(ack.get("round_id", 0) or 0)
-        waiting_release = int(ack.get("waiting_release_round", wait_round + 1) or (wait_round + 1))
-        active_wait = bool(wait_flag and wait_round == round_id and released < waiting_release)
-        st["sync_wait"] = active_wait
-        st["last_sync_round"] = wait_round if wait_round > 0 else round_id
-        st["last_seen_ts"] = float(ack.get("last_seen_ts", time.time()) or time.time())
-        st["estado_visual"] = "STANDBY_RONDA" if active_wait else st.get("estado_visual", "ACTIVO")
-        if active_wait:
-            last_update_time[bot] = time.time()
-    except Exception:
-        pass
-
 def _sync_round_tick_maestro():
     global _SYNC_ROUND_LAST_ANNOUNCED
     _sync_round_bootstrap_state(force=False)
@@ -2298,7 +2273,6 @@ def _sync_round_tick_maestro():
         _SYNC_ROUND_LAST_ANNOUNCED = round_id
 
     closed = {}
-    now_ts = float(time.time())
     for bot in expected:
         ack = _sync_round_safe_read_json(_sync_round_ack_path(bot))
         if not isinstance(ack, dict):
@@ -2310,16 +2284,6 @@ def _sync_round_tick_maestro():
         if ack_round != round_id:
             continue
         if str(ack.get("status", "")).lower().strip() != "closed":
-            continue
-        try:
-            ack_ts = float(ack.get("ts", 0.0) or 0.0)
-        except Exception:
-            continue
-        if ack_ts <= 0:
-            continue
-        if (now_ts - ack_ts) > float(TTL_ACK_SYNC_ROUND_S):
-            continue
-        if ack_ts > (now_ts + float(ACK_SYNC_ROUND_FUTURE_DRIFT_S)):
             continue
         res = str(ack.get("resultado", "")).upper().strip()
         if res not in ("GANANCIA", "PÉRDIDA"):
@@ -2357,17 +2321,6 @@ def _sync_round_tick_maestro():
     if completed:
         agregar_evento(f"✅ LXV_SYNC_COLUMN columna/ronda #{round_id} COMPLETA.")
         agregar_evento(f"🚀 LXV_SYNC_COLUMN ronda #{next_round} LIBERADA.")
-        # Higiene mínima: baja "sync_wait" en bots ya contabilizados
-        for bot in closed.keys():
-            try:
-                ack_path = _sync_round_ack_path(bot)
-                ack_cur = _sync_round_safe_read_json(ack_path) or {}
-                if isinstance(ack_cur, dict):
-                    ack_cur["sync_wait"] = False
-                    ack_cur["last_seen_ts"] = time.time()
-                    _sync_round_write_json_atomic(ack_path, ack_cur)
-            except Exception:
-                pass
 # === /LXV_SYNC_COLUMN ===
 
 # === PATCH: REAL INMEDIATO EN HUD AL EMITIR ORDEN (sin esperar compra) ===
