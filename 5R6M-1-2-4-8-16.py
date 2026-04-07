@@ -385,16 +385,16 @@ IA_REDUNDANCY_SCORE_PENALTY = 0.03
 IA_SENSOR_PLANO_SCORE_PENALTY = 0.04
 IA_SUCESO_SCORE_WEIGHT = 0.08
 IA_OBSERVE_THR = 0.70
-AUTO_REAL_THR = IA_OBJETIVO_REAL_THR      # techo dinámico objetivo (70%)
-AUTO_REAL_BASE_FLOOR = 0.60                 # piso base dinámico para evitar bloqueo permanente en MODELO experimental
-AUTO_REAL_THR_MIN = max(float(IA_ACTIVACION_REAL_THR), float(AUTO_REAL_BASE_FLOOR))
-AUTO_REAL_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
-AUTO_REAL_MARGIN = 0.01   # pequeño margen para evitar quedar fuera por décimas
-AUTO_REAL_LOG_MAX_ROWS = 300  # máximo de señales históricas usadas en la calibración
-AUTO_REAL_LIVE_MIN_BOTS = 3   # mínimos bots con prob viva para calibración por tick
+AUTO_REAL_DISABLED_THR = IA_OBJETIVO_REAL_THR      # techo dinámico objetivo (70%)
+AUTO_REAL_DISABLED_BASE_FLOOR = 0.60                 # piso base dinámico para evitar bloqueo permanente en MODELO experimental
+AUTO_REAL_DISABLED_THR_MIN = max(float(IA_ACTIVACION_REAL_THR), float(AUTO_REAL_DISABLED_BASE_FLOOR))
+AUTO_REAL_DISABLED_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
+AUTO_REAL_DISABLED_MARGIN = 0.01   # pequeño margen para evitar quedar fuera por décimas
+AUTO_REAL_DISABLED_LOG_MAX_ROWS = 300  # máximo de señales históricas usadas en la calibración
+AUTO_REAL_DISABLED_LIVE_MIN_BOTS = 3   # mínimos bots con prob viva para calibración por tick
 
 # Umbral "operativo/UI" (señales actuales, semáforo, etc.)
-IA_METRIC_THRESHOLD = AUTO_REAL_THR_MIN
+IA_METRIC_THRESHOLD = AUTO_REAL_DISABLED_THR_MIN
 # Modo clásico: activación REAL con umbral operativo vigente (hoy 65%, con techo dinámico base 70%).
 # Mantiene lock de un solo bot en REAL y ciclo martingala global en HUD.
 REAL_CLASSIC_GATE = True
@@ -463,29 +463,29 @@ IA_WARMUP_CAP_RAMP_ROWS = 120         # rampa de cap en warmup: permite tocar 75
 IA_WARMUP_LOW_EVIDENCE_CAP_BASE = 0.80
 IA_WARMUP_LOW_EVIDENCE_CAP_POST_N15 = 0.85
 
-AUTO_REAL_ALLOW_UNRELIABLE_POST_N15 = True
-AUTO_REAL_UNRELIABLE_MIN_N = 0
-AUTO_REAL_UNRELIABLE_MIN_PROB = 0.535  # ajuste moderado: reduce bloqueos por borde (ej. 53.8 vs 54.0)
-AUTO_REAL_UNRELIABLE_MIN_AUC = 0.52   # unreliable conservador: evita activaciones con AUC marginal débil
-AUTO_REAL_BLOCK_WHEN_WARMUP = False   # no bloquear REAL por warmup (perfil prueba protegida)
+AUTO_REAL_DISABLED_ALLOW_UNRELIABLE_POST_N15 = True
+AUTO_REAL_DISABLED_UNRELIABLE_MIN_N = 0
+AUTO_REAL_DISABLED_UNRELIABLE_MIN_PROB = 0.535  # ajuste moderado: reduce bloqueos por borde (ej. 53.8 vs 54.0)
+AUTO_REAL_DISABLED_UNRELIABLE_MIN_AUC = 0.52   # unreliable conservador: evita activaciones con AUC marginal débil
+AUTO_REAL_DISABLED_BLOCK_WHEN_WARMUP = False   # no bloquear REAL por warmup (perfil prueba protegida)
 # Ajuste mínimo anti-congelamiento lateral: permite bajar el umbral UNREL
 # solo cuando hay evidencia operativa consistente por bot.
-AUTO_REAL_UNREL_LATERAL_ADAPT_ENABLE = True
-AUTO_REAL_UNREL_LATERAL_MIN_N = 50
-AUTO_REAL_UNREL_LATERAL_MIN_WR = 0.50
-AUTO_REAL_UNREL_LATERAL_MIN_PROB = 0.50
-AUTO_REAL_UNRELIABLE_FLOOR = 0.51      # piso REAL temporal cuando reliable=false y ya hay n mínimo por bot
+AUTO_REAL_DISABLED_UNREL_LATERAL_ADAPT_ENABLE = True
+AUTO_REAL_DISABLED_UNREL_LATERAL_MIN_N = 50
+AUTO_REAL_DISABLED_UNREL_LATERAL_MIN_WR = 0.50
+AUTO_REAL_DISABLED_UNREL_LATERAL_MIN_PROB = 0.50
+AUTO_REAL_DISABLED_UNRELIABLE_FLOOR = 0.51      # piso REAL temporal cuando reliable=false y ya hay n mínimo por bot
 # Micro-relajación gradual del umbral UNREL basada en cierres auditados reales.
 # Solo aplica cuando ya hay muestra suficiente y rendimiento sostenido.
-AUTO_REAL_UNREL_MICRO_RELAX_ENABLE = True
-AUTO_REAL_UNREL_MICRO_RELAX_MIN_CLOSED = 20
-AUTO_REAL_UNREL_MICRO_RELAX_MIN_WINRATE = 0.70
-AUTO_REAL_UNREL_MICRO_RELAX_MAX_DELTA = 0.02
-AUTO_REAL_UNREL_MICRO_RELAX_LOG_COOLDOWN_S = 45.0
+AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_ENABLE = True
+AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MIN_CLOSED = 20
+AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MIN_WINRATE = 0.70
+AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MAX_DELTA = 0.02
+AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_LOG_COOLDOWN_S = 45.0
 # Bypass controlado: si la compuerta REAL ya está sólida en vivo, permitir AUTO
 # aunque el modelo siga en warmup/reliable=false.
-AUTO_REAL_UNRELIABLE_ALLOW_STRONG_GATE = True
-AUTO_REAL_UNRELIABLE_GATE_MIN_PROB = 0.535
+AUTO_REAL_DISABLED_UNRELIABLE_ALLOW_STRONG_GATE = True
+AUTO_REAL_DISABLED_UNRELIABLE_GATE_MIN_PROB = 0.535
 # Bootstrap temprano de banderas LEGACY para evitar uso antes de definición.
 LEGACY_QUARANTINE_ENABLE = True
 LEGACY_ENABLE_PATTERN_V1 = not LEGACY_QUARANTINE_ENABLE
@@ -493,9 +493,9 @@ LEGACY_ENABLE_PATTERN_COLUMNS = False
 LEGACY_ENABLE_SHADOW_MICRO = not LEGACY_QUARANTINE_ENABLE
 LEGACY_ENABLE_MICRO_STRONG_FALLBACK = not LEGACY_QUARANTINE_ENABLE
 LEGACY_ENABLE_EARLY_CONFIRM_OVERRIDE = not LEGACY_QUARANTINE_ENABLE
-AUTO_REAL_MICRO_EARLY_CONFIRM_ENABLE = bool(LEGACY_ENABLE_EARLY_CONFIRM_OVERRIDE)
-AUTO_REAL_MICRO_EARLY_CONFIRM_MARGIN = 0.02
-AUTO_REAL_MICRO_EARLY_CONFIRM_DEFICIT_MAX = 1
+AUTO_REAL_DISABLED_MICRO_EARLY_CONFIRM_ENABLE = bool(LEGACY_ENABLE_EARLY_CONFIRM_OVERRIDE)
+AUTO_REAL_DISABLED_MICRO_EARLY_CONFIRM_MARGIN = 0.02
+AUTO_REAL_DISABLED_MICRO_EARLY_CONFIRM_DEFICIT_MAX = 1
 
 # Guardas por bot para reducir desalineación Prob IA vs % Éxito observado en HUD.
 IA_PROMO_MIN_WR_POR_BOT = 0.45         # no promover bots con WR rolling claramente negativo
@@ -2996,7 +2996,7 @@ def _lxv_core_resolver_ronda(logica_unica_real: dict, bot_names: list[str]) -> t
 # Objetivo:
 # - Al emitir una ORDEN manual (bot+ciclo), reservar REAL y mostrarlo YA en HUD.
 # - Evitar recursión/doble llamada.
-# - Si activar_real_inmediato se llama desde otro flujo (no orden_real),
+# - Si activar_demo_neutralizado se llama desde otro flujo (no orden_real),
 #   asegurar que el bot tenga también su orden_real.json escrita (sin recursión).
 
 _last_real_push_ts = {bot: 0.0 for bot in BOT_NAMES}
@@ -3010,16 +3010,7 @@ LAST_LXV_SYNC_TS = 0.0
 LAST_REAL_ORDER_FAIL_REASON = ""
 
 def limpiar_orden_real(bot: str):
-    """
-    Evita re-entradas fantasma:
-    si se liberó REAL, la orden ya no debe quedar viva.
-    """
-    try:
-        p = path_orden(bot)
-        if os.path.exists(p):
-            os.remove(p)
-    except Exception:
-        pass
+    return None
 
 def _set_ui_token_holder(holder: str | None):
     """
@@ -3086,537 +3077,46 @@ def _enforce_single_real_standby(owner: str | None):
     except Exception:
         pass
 
-def _escribir_orden_real_raw(bot: str, ciclo: int, extra_payload: dict | None = None):
-    """
-    Escritura RAW de orden_real (sin activar_real_inmediato, sin recursión).
-    """
-    ciclo = max(1, min(int(ciclo), MAX_CICLOS))
-    payload = {"bot": bot, "ciclo": ciclo, "ts": time.time()}
-    if isinstance(extra_payload, dict) and extra_payload:
-        payload.update({k: v for k, v in extra_payload.items() if v is not None})
-    try:
-        _atomic_write(path_orden(bot), json.dumps(payload, ensure_ascii=False))
-        agregar_evento(f"📝 Orden REAL escrita para {bot}: ciclo #{ciclo}")
-    except Exception as e:
-        globals()["LAST_REAL_ORDER_FAIL_REASON"] = "order_write_fail"
-        try:
-            agregar_evento(f"⚠️ Falló escritura de orden para {bot}: {e}")
-        except Exception:
-            pass
+def _escribir_orden_demo_neutralizado(bot: str, ciclo: int, extra_payload: dict | None = None):
+    return False
 
-def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> bool:
+def activar_demo_neutralizado(bot: str, ciclo: int, origen: str = "orden_real") -> bool:
+    return False
 
-    """
-    Reserva REAL y actualiza HUD de forma INMEDIATA.
+def escribir_orden_demo_neutralizado(bot: str, ciclo: int, extra_payload: dict | None = None) -> bool:
+    globals()["LAST_REAL_ORDER_FAIL_REASON"] = "demo_only"
+    return False
 
-    Regla anti “órdenes fantasma”:
-    - SOLO si origen == "manual" se auto-escribe orden_real.json aquí.
-    - Si la orden viene por escribir_orden_real(...), ese wrapper YA escribe el JSON.
-    - Flujos de sync/UI/token jamás deben escribir orden_real.json.
-    """
-    global LIMPIEZA_PANEL_HASTA, sonido_disparado, marti_paso, REAL_OWNER_LOCK, REAL_ENTRY_BASELINE
-
-    try:
-        if bot not in BOT_NAMES:
-            return False
-        if _bot_blocked_by_bg_close(bot):
-            return False
-
-        now = time.time()
-        _equity_protection_update(now)
-        if origen in ("orden_real", "manual") and _equity_protection_is_active(now):
-            try:
-                agregar_evento(
-                    f"PROTECCION_SALDO: bloqueo nueva REAL {bot.upper()} | restante={_fmt_protection_countdown(_equity_protection_time_left_s(now))}"
-                )
-            except Exception:
-                pass
-            return False
-
-        # 🔒 No permitir reemplazar owner REAL activo por otro bot.
-        # Solo se puede activar si no hay owner o si es el mismo bot.
-        try:
-            owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-        except Exception:
-            owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
-        if owner_lock in BOT_NAMES and owner_lock != bot:
-            try:
-                agregar_evento(f"🔒 REAL bloqueado: {owner_lock.upper()} sigue activo. Ignorando intento de {bot.upper()}.")
-            except Exception:
-                pass
-            try:
-                if origen == "orden_real":
-                    limpiar_orden_real(bot)
-            except Exception:
-                pass
-            return False
-
-        # Anti doble-disparo (tecla rebotona)
-        if (now - _last_real_push_ts.get(bot, 0.0)) < 0.25:
-            return False
-        _last_real_push_ts[bot] = now
-
-        if origen in ("orden_real", "manual", "token_sync"):
-            ciclo_obj = _marti_ciclo_operativo_actual()
-        else:
-            ciclo_obj = max(1, min(int(ciclo), MAX_CICLOS))
-        monto_obj = _marti_monto_por_ciclo(ciclo_obj)
-        try:
-            agregar_evento(
-                f"🧮 Martingala operativa: perdidas={int(marti_ciclos_perdidos)} -> ciclo={int(ciclo_obj)} -> monto={float(monto_obj):.2f}"
-            )
-        except Exception:
-            pass
-
-        # Baseline REAL: a partir de aquí recién aceptamos cierres para este turno.
-        try:
-            REAL_ENTRY_BASELINE[bot] = int(contar_filas_csv(bot) or 0)
-        except Exception:
-            REAL_ENTRY_BASELINE[bot] = 0
-
-        # Idempotencia token_sync: evita re-enganche/spam si ya está el mismo holder/ciclo.
-        if origen == "token_sync":
-            try:
-                owner_now = leer_token_actual()
-                cyc_now = int(estado_bots.get(bot, {}).get("ciclo_actual", 1) or 1)
-                if owner_now == bot and cyc_now == ciclo_obj:
-                    return True
-            except Exception:
-                pass
-
-        # ✅ Solo “manual” auto-escribe orden_real (la orden explícita)
-        if origen == "manual":
-            try:
-                _escribir_orden_real_raw(bot, ciclo_obj)
-            except Exception:
-                pass
-
-        prev_holder = None
-        try:
-            prev_holder = leer_token_actual()  # sincroniza UI
-        except Exception:
-            prev_holder = None
-
-        # Persistir primero token REAL y confirmar después memoria/UI
-        if origen in ("orden_real", "manual", "token_sync"):
-            with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
-                if not got:
-                    globals()["LAST_REAL_ORDER_FAIL_REASON"] = "real_lock"
-                    agregar_evento("⚠️ Token REAL no escrito: lock real.lock ocupado. Se evita activar sin exclusión.")
-                if not got:
-                    globals()["LAST_REAL_ORDER_FAIL_REASON"] = "real_lock"
-                    agregar_evento("⚠️ Token REAL no escrito: lock real.lock ocupado. Se evita activar sin exclusión.")
-                    try:
-                        if origen == "orden_real":
-                            limpiar_orden_real(bot)
-                    except Exception:
-                        pass
-                    return False
-                if _bot_blocked_by_bg_close(bot):
-                    globals()["LAST_REAL_ORDER_FAIL_REASON"] = "bg_close"
-                    try:
-                        if origen == "orden_real":
-                            limpiar_orden_real(bot)
-                    except Exception:
-                        pass
-                    return False
-                ok_write = bool(write_token_atomic(TOKEN_FILE, f"REAL:{bot}"))
-                if not ok_write:
-                    globals()["LAST_REAL_ORDER_FAIL_REASON"] = "token_write_fail"
-                    agregar_evento("⚠️ Token REAL no escrito: fallo de persistencia en token_actual.txt.")
-                    try:
-                        if origen == "orden_real":
-                            limpiar_orden_real(bot)
-                    except Exception:
-                        pass
-                    return False
-
-        # Confirmación en memoria SOLO tras persistencia correcta
-        REAL_OWNER_LOCK = bot
-
-        # 2) Estado interno inmediato (HUD)
-        _set_ui_token_holder(bot)
-        estado_bots[bot]["trigger_real"] = True
-        estado_bots[bot]["ciclo_actual"] = ciclo_obj
-        try:
-            agregar_evento(
-                f"🚨 REAL activado: bot={bot} ciclo={int(ciclo_obj)} monto={float(monto_obj):.2f} origen={origen}"
-            )
-            agregar_evento(
-                f"MARTI_MAESTRO: entrada REAL bot={bot} ciclo=C{int(ciclo_obj)} monto={int(float(monto_obj)) if float(monto_obj).is_integer() else float(monto_obj):g}"
-            )
-        except Exception:
-            pass
-
-        # Congelar probabilidad de señal al entrar REAL (si no estaba ya fijada)
-        # para evitar divergencia visual/ACK durante toda la operación.
-        try:
-            if not isinstance(estado_bots[bot].get("ia_prob_senal"), (int, float)):
-                p_live = estado_bots[bot].get("prob_ia", None)
-                if isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0:
-                    estado_bots[bot]["ia_prob_senal"] = float(p_live)
-        except Exception:
-            pass
-
-        # Marcas de “entrada a real”
-        first_entry = not bool(estado_bots[bot].get("modo_real_anunciado", False))
-        if first_entry or (prev_holder != bot):
-            estado_bots[bot]["modo_real_anunciado"] = True
-            estado_bots[bot]["real_activado_en"] = now
-            estado_bots[bot]["ignore_cierres_hasta"] = now + 15.0
-            estado_bots[bot]["real_timeout_first_warn"] = 0.0
-
-            # Snapshot visual/diagnóstico (independiente del baseline REAL)
-            try:
-                SNAPSHOT_FILAS[bot] = contar_filas_csv(bot)
-            except Exception:
-                SNAPSHOT_FILAS[bot] = 0
-
-            # Mantener marti_paso global coherente con el ciclo elegido
-            try:
-                marti_paso = ciclo_obj - 1
-            except Exception:
-                pass
-
-            try:
-                agregar_evento(f"🚨 REAL INMEDIATO ({origen}) → {bot.upper()} | ciclo #{ciclo_obj}")
-            except Exception:
-                pass
-
-            # Sonido de activación (solo si tu config lo permite)
-            try:
-                reproducir_evento("racha_detectada", es_demo=False, dentro_gatewin=True)
-            except Exception:
-                pass
-
-            LIMPIEZA_PANEL_HASTA = 0
-            sonido_disparado = False
-
-        # 3) Redibujar panel YA
-        try:
-            fn_panel = globals().get("mostrar_panel", None)
-            if callable(fn_panel):
-                fn_panel()
-        except Exception:
-            pass
-
-        # 4) Standby estricto del resto (evita doble-REAL visual)
-        try:
-            _enforce_single_real_standby(bot)
-        except Exception:
-            pass
-
-        return True
-
-    except Exception:
-        return False
-
-def escribir_orden_real(bot: str, ciclo: int, extra_payload: dict | None = None) -> bool:
-    global REAL_OWNER_LOCK
-    """
-    Wrapper oficial:
-    - Escribe orden_real.json (RAW)
-    - Activa REAL inmediato en HUD + token file
-    """
-    ciclo = max(1, min(int(ciclo), MAX_CICLOS))
-    globals()["LAST_REAL_ORDER_FAIL_REASON"] = ""
-    now = time.time()
-    _equity_protection_update(now)
-    if _equity_protection_is_active(now):
-        globals()["LAST_REAL_ORDER_FAIL_REASON"] = "proteccion_saldo"
-        try:
-            agregar_evento(
-                f"PROTECCION_SALDO: orden REAL bloqueada para {bot.upper()} | restante={_fmt_protection_countdown(_equity_protection_time_left_s(now))}"
-            )
-        except Exception:
-            pass
-        return False
-
-    # 🔒 No crear orden si ya hay otro owner REAL activo.
-    try:
-        owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-    except Exception:
-        owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
-
-    if owner_lock in BOT_NAMES and owner_lock != bot:
-        globals()["LAST_REAL_ORDER_FAIL_REASON"] = "owner_real_ocupado"
-        try:
-            agregar_evento(f"🔒 Orden REAL bloqueada para {bot.upper()}: {owner_lock.upper()} está activo.")
-        except Exception:
-            pass
-        return False
-
-    # Veto operativo temprano: no materializar REAL ni escribir orden fantasma
-    # mientras el bot tenga cierre BG pendiente.
-    if _bot_blocked_by_bg_close(bot):
-        globals()["LAST_REAL_ORDER_FAIL_REASON"] = "bg_close"
-        return False
-
-    # ✅ Auditoría Real vs Ficticia: abrir señal SOLO si esta orden está respaldada por IA (prob >= umbral)
-    try:
-        st = estado_bots.get(str(bot), {}) if isinstance(estado_bots, dict) else {}
-        prob_sig = st.get("prob_ia_oper", st.get("prob_ia"))
-        modo_sig = str(st.get("modo_ia") or "").upper()
-        thr_sig = float(get_umbral_operativo())
-        if isinstance(prob_sig, (int, float)) and modo_sig not in ("", "OFF", "0") and float(prob_sig) >= thr_sig:
-            ep_sig = ia_audit_get_last_pre_epoch(str(bot))
-            if isinstance(ep_sig, (int, float)) and int(ep_sig) > 0:
-                log_ia_open(str(bot), int(ep_sig), float(prob_sig), float(thr_sig), str(st.get("fuente") or "ORDEN_REAL"))
-    except Exception:
-        pass
-
-    _escribir_orden_real_raw(bot, ciclo, extra_payload=extra_payload)
-    ok_activate = bool(activar_real_inmediato(bot, ciclo, origen="orden_real"))
-
-    owner_after_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
-    owner_after_file = leer_token_archivo_raw()
-    ok = bool(ok_activate and owner_after_mem == bot and owner_after_file == bot)
-    if not ok and not str(globals().get("LAST_REAL_ORDER_FAIL_REASON", "") or "").strip():
-        globals()["LAST_REAL_ORDER_FAIL_REASON"] = "token_write_fail"
-    if ok:
-        _marti_audit_log_orden(ciclo, bot=bot, origen="escribir_orden_real")
-        if int(ciclo) == 1:
-            agregar_evento("🟢 MARTI-AUDIT: apertura explícita en C1 (nuevo ciclo confirmado).")
-        _marcar_compuerta_real_consumida()
-        DYN_ROOF_STATE["last_real_open_ts"] = float(time.time())
-        try:
-            _REAL_SHADOW_MICRO_OPEN_TS.append(float(time.time()))
-        except Exception:
-            pass
-    return ok
-# === FIN PATCH REAL INMEDIATO ===
-# === IA ACK (handshake maestro→bot: confirma que el PRE-TRADE ya fue evaluado) ===
-IA_ACK_DIR = "ia_ack"
-_LAST_IA_ACK_HEARTBEAT_TS = 0.0
-
-def path_ia_ack(bot: str) -> str:
-    _ensure_dir(IA_ACK_DIR)
-    return os.path.join(IA_ACK_DIR, f"{bot}.json")
-
-def _prob_ia_para_ack(bot: str, st: dict | None = None):
-    """
-    Prob IA efectiva para ACK:
-    - Si el bot tiene una señal ya seleccionada (ia_prob_senal), la conservamos para
-      evitar que el ACK oscile durante reintentos/token-sync.
-    - Si no hay señal bloqueada, SOLO usamos prob_ia viva cuando el bot reporta
-      ia_ready=True y modo_ia != off.
-
-    Esto evita mostrar 0.0% fantasma cuando prob_ia quedó en default durante resets.
-    """
-    try:
-        st = st if isinstance(st, dict) else estado_bots.get(str(bot), {})
-        p_lock = st.get("ia_prob_senal", None)
-        if isinstance(p_lock, (int, float)) and 0.0 <= float(p_lock) <= 1.0:
-            return float(p_lock)
-
-        ia_ready = bool(st.get("ia_ready", False))
-        modo = str(st.get("modo_ia", "off") or "off").strip().lower()
-        p_live = st.get("prob_ia", None)
-        if ia_ready and (modo != "off") and isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0:
-            return float(p_live)
-    except Exception:
-        pass
-    return None
-
-def _resolver_prob_en_juego_ack(bot: str, st: dict | None = None):
-    """Devuelve (prob_en_juego, source) para unificar la fuente de verdad del ACK."""
-    try:
-        st = st if isinstance(st, dict) else estado_bots.get(str(bot), {})
-        p_lock = st.get("ia_prob_senal", None)
-        if isinstance(p_lock, (int, float)) and 0.0 <= float(p_lock) <= 1.0:
-            return float(p_lock), "SENAL"
-
-        ia_ready = bool(st.get("ia_ready", False))
-        modo = str(st.get("modo_ia", "off") or "off").strip().lower()
-        p_live = st.get("prob_ia", None)
-        if isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0 and (modo != "off"):
-            # MODELO: predicción lista y usable para decisión real.
-            if ia_ready:
-                return float(p_live), "MODELO"
-            # LOW_DATA/NO_READY: mostramos prob viva del maestro como referencia visual
-            # (evita ocultar 54.2% en bot cuando el HUD sí la está mostrando).
-            if float(p_live) > 0.0:
-                return float(p_live), "HUD"
-
-        if modo == "off":
-            return None, "OFF"
-        return None, "NO_READY"
-    except Exception:
-        return None, "NO_READY"
-
-def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: str, meta: dict | None):
-    """
-    Escribe un ACK por-bot para que el bot muestre la prob IA asociada a su PRE.
-    Incluye:
-      - prob: prob calibrada (0..1) o None
-      - prob_raw: prob sin calibrar (0..1), si está disponible
-      - calib_factor: factor aplicado (si aplica)
-      - auc / thr / reliable desde model_meta
-    """
-    try:
-        ack_path = path_ia_ack(bot)
-        os.makedirs(os.path.dirname(ack_path), exist_ok=True)
-
-        st = estado_bots.get(str(bot), {}) if isinstance(estado_bots, dict) else {}
-
-        p_hud = _prob_ia_para_ack(bot, st)
-        p_play, p_source = _resolver_prob_en_juego_ack(bot, st)
-        decision_id = st.get("ia_decision_id")
-        if not decision_id:
-            ep = int(epoch) if epoch is not None else 0
-            decision_id = f"{bot}|{ep}"
-        payload = {
-            "bot": str(bot),
-            "epoch": int(epoch) if epoch is not None else 0,
-            "prob": float(prob) if isinstance(prob, (int, float)) else None,
-            # prob_hud/modo_hud = valor vigente que pinta el HUD del maestro (fuente visual principal)
-            "prob_hud": p_hud,
-            "has_prob_hud": isinstance(p_hud, (int, float)),
-            "ia_ready": bool(st.get("ia_ready", False)),
-            "modo_hud": str(st.get("modo_ia", "off") or "off").upper(),
-            "prob_en_juego": p_play,
-            "has_prob_en_juego": isinstance(p_play, (int, float)),
-            "prob_source": str(p_source),
-            "decision_id": str(decision_id),
-            "ack_ts": time.time(),
-            "prob_raw": float(st.get("prob_ia_raw")) if isinstance(st.get("prob_ia_raw"), (int, float)) else None,
-            "calib_factor": float(st.get("cal_factor")) if isinstance(st.get("cal_factor"), (int, float)) else None,
-            "auc": float((meta or {}).get("auc", 0.0) or 0.0),
-            "thr": float((meta or {}).get("threshold", 0.0) or 0.0),
-            "real_thr": float(get_umbral_real_calibrado()),
-            "real_thr_cap": float(AUTO_REAL_THR),
-            "reliable": bool((meta or {}).get("reliable", True)),
-            "modo": str(modo_ia).upper() if modo_ia else "OFF",
-            "model_version": str((meta or {}).get("trained_at", "")),
-            "ts": time.time()
-        }
-
-        with open(ack_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def refrescar_ia_ack_desde_hud(intervalo_s: float = 1.0):
-    """
-    Heartbeat de ACK: mantiene `ia_ack/<bot>.json` sincronizado con el HUD.
-    Objetivo: que los bots vean la prob IA vigente del maestro durante GateWin,
-    incluso si no entraron filas nuevas de CSV en ese instante.
-    """
-    global _LAST_IA_ACK_HEARTBEAT_TS
-    now = time.time()
-    if (now - float(_LAST_IA_ACK_HEARTBEAT_TS or 0.0)) < float(intervalo_s):
-        return
-
-    meta = leer_model_meta() or {}
-    for bot in BOT_NAMES:
-        try:
-            st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
-            ep = st.get("ultimo_epoch_pretrade", 0)
-            if ep is None:
-                ep = 0
-            ep = int(float(ep)) if str(ep).strip() != "" else 0
-            if ep <= 0:
-                continue
-
-            p_eff = _prob_ia_para_ack(bot, st)
-            modo = str(st.get("modo_ia", "off") or "off").upper()
-            escribir_ia_ack(bot, ep, p_eff if isinstance(p_eff, (int, float)) else None, modo, meta)
-        except Exception:
-            continue
-
-    _LAST_IA_ACK_HEARTBEAT_TS = now
+_LAST_IA_ACK_HEARTBEAT_TS = now
 # Leer token actual
 def leer_token_actual():
-    """
-    Lee token_actual.txt y además sincroniza el HUD (estado_bots[*]["token"])
-    para que REAL/DEMO se refleje sin esperar compra del bot.
-    Prioriza lock en memoria para evitar parpadeos DEMO durante REAL en curso.
-    """
-    holder = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
-
-    # Si ya hay owner REAL en memoria, mantenemos sincronía visual inmediata.
-    if holder in BOT_NAMES:
-        _set_ui_token_holder(holder)
-        _enforce_single_real_standby(holder)
-        return holder
-
-    if not os.path.exists(TOKEN_FILE):
-        _set_ui_token_holder(None)
-        return None
+    """Modo DEMO-only: token neutralizado en REAL:none y HUD en DEMO."""
+    global REAL_OWNER_LOCK
+    REAL_OWNER_LOCK = None
     try:
-        with open(TOKEN_FILE, encoding="utf-8", errors="replace") as f:
-            linea = (f.read() or "").strip()
-        if linea.startswith("REAL:"):
-            bot_name = linea.split(":", 1)[1].strip()
-            if bot_name in BOT_NAMES:
-                holder = bot_name
-            elif bot_name == "none":
-                holder = None
-        _set_ui_token_holder(holder)
-        if holder in BOT_NAMES:
-            _enforce_single_real_standby(holder)
-        return holder
-    except Exception as e:
-        try:
-            print(f"⚠️ Error leyendo token: {e}")
-        except Exception:
-            pass
-        fallback = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
-        _set_ui_token_holder(fallback)
-        if fallback in BOT_NAMES:
-            _enforce_single_real_standby(fallback)
-        return fallback
-
+        raw = ""
+        if os.path.exists(TOKEN_FILE):
+            with open(TOKEN_FILE, encoding="utf-8", errors="replace") as f:
+                raw = (f.read() or "").strip()
+        if raw != "REAL:none":
+            write_token_atomic(TOKEN_FILE, "REAL:none")
+    except Exception:
+        pass
+    _set_ui_token_holder(None)
+    return None
 
 def leer_token_archivo_raw():
-    """
-    Lee token_actual.txt SIN priorizar REAL_OWNER_LOCK (para reconciliar desincronías).
-    Retorna bot owner REAL o None.
-    """
-    if not os.path.exists(TOKEN_FILE):
-        return None
-    try:
-        with open(TOKEN_FILE, encoding="utf-8", errors="replace") as f:
-            linea = (f.read() or "").strip()
-        if not linea.startswith("REAL:"):
-            return None
-        bot_name = linea.split(":", 1)[1].strip()
-        if bot_name in BOT_NAMES:
-            return bot_name
-        return None
-    except Exception:
-        return None
+    return None
 
-# Escribir token actual
+# Escribir token actual# Escribir token actual
 async def escribir_token_actual(bot):
-    """
-    Sync UI/token: refleja REAL en HUD y token file.
-    ⚠️ Regla: este flujo NO debe generar orden_real.json.
-    """
     try:
-        try:
-            _ = leer_token_actual()  # sincroniza UI
-        except Exception:
-            pass
-
-        ciclo_objetivo = _marti_ciclo_operativo_actual()
-
-        # ✅ origen "sync_ui": NO debe escribir orden_real.json
-        activar_real_inmediato(bot, ciclo_objetivo, origen="token_sync")
-
-        # No bloqueamos: saldo en background
-        try:
-            asyncio.create_task(obtener_saldo_real())
-        except Exception:
-            try:
-                asyncio.create_task(refresh_saldo_real(forzado=True))
-            except Exception:
-                pass
-
+        write_token_atomic(TOKEN_FILE, "REAL:none")
+        _set_ui_token_holder(None)
     except Exception:
         pass
 
-# Activar remate
+# Activar remate# Activar remate
 def activar_remate(bot: str, reason: str):
     if not estado_bots[bot]["remate_active"]:
         estado_bots[bot]["remate_active"] = True
@@ -8719,10 +8219,10 @@ def ia_prob_valida(bot: str, max_age_s: float = 10.0) -> bool:
     except Exception:
         return False
                                               
-_AUTO_REAL_CACHE = {"ts": 0.0, "thr": float(IA_ACTIVACION_REAL_THR), "n": 0, "max": 0.0}
+_AUTO_REAL_DISABLED_CACHE = {"ts": 0.0, "thr": float(IA_ACTIVACION_REAL_THR), "n": 0, "max": 0.0}
 
 
-def _leer_probs_historicas_ia(max_rows: int = AUTO_REAL_LOG_MAX_ROWS) -> list[float]:
+def _leer_probs_historicas_ia(max_rows: int = AUTO_REAL_DISABLED_LOG_MAX_ROWS) -> list[float]:
     """Lee probs históricas del log de señales IA cerradas para calibrar umbral REAL."""
     path = IA_SIGNALS_LOG
     if not os.path.exists(path):
@@ -8752,28 +8252,28 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
     Reglas:
     - Histórico: cuantíl alto de ia_signals_log.prob (estabilidad).
     - Vivo: mejor prob IA actual de bots (sensibilidad al régimen actual).
-    - Resultado: min(thr_hist, thr_live) acotado en [AUTO_REAL_THR_MIN .. AUTO_REAL_THR].
+    - Resultado: min(thr_hist, thr_live) acotado en [AUTO_REAL_DISABLED_THR_MIN .. AUTO_REAL_DISABLED_THR].
     """
     now = time.time()
     try:
         # En modo clásico, el umbral REAL debe mantenerse fijo al operativo (85%).
         if bool(REAL_CLASSIC_GATE):
             thr_fixed = float(IA_ACTIVACION_REAL_THR)
-            _AUTO_REAL_CACHE["ts"] = now
-            _AUTO_REAL_CACHE["thr"] = thr_fixed
+            _AUTO_REAL_DISABLED_CACHE["ts"] = now
+            _AUTO_REAL_DISABLED_CACHE["thr"] = thr_fixed
             return thr_fixed
 
-        if (not force) and ((now - float(_AUTO_REAL_CACHE.get("ts", 0.0) or 0.0)) < 8.0):
-            return float(_AUTO_REAL_CACHE.get("thr", AUTO_REAL_THR_MIN))
+        if (not force) and ((now - float(_AUTO_REAL_DISABLED_CACHE.get("ts", 0.0) or 0.0)) < 8.0):
+            return float(_AUTO_REAL_DISABLED_CACHE.get("thr", AUTO_REAL_DISABLED_THR_MIN))
 
         # 1) Histórico
-        probs = _leer_probs_historicas_ia(AUTO_REAL_LOG_MAX_ROWS)
+        probs = _leer_probs_historicas_ia(AUTO_REAL_DISABLED_LOG_MAX_ROWS)
         if len(probs) >= 12:
-            q_hist = float(np.quantile(np.array(probs, dtype=float), float(AUTO_REAL_TOP_Q)))
-            thr_hist = q_hist - float(AUTO_REAL_MARGIN)
+            q_hist = float(np.quantile(np.array(probs, dtype=float), float(AUTO_REAL_DISABLED_TOP_Q)))
+            thr_hist = q_hist - float(AUTO_REAL_DISABLED_MARGIN)
             pmax_hist = float(max(probs))
         else:
-            thr_hist = float(AUTO_REAL_THR_MIN)
+            thr_hist = float(AUTO_REAL_DISABLED_THR_MIN)
             pmax_hist = float(max(probs)) if probs else 0.0
 
         # 2) Vivo (último tick): si el mercado/modelo se aplana, el gate también baja
@@ -8788,23 +8288,23 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
             except Exception:
                 continue
 
-        if len(live_probs) >= int(AUTO_REAL_LIVE_MIN_BOTS):
+        if len(live_probs) >= int(AUTO_REAL_DISABLED_LIVE_MIN_BOTS):
             pmax_live = float(max(live_probs))
-            thr_live = pmax_live - float(AUTO_REAL_MARGIN)
+            thr_live = pmax_live - float(AUTO_REAL_DISABLED_MARGIN)
         else:
             pmax_live = 0.0
-            thr_live = float(AUTO_REAL_THR_MIN)
+            thr_live = float(AUTO_REAL_DISABLED_THR_MIN)
 
         thr_raw = min(float(thr_hist), float(thr_live))
-        thr = max(float(AUTO_REAL_THR_MIN), min(float(AUTO_REAL_THR), float(thr_raw)))
+        thr = max(float(AUTO_REAL_DISABLED_THR_MIN), min(float(AUTO_REAL_DISABLED_THR), float(thr_raw)))
 
-        _AUTO_REAL_CACHE["ts"] = now
-        _AUTO_REAL_CACHE["thr"] = float(thr)
-        _AUTO_REAL_CACHE["n"] = int(len(probs))
-        _AUTO_REAL_CACHE["max"] = float(max(pmax_hist, pmax_live))
+        _AUTO_REAL_DISABLED_CACHE["ts"] = now
+        _AUTO_REAL_DISABLED_CACHE["thr"] = float(thr)
+        _AUTO_REAL_DISABLED_CACHE["n"] = int(len(probs))
+        _AUTO_REAL_DISABLED_CACHE["max"] = float(max(pmax_hist, pmax_live))
         return float(thr)
     except Exception:
-        return float(AUTO_REAL_THR_MIN)
+        return float(AUTO_REAL_DISABLED_THR_MIN)
 
 
 def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_real_token=False, expected_ciclo=None):
@@ -13113,9 +12613,9 @@ def mostrar_panel(force: bool = False):
             best_prob = float(mejor[1]) if isinstance(mejor, tuple) and len(mejor) >= 2 else 0.0
             unrel_thr_live = float(_umbral_unrel_operativo(mejor[0] if isinstance(mejor, tuple) else None, best_prob))
             auto_adapt_ok = bool(
-                AUTO_REAL_ALLOW_UNRELIABLE_POST_N15
+                AUTO_REAL_DISABLED_ALLOW_UNRELIABLE_POST_N15
                 and post_n15
-                and (n_samples_live >= int(AUTO_REAL_UNRELIABLE_MIN_N))
+                and (n_samples_live >= int(AUTO_REAL_DISABLED_UNRELIABLE_MIN_N))
                 and (best_prob >= float(unrel_thr_live))
             )
             auto_state = "OK" if reliable else ("ADAPT" if auto_adapt_ok else "BLOCK")
@@ -13129,12 +12629,12 @@ def mostrar_panel(force: bool = False):
             if warmup_live:
                 why_reasons.append("warmup")
             if (not reliable) and (not canary_live) and (not auto_adapt_ok):
-                if not bool(AUTO_REAL_ALLOW_UNRELIABLE_POST_N15):
+                if not bool(AUTO_REAL_DISABLED_ALLOW_UNRELIABLE_POST_N15):
                     why_reasons.append("adapt_off")
                 if not post_n15:
                     why_reasons.append("n15_pending")
-                if n_samples_live < int(AUTO_REAL_UNRELIABLE_MIN_N):
-                    why_reasons.append(f"n<{int(AUTO_REAL_UNRELIABLE_MIN_N)}")
+                if n_samples_live < int(AUTO_REAL_DISABLED_UNRELIABLE_MIN_N):
+                    why_reasons.append(f"n<{int(AUTO_REAL_DISABLED_UNRELIABLE_MIN_N)}")
                 if best_prob < float(unrel_thr_live):
                     why_reasons.append(f"p_best<{float(unrel_thr_live)*100:.1f}%")
             if confirm_h < confirm_need_h:
@@ -13211,7 +12711,7 @@ def mostrar_panel(force: bool = False):
             trig_ok = bool(trigger_ok_h)
             rel_ok = bool(reliable)
             can_ok = bool(canary_live)
-            classic_ok = bool(best_prob >= float(AUTO_REAL_THR_MIN))
+            classic_ok = bool(best_prob >= float(AUTO_REAL_DISABLED_THR_MIN))
 
             p_diag = float(best_prob)
             p_model = float(best_prob)
@@ -13226,7 +12726,7 @@ def mostrar_panel(force: bool = False):
                 ("TRIG", trig_ok),
                 ("REL", rel_ok),
                 ("CAN", can_ok),
-                (f"CLASS{int(round(AUTO_REAL_THR_MIN*100))}", classic_ok),
+                (f"CLASS{int(round(AUTO_REAL_DISABLED_THR_MIN*100))}", classic_ok),
             ]
             funnel_txt = " | ".join([f"{k}{'✅' if v else '❌'}" for k, v in funnel_checks])
 
@@ -13237,7 +12737,7 @@ def mostrar_panel(force: bool = False):
                 ("TRIGGER", trig_ok, 0.0, ""),
                 ("RELIABLE", rel_ok, 0.0, ""),
                 ("CANARY", can_ok, 0.0, ""),
-                (f"CLASS{int(round(AUTO_REAL_THR_MIN*100))}", classic_ok, max(0.0, float(AUTO_REAL_THR_MIN) - best_prob), "%"),
+                (f"CLASS{int(round(AUTO_REAL_DISABLED_THR_MIN*100))}", classic_ok, max(0.0, float(AUTO_REAL_DISABLED_THR_MIN) - best_prob), "%"),
             ]
             principal = next((b for b in bloqueos if not b[1]), None)
             if principal is None:
@@ -13277,9 +12777,9 @@ def mostrar_panel(force: bool = False):
             print(padding + Fore.CYAN + decision_line)
             _runtime_audit_append(decision_line)
             if bool(HUD_COMPACT_MODE):
-                print(padding + Fore.CYAN + f"📏 Umbrales: UNREL={unrel_thr_live*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | CLASSIC={AUTO_REAL_THR_MIN*100:.0f}%")
+                print(padding + Fore.CYAN + f"📏 Umbrales: UNREL={unrel_thr_live*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | CLASSIC={AUTO_REAL_DISABLED_THR_MIN*100:.0f}%")
             else:
-                print(padding + Fore.CYAN + f"📏 Umbrales activos: OBS={umbral_obs*100:.0f}% | UNREL={unrel_thr_live*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | B-GATE={floor_gate_h*100:.1f}% | LIVE_MAX={live_peak_h*100:.1f}% (n={live_peak_n_h}) | CLASSIC={AUTO_REAL_THR_MIN*100:.0f}%")
+                print(padding + Fore.CYAN + f"📏 Umbrales activos: OBS={umbral_obs*100:.0f}% | UNREL={unrel_thr_live*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | B-GATE={floor_gate_h*100:.1f}% | LIVE_MAX={live_peak_h*100:.1f}% (n={live_peak_n_h}) | CLASSIC={AUTO_REAL_DISABLED_THR_MIN*100:.0f}%")
             bloqueos_line = f"📉 Bloqueo dominante ({len(HUD_BLOQUEOS_RECIENTES)} ticks): {top_txt}"
             print(padding + Fore.CYAN + bloqueos_line)
             _runtime_audit_append(bloqueos_line)
@@ -13700,7 +13200,7 @@ def mostrar_panel(force: bool = False):
             modo_base = modo_map.get(modo, (modo.upper() if modo != "off" else "OFF"))
 
             if modo != "off":
-                if confianza >= AUTO_REAL_THR_MIN:
+                if confianza >= AUTO_REAL_DISABLED_THR_MIN:
                     modo_color = Fore.GREEN
                 elif confianza >= 0.55:
                     modo_color = Fore.YELLOW
@@ -14292,7 +13792,7 @@ def forzar_real_manual(bot: str, ciclo: int):
             agregar_evento(f"⛔ Forzar REAL bloqueado en {bot}: saldo insuficiente {float(val):.2f} < {float(requerido):.2f} para ciclo #{ciclo}.")
             return
 
-        if not escribir_orden_real(bot, ciclo):
+        if not escribir_orden_demo_neutralizado(bot, ciclo):
             agregar_evento(f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL.")
             return
 
@@ -14302,7 +13802,7 @@ def forzar_real_manual(bot: str, ciclo: int):
         marti_paso = ciclo - 1
         estado_bots[bot]["fuente"] = "MANUAL"
 
-        # escribir_orden_real(...) ya dejó token+HUD sincronizados; evitamos doble token_sync.
+        # escribir_orden_demo_neutralizado(...) ya dejó token+HUD sincronizados; evitamos doble token_sync.
         agregar_evento(f"⚡ Forzar REAL: {bot} → ciclo #{ciclo} (fuente=MANUAL)")
         with RENDER_LOCK:
             mostrar_panel()
@@ -14707,7 +14207,7 @@ def set_etapa(codigo, detalle_extra=None, anunciar=False):
 # Nueva constante para watchdog de REAL - Bajado para más reactividad
 REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme
 REAL_STUCK_FORCE_RELEASE_S = 90  # segundos extra tras aviso para liberar REAL si no hay cierre
-REAL_TRIGGER_MIN = AUTO_REAL_THR_MIN  # alineado al piso base de 70% para arranque REAL
+REAL_TRIGGER_MIN = AUTO_REAL_DISABLED_THR_MIN  # alineado al piso base de 70% para arranque REAL
 
 # =========================================================
 # TECHO DINÁMICO + COMPUERTA REAL (anti-bug de activación baja)
@@ -14720,7 +14220,7 @@ DYN_ROOF_HOLD_TICKS = DYN_ROOF_BATCH_TICKS * DYN_ROOF_HOLD_BATCHES
 # Derretido lento del techo: -0.5pp por lote tras la paciencia
 DYN_ROOF_STEP = 0.010
 # Piso duro para REAL
-DYN_ROOF_FLOOR = AUTO_REAL_THR_MIN
+DYN_ROOF_FLOOR = AUTO_REAL_DISABLED_THR_MIN
 # Ventaja mínima del mejor vs segundo mejor
 DYN_ROOF_GAP = 0.02
 # Confirmación mínima (ticks consecutivos del MISMO bot)
@@ -14839,10 +14339,10 @@ def _todos_bots_con_n_minimo_real(min_n: int | None = None) -> bool:
 def _umbral_real_operativo_actual() -> float:
     """
     Umbral REAL dinámico con piso inteligente:
-    - En modo confiable: mantiene piso AUTO_REAL_THR_MIN.
+    - En modo confiable: mantiene piso AUTO_REAL_DISABLED_THR_MIN.
     - En unreliable con n mínimo por bot: habilita piso moderado temporal.
     """
-    piso_conf = float(AUTO_REAL_THR_MIN)
+    piso_conf = float(AUTO_REAL_DISABLED_THR_MIN)
     try:
         if _todos_bots_con_n_minimo_real():
             meta = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
@@ -14851,7 +14351,7 @@ def _umbral_real_operativo_actual() -> float:
             reliable = bool(meta.get("reliable", False)) and (not warmup)
 
             if (not reliable):
-                piso_unrel = float(max(0.50, float(AUTO_REAL_UNRELIABLE_FLOOR)))
+                piso_unrel = float(max(0.50, float(AUTO_REAL_DISABLED_UNRELIABLE_FLOOR)))
                 if n_samples >= int(IA_ACTIVACION_REAL_THR_POST_N15_UNREL_MIN_SAMPLES):
                     return float(max(piso_unrel, float(IA_ACTIVACION_REAL_THR_POST_N15_UNREL)))
                 return float(max(piso_unrel, float(IA_ACTIVACION_REAL_THR)))
@@ -14948,7 +14448,7 @@ def _calcular_micro_relax_unrel(force: bool = False) -> dict:
     global _UNREL_MICRO_RELAX_CACHE, _UNREL_MICRO_RELAX_LOG_TS
     out = {"delta": 0.0, "n": 0, "wr": 0.0, "active": False, "why": "off"}
     try:
-        if not bool(AUTO_REAL_UNREL_MICRO_RELAX_ENABLE):
+        if not bool(AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_ENABLE):
             return out
 
         now = time.time()
@@ -14996,28 +14496,28 @@ def _calcular_micro_relax_unrel(force: bool = False) -> dict:
                 continue
 
         n = len(closed)
-        if n < int(AUTO_REAL_UNREL_MICRO_RELAX_MIN_CLOSED):
+        if n < int(AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MIN_CLOSED):
             out.update({"n": n, "why": "n_low"})
             _UNREL_MICRO_RELAX_CACHE = {"ts": now, **out}
             return out
 
         wins = sum(y for y, _thr in closed)
         wr = float(wins / max(1, n))
-        if wr < float(AUTO_REAL_UNREL_MICRO_RELAX_MIN_WINRATE):
+        if wr < float(AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MIN_WINRATE):
             out.update({"n": n, "wr": wr, "why": "wr_low"})
             _UNREL_MICRO_RELAX_CACHE = {"ts": now, **out}
             return out
 
         # Delta gradual por muestra + calidad, acotado por MAX_DELTA.
-        wr_excess = max(0.0, wr - float(AUTO_REAL_UNREL_MICRO_RELAX_MIN_WINRATE))
+        wr_excess = max(0.0, wr - float(AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MIN_WINRATE))
         wr_gain = min(1.0, wr_excess / 0.20)
         n_gain = min(1.0, float(n) / 80.0)
-        delta = float(min(float(AUTO_REAL_UNREL_MICRO_RELAX_MAX_DELTA), float(AUTO_REAL_UNREL_MICRO_RELAX_MAX_DELTA) * wr_gain * n_gain))
+        delta = float(min(float(AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MAX_DELTA), float(AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MAX_DELTA) * wr_gain * n_gain))
 
         out.update({"delta": delta, "n": n, "wr": wr, "active": bool(delta > 0.0), "why": "ok" if delta > 0.0 else "flat"})
         _UNREL_MICRO_RELAX_CACHE = {"ts": now, **out}
 
-        if out["active"] and ((now - float(_UNREL_MICRO_RELAX_LOG_TS or 0.0)) >= float(AUTO_REAL_UNREL_MICRO_RELAX_LOG_COOLDOWN_S)):
+        if out["active"] and ((now - float(_UNREL_MICRO_RELAX_LOG_TS or 0.0)) >= float(AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_LOG_COOLDOWN_S)):
             _UNREL_MICRO_RELAX_LOG_TS = now
             try:
                 agregar_evento(f"🧪 UNREL micro-relax activo: -{delta*100:.1f}pp (n={n}, wr={wr*100:.1f}%).")
@@ -15032,17 +14532,17 @@ def _calcular_micro_relax_unrel(force: bool = False) -> dict:
 def _umbral_unrel_operativo(best_bot: str | None, best_prob: float | None = None) -> float:
     """
     Umbral UNREL operativo con 2 capas:
-    - base conservadora (AUTO_REAL_UNRELIABLE_MIN_PROB).
+    - base conservadora (AUTO_REAL_DISABLED_UNRELIABLE_MIN_PROB).
     - ajuste por lateral + percentil de prob reciente del bot (anti-congelamiento).
 
     Objetivo: no exigir 63% fijo cuando el modelo está bien discriminado en un rango
     más bajo (ej. 55-60%), evitando inflar artificialmente la probabilidad.
     """
     try:
-        base = float(AUTO_REAL_UNRELIABLE_MIN_PROB)
+        base = float(AUTO_REAL_DISABLED_UNRELIABLE_MIN_PROB)
         mr = _calcular_micro_relax_unrel(force=False)
         base = float(max(0.50, base - float(mr.get("delta", 0.0) or 0.0)))
-        if not bool(AUTO_REAL_UNREL_LATERAL_ADAPT_ENABLE):
+        if not bool(AUTO_REAL_DISABLED_UNREL_LATERAL_ADAPT_ENABLE):
             return base
         if not isinstance(best_bot, str) or (best_bot not in BOT_NAMES):
             return base
@@ -15054,12 +14554,12 @@ def _umbral_unrel_operativo(best_bot: str | None, best_prob: float | None = None
 
         # Capa 1: lateral clásico
         lateral_ok = bool(
-            (n_bot >= int(AUTO_REAL_UNREL_LATERAL_MIN_N))
-            and (wr_bot >= float(AUTO_REAL_UNREL_LATERAL_MIN_WR))
-            and (p_best >= float(AUTO_REAL_UNREL_LATERAL_MIN_PROB))
+            (n_bot >= int(AUTO_REAL_DISABLED_UNREL_LATERAL_MIN_N))
+            and (wr_bot >= float(AUTO_REAL_DISABLED_UNREL_LATERAL_MIN_WR))
+            and (p_best >= float(AUTO_REAL_DISABLED_UNREL_LATERAL_MIN_PROB))
         )
         if lateral_ok:
-            return float(max(float(AUTO_REAL_UNREL_LATERAL_MIN_PROB), min(base, p_best)))
+            return float(max(float(AUTO_REAL_DISABLED_UNREL_LATERAL_MIN_PROB), min(base, p_best)))
 
         # Capa 2: adaptación por distribución viva del bot (percentil robusto)
         hist = st.get("ia_prob_hist_raw", [])
@@ -15083,7 +14583,7 @@ def _umbral_unrel_operativo(best_bot: str | None, best_prob: float | None = None
 
         return base
     except Exception:
-        return float(AUTO_REAL_UNRELIABLE_MIN_PROB)
+        return float(AUTO_REAL_DISABLED_UNRELIABLE_MIN_PROB)
 
 
 def _actualizar_compuerta_techo_dinamico() -> dict:
@@ -15365,7 +14865,7 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             trigger_ok = bool(crossed_up)
         if warmup_mode and (not mode_c_active):
             # Modo precisión conservador: bloquear REAL en warmup.
-            if bool(AUTO_REAL_BLOCK_WHEN_WARMUP):
+            if bool(AUTO_REAL_DISABLED_BLOCK_WHEN_WARMUP):
                 trigger_ok = False
             else:
                 if not modo_relajado_n15:
@@ -16586,7 +16086,7 @@ async def cargar_datos_bot(bot, token_actual):
                     elif resultado == "PÉRDIDA":
                         estado_bots[bot]["ia_fallos"] += 1
 
-                if prob_senal is not None and prob_senal >= float(AUTO_REAL_THR_MIN):
+                if prob_senal is not None and prob_senal >= float(AUTO_REAL_DISABLED_THR_MIN):
                     IA90_stats[bot]["n"] += 1
                     if resultado == "GANANCIA":
                         IA90_stats[bot]["ok"] += 1
@@ -18306,7 +17806,7 @@ async def main():
                             _enforce_single_real_standby(activo_real)
 
                         # Umbral maestro calibrado con históricos de Prob IA (top quantil),
-                        # acotado por [AUTO_REAL_THR_MIN .. AUTO_REAL_THR] para activar REAL
+                        # acotado por [AUTO_REAL_DISABLED_THR_MIN .. AUTO_REAL_DISABLED_THR] para activar REAL
                         # usando los valores altos observados recientemente.
                         if REAL_CLASSIC_GATE:
                             umbral_ia_real = float(_umbral_real_operativo_actual())
@@ -18980,7 +18480,7 @@ async def main():
                                     estado_bots[mejor_bot]["ia_senal_pendiente"] = True
                                     extra_payload = dict(lxv_sync_order_payload)
                                     extra_payload["ciclo"] = int(ciclo_auto)
-                                    ok_real = escribir_orden_real(mejor_bot, ciclo_auto, extra_payload=extra_payload)
+                                    ok_real = escribir_orden_demo_neutralizado(mejor_bot, ciclo_auto, extra_payload=extra_payload)
                                     if ok_real:
                                         try:
                                             globals()["LAST_LXV_SYNC_SNAPSHOT_ID"] = str(extra_payload.get("snapshot_id", "") or "")
@@ -19070,13 +18570,13 @@ async def main():
 
                             if not mejor_bot or mejor is None:
                                 agregar_evento(
-                                    f"AUTO_REAL: trigger sin bot operativo válido (selected='{mejor_bot or '--'}')"
+                                    f"AUTO_REAL_DISABLED: trigger sin bot operativo válido (selected='{mejor_bot or '--'}')"
                                 )
                             else:
                                 score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
                                 agregar_evento(f"⚙️ IA AUTO (LOGICA_UNICA_REAL): {mejor_bot} p_oper={prob*100:.1f}% source={real_source_operativo}")
                                 agregar_evento(
-                                    f"AUTO_REAL: trigger recibido bot={mejor_bot} ciclo={ciclo_tag} monto={float(monto):.2f}"
+                                    f"AUTO_REAL_DISABLED: trigger recibido bot={mejor_bot} ciclo={ciclo_tag} monto={float(monto):.2f}"
                                 )
 
                                 owner_prev = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
@@ -19084,7 +18584,7 @@ async def main():
                                 owner_activo = owner_prev if owner_prev in BOT_NAMES else (owner_mem if owner_mem in BOT_NAMES else None)
                                 if owner_activo and owner_activo != mejor_bot:
                                     agregar_evento(
-                                        f"AUTO_REAL: cancelado por owner REAL activo={owner_activo}"
+                                        f"AUTO_REAL_DISABLED: cancelado por owner REAL activo={owner_activo}"
                                     )
                                     if lxv_permite_real_nuevo:
                                         agregar_evento(f"LXV_EXEC_BLOCKED: bot={mejor_bot} | motivo=owner_real_ocupado")
@@ -19092,13 +18592,13 @@ async def main():
                                     val = obtener_valor_saldo()
                                     if val is None:
                                         agregar_evento(
-                                            f"AUTO_REAL: cancelado por saldo no disponible bot={mejor_bot} ciclo={ciclo_tag}"
+                                            f"AUTO_REAL_DISABLED: cancelado por saldo no disponible bot={mejor_bot} ciclo={ciclo_tag}"
                                         )
                                         if lxv_permite_real_nuevo:
                                             agregar_evento(f"LXV_EXEC_BLOCKED: bot={mejor_bot} | motivo=saldo_no_disponible")
                                     elif float(val) < float(monto):
                                         agregar_evento(
-                                            f"AUTO_REAL: cancelado por saldo insuficiente bot={mejor_bot} ciclo={ciclo_tag} saldo={float(val):.2f} monto={float(monto):.2f}"
+                                            f"AUTO_REAL_DISABLED: cancelado por saldo insuficiente bot={mejor_bot} ciclo={ciclo_tag} saldo={float(val):.2f} monto={float(monto):.2f}"
                                         )
                                         if lxv_permite_real_nuevo:
                                             agregar_evento(f"LXV_EXEC_BLOCKED: bot={mejor_bot} | motivo=saldo_insuficiente")
@@ -19111,7 +18611,7 @@ async def main():
                                             agregar_evento(f"LXV_EXEC_BLOCKED: bot={mejor_bot} | motivo=orden_lxv_no_trazable")
                                             ok_real = False
                                         else:
-                                            ok_real = escribir_orden_real(mejor_bot, ciclo_auto, extra_payload=extra_payload)
+                                            ok_real = escribir_orden_demo_neutralizado(mejor_bot, ciclo_auto, extra_payload=extra_payload)
                                         if ok_real:
                                             if isinstance(extra_payload, dict):
                                                 try:
@@ -19125,13 +18625,13 @@ async def main():
                                             activo_real = mejor_bot
                                             marti_activa = True
                                             agregar_evento(
-                                                f"AUTO_REAL: REAL activado bot={mejor_bot} ciclo={ciclo_tag} monto={float(monto):.2f}"
+                                                f"AUTO_REAL_DISABLED: REAL activado bot={mejor_bot} ciclo={ciclo_tag} monto={float(monto):.2f}"
                                             )
                                         else:
                                             estado_bots[mejor_bot]["ia_senal_pendiente"] = False
                                             estado_bots[mejor_bot]["ia_prob_senal"] = None
                                             agregar_evento(
-                                                f"AUTO_REAL: escribir_orden_real devolvió False bot={mejor_bot} ciclo={ciclo_tag}"
+                                                f"AUTO_REAL_DISABLED: escribir_orden_demo_neutralizado devolvió False bot={mejor_bot} ciclo={ciclo_tag}"
                                             )
                                             if lxv_permite_real_nuevo:
                                                 agregar_evento(f"LXV_EXEC_BLOCKED: bot={mejor_bot} | motivo=write_real_failed")
