@@ -1,16 +1,10 @@
 # -*- coding: utf-8 -*-
 import asyncio
-try:
-    import websockets
-    WEBSOCKETS_OK = True
-except Exception:
-    websockets = None
-    WEBSOCKETS_OK = False
+import websockets
 import json
 import csv
 import os
 import sys
-import math
 from datetime import datetime, timezone
 from statistics import mean
 from colorama import Fore, Back, Style, init
@@ -19,6 +13,23 @@ import pandas as pd
 import time  # Added for timestamps in orden_real and BLOQUE 5
 import random  # Added for jitter in BLOQUE 1.3
 import itertools  # For req_counter in api_call
+import math
+import unicodedata
+
+os.environ.setdefault("PYTHONUTF8", "1")
+
+def _configure_console_output_safe():
+    for _stream_name in ("stdout", "stderr"):
+        _stream = getattr(sys, _stream_name, None)
+        if _stream is None:
+            continue
+        try:
+            if hasattr(_stream, "reconfigure"):
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+_configure_console_output_safe()
 
 # === BLINDAJE: señales limpias ===
 import signal
@@ -138,19 +149,20 @@ _sfx_load_all()
 NOMBRE_BOT = "fulll46"
 ARCHIVO_CSV = f"registro_enriquecido_{NOMBRE_BOT}.csv"
 ARCHIVO_TOKEN = "token_actual.txt"  # Fuente única de verdad (coincide con 5R6M)
+BG_CLOSE_GUARD_DIR = "bg_close_guard"
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 ACTIVOS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
 MARTINGALA_DEMO = [1, 2, 4, 8]
 MARTINGALA_REAL = [1, 2, 4, 8]
 VELAS = 20
-PAUSA_POST_OPERACION_S = 40  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
+PAUSA_POST_OPERACION_S = 8  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
 # ==================== VENTANA DE DECISIÓN IA ====================
 # Objetivo: dar tiempo al MAESTRO + humano para decidir pasar a REAL ANTES del BUY.
 # (0 para desactivar)
-VENTANA_DECISION_IA_S = 30        # segundos
+VENTANA_DECISION_IA_S = 12        # segundos
 VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
 # === Filtro avanzado (sin cambiar 13 features) ===
-SCORE_MIN = 2.80            # score mínimo para aceptar un setup
+SCORE_MIN = 2.35            # score mínimo para aceptar un setup
 SCORE_DROP_MAX = 0.70       # caída máxima tolerada al revalidar pre-buy
 REVALIDAR_VELAS_N = 8       # velas mínimas para revalidación rápida
 resultado_global = {"demo": 0.0, "real": 0.0}
@@ -167,8 +179,11 @@ estado_bot = {
     "barra_activa": False,
     "score_senal": None,
     "ciclo_actual": 1,
-    "trade_snapshots": {},
-    "cancelled_pretrades": set(),
+    "round_id_actual": 0,
+    "last_round_ack": 0,
+    "last_lxv_snapshot_consumed": "",
+    "last_lxv_round_consumed": 0,
+    "trade_ack_ctx": {},
 }  # Added modo_manual and barra_activa
 racha_actual_bot = 0  # racha del bot: >0 = racha de GANANCIAS, <0 = racha de PÉRDIDAS
 
@@ -176,17 +191,20 @@ racha_actual_bot = 0  # racha del bot: >0 = racha de GANANCIAS, <0 = racha de P�
 primer_ingreso_real = False  # Sonido solo 1 vez por ventana
 
 # Variables persistentes para saldos últimos válidos
-saldo_demo_last = 0.0
-saldo_real_last = 0.0
+saldo_demo_last = None
+saldo_real_last = None
+saldo_demo_last_ts = 0.0
+saldo_real_last_ts = 0.0
 real_activado_en_bot = 0.0  # BLOQUE 5: Global for activation timestamp
+real_activation_confirmed = False
 
 # BLOQUE 2: Commit guard for REAL operations
-REAL_COMMIT_WINDOW_S = 75
+REAL_COMMIT_WINDOW_S = 20
 last_real_contract_id = None
 real_buy_commit_until = 0.0
 
-# Higiene de riesgo: al saltar a REAL, arrancar en C1 (aunque el maestro sugiera C2+)
-RESET_CICLO_EN_ENTRADA_REAL = True
+# Compat: se mantiene la bandera, pero por política vigente manda siempre la orden fresca del maestro.
+RESET_CICLO_EN_ENTRADA_REAL = False
 
 def commit_guard_active() -> bool:
     return (last_real_contract_id is not None) and (time.time() < real_buy_commit_until)
@@ -201,6 +219,66 @@ def commit_guard_clear():
     last_real_contract_id = None
     real_buy_commit_until = 0.0
 
+def _bg_close_guard_path() -> str:
+    return os.path.join(BG_CLOSE_GUARD_DIR, f"{NOMBRE_BOT}.json")
+
+def _set_bg_close_pending(contract_id, reason: str):
+    now_ts = time.time()
+    guard = {
+        "bot": NOMBRE_BOT,
+        "bg_close_pending": True,
+        "contract_id": str(contract_id or ""),
+        "reason": str(reason or ""),
+        "ts_open": now_ts,
+        "ts_last_update": now_ts,
+    }
+    try:
+        os.makedirs(BG_CLOSE_GUARD_DIR, exist_ok=True)
+        path = _bg_close_guard_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(guard, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception as e:
+        if _print_once("bg-close-guard-set", ttl=20):
+            print(Fore.YELLOW + f"[WARN] bg_close_guard set: {type(e).__name__}: {e}")
+
+def _clear_bg_close_pending(contract_id=None):
+    now_ts = time.time()
+    guard = {
+        "bot": NOMBRE_BOT,
+        "bg_close_pending": False,
+        "contract_id": str(contract_id or ""),
+        "reason": "",
+        "ts_open": 0,
+        "ts_last_update": now_ts,
+    }
+    try:
+        os.makedirs(BG_CLOSE_GUARD_DIR, exist_ok=True)
+        path = _bg_close_guard_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(guard, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception as e:
+        if _print_once("bg-close-guard-clear", ttl=20):
+            print(Fore.YELLOW + f"[WARN] bg_close_guard clear: {type(e).__name__}: {e}")
+
+def _has_bg_close_pending() -> bool:
+    path = _bg_close_guard_path()
+    try:
+        if not os.path.exists(path):
+            return False
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f) or {}
+        return bool(data.get("bg_close_pending", False))
+    except Exception:
+        return False
+
 # >>> PATCH 1 — Helpers de orden de ciclo
 ORDEN_DIR = "orden_real"  # misma carpeta usada por el maestro
 # === IA ACK (handshake maestro→bot) ===
@@ -209,6 +287,33 @@ try:
     os.makedirs(IA_ACK_DIR, exist_ok=True)
 except Exception:
     pass
+
+LXV_CONSUMED_ACK_DIR = "lxv_consumed_ack"
+try:
+    os.makedirs(LXV_CONSUMED_ACK_DIR, exist_ok=True)
+except Exception:
+    pass
+
+def escribir_ack_consumed_real_lxv(bot: str, round_lxv: int, snapshot_id: str, contract_id=None):
+    try:
+        payload = {
+            "bot": str(bot or ""),
+            "round_lxv": int(round_lxv or 0),
+            "snapshot_id": str(snapshot_id or ""),
+            "ts": float(time.time()),
+            "contract_id": str(contract_id or ""),
+            "estado": "consumed_real",
+        }
+        path = os.path.join(LXV_CONSUMED_ACK_DIR, f"{bot}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
 
 def leer_ia_ack(bot: str):
     path = os.path.join(IA_ACK_DIR, f"{bot}.json")
@@ -227,36 +332,344 @@ try:
 except Exception:
     pass
 
+SYNC_ROUND_DIR = "sync_round"
+BARRIER_ENABLED = True
+LXV_CORE_ENABLE = True
+LXV_SOFT_LEVEL_ENABLE = True
+LXV_SOFT_LEVEL_MAX_WAIT_S = 20.0
+LXV_SOFT_LEVEL_POLL_S = 0.5
+
+def _barrier_state_path() -> str:
+    return os.path.join(SYNC_ROUND_DIR, "barrier_state.json")
+
+def _barrier_ack_path(bot: str, round_id: int) -> str:
+    rid = max(1, int(round_id or 1))
+    d = os.path.join(SYNC_ROUND_DIR, f"round_{rid}")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"{bot}.json")
+
+def leer_barrier_state() -> dict:
+    try:
+        p = _barrier_state_path()
+        if not os.path.exists(p):
+            return {"barrier_enabled": bool(BARRIER_ENABLED), "release_round": 1, "current_round": 1}
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+async def esperar_permiso_barrier_siguiente_ronda(round_local_siguiente: int, round_local_actual: int | None = None) -> bool:
+    try:
+        expected_local = int(estado_bot.get("_post_ack_expected_local_round", 0) or 0)
+        current_local = int(round_local_actual or 0)
+        if expected_local > 0 and current_local == expected_local:
+            if _print_once(f"post-ack-route-inconsistent-{expected_local}", ttl=6):
+                print(
+                    Fore.RED
+                    + f"POST_ACK_ROUTE_INCONSISTENT bot={NOMBRE_BOT} round={int(expected_local)} "
+                      f"expected=LOCAL_CONTINUE observed=HARD_WAIT"
+                )
+            estado_bot["_post_ack_expected_local_round"] = 0
+    except Exception:
+        pass
+    while bool(BARRIER_ENABLED):
+        st = leer_barrier_state() or {}
+        if not bool(st.get("barrier_enabled", True)):
+            return True
+        release_round = int(st.get("release_round", 1) or 1)
+        if int(release_round) >= int(round_local_siguiente):
+            if _print_once(f"bot-release-{round_local_siguiente}", ttl=2):
+                print(Fore.GREEN + f"BOT_BARRIER_RELEASED bot={NOMBRE_BOT} round={int(round_local_siguiente)}")
+            return True
+        if _print_once(f"bot-wait-release-{round_local_siguiente}-{release_round}", ttl=6):
+            current_round = int(st.get("current_round", 1) or 1)
+            print(Fore.YELLOW + f"BOT_WAIT_BARRIER bot={NOMBRE_BOT} current_round={int(current_round)} waiting_for={int(round_local_siguiente)} release_round={int(release_round)}")
+        await asyncio.sleep(0.35)
+    return True
+
+async def esperar_nivelacion_suave_post_ronda(round_cerrada: int) -> bool:
+    if not (bool(LXV_SOFT_LEVEL_ENABLE) and bool(LXV_CORE_ENABLE) and bool(BARRIER_ENABLED)):
+        return True
+    if int(round_cerrada or 0) <= 0:
+        return True
+    if _es_token_real(leer_token_desde_archivo()):
+        return True
+    st = leer_barrier_state()
+    if not isinstance(st, dict):
+        return True
+    if not bool(st.get("barrier_enabled", True)):
+        return True
+
+    round_target = int(round_cerrada) + 1
+    t0 = time.time()
+    wait_logged = False
+    while True:
+        st = leer_barrier_state()
+        if not isinstance(st, dict):
+            return True
+        if not bool(st.get("barrier_enabled", True)):
+            return True
+        release_round = int(st.get("release_round", 1) or 1)
+        waited = max(0.0, float(time.time() - t0))
+        if release_round >= round_target:
+            if waited >= 0.2 and _print_once(f"bot-soft-level-ok-{round_target}", ttl=2):
+                print(Fore.YELLOW + f"BOT_SOFT_LEVEL_OK bot={NOMBRE_BOT} round={int(round_cerrada)} waited={waited:.1f}s")
+            return True
+        if waited >= float(LXV_SOFT_LEVEL_MAX_WAIT_S):
+            if _print_once(f"bot-soft-level-timeout-{round_target}", ttl=2):
+                print(Fore.YELLOW + f"BOT_SOFT_LEVEL_TIMEOUT bot={NOMBRE_BOT} round={int(round_cerrada)} waited={waited:.1f}s")
+            return False
+        if (not wait_logged) and _print_once(f"bot-soft-level-wait-{round_target}", ttl=2):
+            print(Fore.YELLOW + f"BOT_SOFT_LEVEL_WAIT bot={NOMBRE_BOT} round={int(round_cerrada)} waited={waited:.1f}s reason=esperando_release_round")
+            wait_logged = True
+        await asyncio.sleep(max(0.1, float(LXV_SOFT_LEVEL_POLL_S)))
+
+def normalizar_resultado_cierre(resultado_raw) -> dict:
+    txt = str(resultado_raw or "").strip().upper()
+    if not txt:
+        return {"resultado_norm": "INDEFINIDO", "resultado_definido": False}
+    txt = unicodedata.normalize("NFKD", txt)
+    txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
+    txt = " ".join(txt.replace("✅", " ").replace("❌", " ").split())
+    map_g = {"GANANCIA", "GANADA", "WIN", "PROFIT", "WON", "GAIN"}
+    map_p = {"PERDIDA", "LOSS", "LOST", "FAIL", "ROJA"}
+    map_e = {"EMPATE", "DRAW", "PUSH", "TIE"}
+    map_i = {"INDEFINIDO", "ERROR", "NONE", "NULL", "OPEN", "PRE_TRADE", "PENDIENTE", "ABIERTO"}
+    if txt in map_g or ("GANAN" in txt) or ("WIN" in txt) or ("PROFIT" in txt):
+        return {"resultado_norm": "GANANCIA", "resultado_definido": True}
+    if txt in map_p or ("PERDI" in txt) or ("LOSS" in txt) or ("LOST" in txt):
+        return {"resultado_norm": "PERDIDA", "resultado_definido": True}
+    if txt in map_e:
+        return {"resultado_norm": "EMPATE", "resultado_definido": True}
+    if txt in map_i:
+        return {"resultado_norm": "INDEFINIDO", "resultado_definido": False}
+    return {"resultado_norm": "INDEFINIDO", "resultado_definido": False}
+
+def escribir_ack_cierre_ronda(round_id: int, resultado: str, trade_uid: str = "", epoch_ref=None):
+    if int(round_id or 0) <= 0:
+        return
+    norm_res = normalizar_resultado_cierre(resultado)
+    payload = {
+        "bot": str(NOMBRE_BOT),
+        "round_id": int(round_id),
+        "status": "CERRADO",
+        "epoch": int(float(epoch_ref or 0) or 0),
+        "ia_decision_id": str(trade_uid or ""),
+        "trade_status": "CERRADO",
+        "pending_open": False,
+        "resultado_raw": str(resultado or ""),
+        "resultado_norm": str(norm_res.get("resultado_norm", "INDEFINIDO") or "INDEFINIDO"),
+        "resultado_definido": bool(norm_res.get("resultado_definido", False)),
+        "ts_close": float(time.time()),
+    }
+    if not bool(payload["resultado_definido"]):
+        return
+    try:
+        os.makedirs(SYNC_ROUND_DIR, exist_ok=True)
+        p = _barrier_ack_path(NOMBRE_BOT, int(round_id))
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, p)
+        estado_bot["last_round_ack"] = int(round_id)
+        if _print_once(f"bot-ack-write-{round_id}", ttl=5):
+            print(Fore.YELLOW + f"BOT_ACK_WRITE bot={NOMBRE_BOT} round={int(round_id)} result={str(payload.get('resultado_norm','INDEFINIDO'))}")
+    except Exception:
+        pass
+
+
+def _is_real_owner_valid_now() -> bool:
+    try:
+        with open(ARCHIVO_TOKEN, "r", encoding="utf-8") as f:
+            linea = (f.read() or "").strip()
+        return linea == f"REAL:{NOMBRE_BOT}"
+    except Exception:
+        return False
+
+def _lxv_post_real_confirmed() -> bool:
+    try:
+        return bool(real_activation_confirmed and _es_token_real(leer_token_desde_archivo()) and _is_real_owner_valid_now())
+    except Exception:
+        return False
+
+
+def _lxv_sync_tiene_pendiente_abierta(archivo_csv: str) -> bool:
+    """True si hay operación PRE_TRADE/PENDIENTE sin cierre definitivo asociado."""
+    try:
+        rec = {}
+        with open(archivo_csv, "r", encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                key = _trade_key_from_row(row)
+                if not key:
+                    continue
+                st = str(row.get("trade_status", "") or "").strip().upper()
+                cur = rec.get(key, {"has_pre": False, "has_close": False})
+                if st in {"PRE_TRADE", "PENDIENTE", "OPEN", "ABIERTO"}:
+                    cur["has_pre"] = True
+                elif st == "CERRADO":
+                    cur["has_close"] = True
+                rec[key] = cur
+        return any(bool(v.get("has_pre")) and not bool(v.get("has_close")) for v in rec.values())
+    except Exception:
+        return False
+
+# Compat temporal (naming previo LXB)
+def _lxb_sync_tiene_pendiente_abierta(archivo_csv: str) -> bool:
+    return _lxv_sync_tiene_pendiente_abierta(archivo_csv)
+
+def leer_orden_real_full(bot: str):
+    """Lee JSON completo de orden_real de forma tolerante/atómica."""
+    ruta = os.path.join(ORDEN_DIR, f"{bot}.json")
+    tmp = ruta + ".tmp"
+    try:
+        if not os.path.exists(ruta):
+            return None
+        with open(ruta, "r", encoding="utf-8") as f, open(tmp, "w", encoding="utf-8") as t:
+            t.write(f.read())
+        with open(tmp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        os.remove(tmp)
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return None
 
 def leer_orden_real(bot: str):
     """
     Devuelve (ciclo, ts, quiet, src) si existe orden fresca, o (None, None, 0, None) si no.
     """
-    ruta = os.path.join(ORDEN_DIR, f"{bot}.json")
-    tmp = ruta + ".tmp"
-    try:
-        if os.path.exists(ruta):
-            with open(ruta, "r", encoding="utf-8") as f, open(tmp, "w", encoding="utf-8") as t:
-                t.write(f.read())
-            with open(tmp, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            os.remove(tmp)
-            if data.get("bot") != bot:
-                return None, None, 0, None
-            cyc = int(data.get("ciclo", 1))
-            ts = float(data.get("ts", 0.0))
-            ttl = int(data.get("ttl", 120))
-            quiet = 1 if int(data.get("quiet", 0)) == 1 else 0
-            src = str(data.get("src", "") or "").upper() or None
-            lim = max(30, min(ttl, 300))  # margen seguro
-            if time.time() - ts > lim:
-                return None, None, 0, None
-            return max(1, min(cyc, MAX_CICLOS)), ts, quiet, src
+    data = leer_orden_real_full(bot)
+    if not isinstance(data, dict):
         return None, None, 0, None
-    except Exception:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+    if data.get("bot") != bot:
         return None, None, 0, None
+    cyc = int(data.get("ciclo", 1))
+    ts = float(data.get("ts", 0.0))
+    ttl = int(data.get("ttl", 120))
+    quiet = 1 if int(data.get("quiet", 0)) == 1 else 0
+    src = str(data.get("src", "") or "").upper() or None
+    if src in {"LXV_SYNC", "LXV_SINCRONIZADO", "LXB_SYNC", "LXB_SINCRONIZADO", "LXV_CORE"}:
+        if _lxv_sync_tiene_pendiente_abierta(ARCHIVO_CSV):
+            if _print_once("lxv-sync-skip-pendiente", ttl=10):
+                print(Fore.YELLOW + "LXV_SYNC_SKIP: ronda=0 | motivo=pendiente_abierta")
+            return None, None, 0, src
+    lim = max(30, min(ttl, 300))  # margen seguro
+    if time.time() - ts > lim:
+        if src in {"LXV_SYNC", "LXV_SINCRONIZADO", "LXB_SYNC", "LXB_SINCRONIZADO", "LXV_CORE"}:
+            if _print_once("lxv-snapshot-exp-hard-block", ttl=15):
+                print(Fore.YELLOW + "LXV_SYNC_ABORT: orden_vencida")
+            return None, None, 0, src
+        return None, None, 0, None
+    return max(1, min(cyc, MAX_CICLOS)), ts, quiet, src
+
+def _es_token_real(token_val) -> bool:
+    return str(token_val or "").strip() == str(TOKEN_REAL).strip()
+
+def _cuenta_label(token_val) -> str:
+    return "REAL" if _es_token_real(token_val) else "DEMO"
+
+def _csv_account_fields(token_val) -> dict:
+    lbl = _cuenta_label(token_val)
+    return {"token": lbl, "cuenta": lbl, "modo": lbl}
+
+def _resolver_ciclo_prioritario(fallback: int = 1):
+    ciclo_orden, _ts, _quiet, _src = leer_orden_real(NOMBRE_BOT)
+    if ciclo_orden:
+        return int(ciclo_orden), "orden"
+    ciclo_forzado = estado_bot.get("ciclo_forzado")
+    if ciclo_forzado:
+        return int(ciclo_forzado), "retenido"
+    if _es_token_real(leer_token_desde_archivo()):
+        return None, "sin_orden"
+    return int(fallback), "fallback"
+
+def _retener_ciclo_para_reinicio(ciclo_actual: int):
+    ciclo_orden, _ts, _quiet, _src = leer_orden_real(NOMBRE_BOT)
+    if ciclo_orden:
+        estado_bot["ciclo_forzado"] = int(ciclo_orden)
+        return int(ciclo_orden), "orden"
+    ciclo_forzado = estado_bot.get("ciclo_forzado")
+    if ciclo_forzado:
+        return int(ciclo_forzado), "retenido"
+    estado_bot["ciclo_forzado"] = int(ciclo_actual or 1)
+    return int(estado_bot["ciclo_forzado"]), "actual"
+
+def validar_permiso_buy_lxv_sync(bot: str, ciclo: int, token_actual, owner_ok: bool = True):
+    data = leer_orden_real_full(bot)
+    if _es_token_real(token_actual) and not isinstance(data, dict):
+        return False, "token_real_sin_orden_valida", None
+    src = str((data or {}).get("src", "") or "").upper()
+    if src not in {"LXV_SYNC", "LXV_SINCRONIZADO", "LXB_SYNC", "LXB_SINCRONIZADO", "LXV_CORE"}:
+        return True, "not_lxv_sync", None
+    if not _es_token_real(token_actual):
+        return False, "token_no_real", data
+    if not bool(owner_ok and _is_real_owner_valid_now()):
+        return False, "owner_lock_invalido", data
+    if not isinstance(data, dict):
+        return False, "orden_ausente", None
+    if str(data.get("bot", "")).strip() != str(bot):
+        return False, "bot_mismatch", data
+    if str(data.get("selected_bot", "")).strip() != str(bot):
+        return False, "selected_bot_mismatch", data
+    round_lxv = int(data.get("round_lxv", 0) or 0)
+    snapshot_id = str(data.get("snapshot_id", "") or "").strip()
+    if round_lxv <= 0:
+        return False, "round_lxv_missing", data
+    if not snapshot_id:
+        return False, "snapshot_id_missing", data
+    if int(ciclo or 0) != int(data.get("ciclo", 0) or 0):
+        return False, "ciclo_mismatch", data
+    ts = float(data.get("ts", 0.0) or 0.0)
+    ttl = int(data.get("ttl", 120) or 120)
+    lim = max(30, min(ttl, 300))
+    if (time.time() - ts) > lim:
+        return False, "ttl_vencido", data
+    if str(estado_bot.get("last_lxv_snapshot_consumed", "") or "") == snapshot_id:
+        if _print_once(f"lxv-skip-consumed-{round_lxv}-{snapshot_id}", ttl=8):
+            print(Fore.YELLOW + f"LXV_SYNC_SKIP_CONSUMED_REAL bot={bot} round={int(round_lxv)} snapshot={snapshot_id}")
+        return False, "snapshot_ya_consumido", data
+    if int(round_lxv) <= int(estado_bot.get("last_lxv_round_consumed", 0) or 0):
+        if _print_once(f"lxv-skip-consumed-round-{round_lxv}", ttl=8):
+            print(Fore.YELLOW + f"LXV_SYNC_SKIP_CONSUMED_REAL bot={bot} round={int(round_lxv)} snapshot={snapshot_id}")
+        return False, "ronda_ya_consumida", data
+    if _lxv_sync_tiene_pendiente_abierta(ARCHIVO_CSV):
+        return False, "pendiente_abierta_local", data
+    if _has_bg_close_pending():
+        return False, "bg_close_pending", data
+    if commit_guard_active():
+        return False, "commit_guard_activo", data
+    return True, "ok", data
+
+
+LXV_CANONICAL_SRCS = {"LXV_CORE", "LXV_SYNC", "LXV_SINCRONIZADO", "LXB_SYNC", "LXB_SINCRONIZADO"}
+
+
+def _build_trade_ack_ctx(round_local: int, data_lxv_buy) -> dict:
+    ctx = {
+        "round_ack": int(round_local or 0),
+        "snapshot_id": "",
+        "src": "",
+        "is_lxv": False,
+        "round_local": int(round_local or 0),
+    }
+    if isinstance(data_lxv_buy, dict):
+        src_lxv = str(data_lxv_buy.get("src", "") or "").upper().strip()
+        round_lxv = int(data_lxv_buy.get("round_lxv", 0) or 0)
+        snapshot_id = str(data_lxv_buy.get("snapshot_id", "") or "").strip()
+        if src_lxv in LXV_CANONICAL_SRCS and round_lxv > 0:
+            ctx.update({
+                "round_ack": int(round_lxv),
+                "snapshot_id": str(snapshot_id),
+                "src": str(src_lxv),
+                "is_lxv": True,
+            })
+    return ctx
 
 # <<< PATCH 1
 
@@ -295,24 +708,6 @@ async def _silencio_temporal(seg=90, fuente=None):
 
 # >>> PATCH (globals) BLOQUE 3
 _contratos_procesados = set()
-_CONTRATOS_MAX_TRACK = 4000
-
-def _registrar_contrato_procesado(contract_id) -> bool:
-    """True si se registró; False si ya estaba. Evita crecimiento infinito del set."""
-    try:
-        cid = int(contract_id)
-    except Exception:
-        return False
-    if cid in _contratos_procesados:
-        return False
-    _contratos_procesados.add(cid)
-    if len(_contratos_procesados) > _CONTRATOS_MAX_TRACK:
-        try:
-            _contratos_procesados.clear()
-            _contratos_procesados.add(cid)
-        except Exception:
-            pass
-    return True
 # <<< PATCH
 
 # >>> PATCH (globals) BLOQUE 3 y BLOQUE 4
@@ -326,6 +721,9 @@ COOLDOWN_REAL_S = 12
 # >>> PATCH BLOQUE 4 y 8
 REFRESCO_SALDO = 12
 _last_saldo_ts = 0.0
+SALDO_CONNECT_OPEN_TIMEOUT_S = 8.0
+SALDO_STARTUP_JITTER_MIN_S = 0.4
+SALDO_STARTUP_JITTER_MAX_S = 2.0
 # <<< PATCH
 
 # >>> BLOQUE A: Buffer de logs para no romper la barra
@@ -373,18 +771,11 @@ CSV_HEADER = [
     "puntaje_estrategia",
     "result_bin",            # 1 o 0 solo en filas cerradas
     "trade_status",          # "PRE_TRADE" o "CERRADO"
+    "token",
+    "cuenta",
+    "modo",
     "epoch",
     "ts",
-    "ret_1m",
-    "ret_3m",
-    "ret_5m",
-    "slope_5m",
-    "rv_20",
-    "range_norm",
-    "bb_z",
-    "body_ratio",
-    "wick_imbalance",
-    "micro_trend_persist",
     "ia_prob_en_juego",
     "ia_prob_source",
     "ia_decision_id",
@@ -392,6 +783,9 @@ CSV_HEADER = [
     "ia_modo_ack",
     "ia_ready_ack"
 ]
+CLOSE_SNAPSHOT_COLS = [f"close_{i}" for i in range(20)]
+CSV_HEADER = CSV_HEADER + CLOSE_SNAPSHOT_COLS
+CSV_HEADER.append("close_origin")
 # =============================================================================
 # CSV — helpers robustos (evita columnas corridas + asegura puntaje 0..1)
 # =============================================================================
@@ -408,6 +802,49 @@ def _to_float(x, default=0.0):
         return float(x)
     except Exception:
         return default
+
+def _warn_close_snapshot_insuficiente(closes, total: int = 20, min_valid: int = 10, cooldown_s: float = 120.0):
+    try:
+        valid_closes = sum(1 for c in list(closes or []) if isinstance(c, (int, float)) and math.isfinite(float(c)) and float(c) > 0.0)
+    except Exception:
+        valid_closes = 0
+    if valid_closes >= int(min_valid):
+        return
+    now = time.time()
+    last = float(globals().get("_last_warn_close_snapshot_ts", 0.0) or 0.0)
+    if (now - last) < float(cooldown_s):
+        return
+    globals()["_last_warn_close_snapshot_ts"] = now
+    print(Fore.YELLOW + f"[WARN] close_snapshot insuficiente: {valid_closes}/{int(total)}")
+
+def _extract_close_snapshot(velas, n: int = 20):
+    closes = []
+    try:
+        seq = list(velas or [])
+        if not seq:
+            return [None] * int(n)
+        seq = seq[-int(n):]
+        seq = list(reversed(seq))  # close_0 = más reciente
+        for v in seq:
+            c = None
+            if isinstance(v, dict):
+                c = v.get("close", v.get("c"))
+            elif isinstance(v, bool):
+                c = None
+            elif isinstance(v, str):
+                c = v.strip()
+            else:
+                c = v
+            try:
+                cf = float(c)
+                closes.append(cf if math.isfinite(cf) else None)
+            except Exception:
+                closes.append(None)
+        while len(closes) < int(n):
+            closes.append(None)
+    except Exception:
+        closes = [None] * int(n)
+    return closes[:int(n)]
 
 def _norm_puntaje_01(condiciones, total_cond=3):
     """
@@ -445,39 +882,67 @@ def _write_row_dict_atomic(archivo_csv: str, row_dict: dict):
     row = [row_dict.get(col, "") for col in CSV_HEADER]
     write_csv_atomic(archivo_csv, row)
 
-# === FIN HEADER FINAL ===
-def _normalizar_payout_desde_monto(payout_raw, monto_raw):
-    """Normaliza payout con semántica única: multiplier (ratio total) y payout_total."""
-    payout_total_f = 0.0
-    payout_mult_f = 0.0
+def _build_trade_uid(epoch_val, symbol, direccion, ciclo, token, ts_iso=None):
     try:
-        monto_f = float(monto_raw) if monto_raw not in (None, "", "nan", "NaN") else 0.0
+        ep = int(float(epoch_val or 0))
     except Exception:
-        monto_f = 0.0
-    try:
-        p = float(payout_raw) if payout_raw not in (None, "", "nan", "NaN") else 0.0
-    except Exception:
-        p = 0.0
-    try:
-        import math
-        if not math.isfinite(p):
-            p = 0.0
-        if not math.isfinite(monto_f):
-            monto_f = 0.0
-    except Exception:
-        pass
-    try:
-        if p > 0 and p <= 3.5:
-            payout_mult_f = p
-            payout_total_f = (monto_f * payout_mult_f) if monto_f > 0 else 0.0
-        elif p > 3.5:
-            payout_total_f = p
-            payout_mult_f = (payout_total_f / monto_f) if monto_f > 0 else 0.0
-    except Exception:
-        payout_total_f = 0.0
-        payout_mult_f = 0.0
-    return float(monto_f), float(payout_total_f), float(payout_mult_f)
+        ep = int(time.time())
+    cyc = int(ciclo) if ciclo is not None else 1
+    sym = str(symbol or "").strip().upper()
+    direc = str(direccion or "").strip().upper()
+    tok = str(token or "NA").strip().upper()
+    ts_part = str(ts_iso or "").strip()
+    return f"{NOMBRE_BOT}|{ep}|C{cyc}|{sym}|{direc}|{tok}|{ts_part}"
 
+def _trade_key_from_row(row: dict) -> str:
+    rid = str((row or {}).get("ia_decision_id", "") or "").strip()
+    if rid:
+        return rid
+    parts = [
+        str((row or {}).get("activo", "") or "").strip().upper(),
+        str((row or {}).get("direction", "") or "").strip().upper(),
+        str((row or {}).get("epoch", "") or "").strip(),
+        str((row or {}).get("ciclo_martingala", "") or "").strip(),
+        str((row or {}).get("ts", "") or "").strip(),
+    ]
+    return "|".join(parts)
+
+def _audit_csv_trade_metrics(archivo_csv: str) -> tuple[int, int, int]:
+    try:
+        rec = {}
+        with open(archivo_csv, "r", encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                status = str(row.get("trade_status", "")).strip().upper()
+                if status not in {"PRE_TRADE", "PENDIENTE", "CERRADO"}:
+                    continue
+                key = _trade_key_from_row(row)
+                if not key:
+                    continue
+                cur = rec.get(key, {"has_pre": False, "has_close": False, "rb": "", "ts": ""})
+                cur["has_pre"] = bool(cur["has_pre"] or status in {"PRE_TRADE", "PENDIENTE"})
+                if status == "CERRADO":
+                    cur["has_close"] = True
+                    cur["rb"] = str(row.get("result_bin", "")).strip()
+                cur["ts"] = str(row.get("ts", cur.get("ts", "")) or cur.get("ts", ""))
+                rec[key] = cur
+
+        total_cerrados = 0
+        ganancias = 0
+        pendientes = 0
+        for v in rec.values():
+            rb = str(v.get("rb", "")).strip()
+            if bool(v.get("has_close", False)) and rb in {"0", "1"}:
+                total_cerrados += 1
+                if rb == "1":
+                    ganancias += 1
+            elif bool(v.get("has_pre", False)):
+                pendientes += 1
+        return int(total_cerrados), int(ganancias), int(pendientes)
+    except Exception:
+        return 0, 0, 0
+
+# === FIN HEADER FINAL ===
 def write_pretrade_snapshot(
     archivo_csv,
     symbol=None,
@@ -554,21 +1019,39 @@ def write_pretrade_snapshot(
         except Exception:
             es_rebote_flag = 1 if (racha_prev <= -4) else 0
 
-    # scalping features (snapshot inmutable del trade)
-    sf = kwargs.get("scalping_features") if isinstance(kwargs.get("scalping_features"), dict) else {}
-    ret_1m = _safe_clip(sf.get("ret_1m", 0.0), -1.0, 1.0, 0.0)
-    ret_3m = _safe_clip(sf.get("ret_3m", 0.0), -1.0, 1.0, 0.0)
-    ret_5m = _safe_clip(sf.get("ret_5m", 0.0), -1.0, 1.0, 0.0)
-    slope_5m = _safe_clip(sf.get("slope_5m", 0.0), -1.0, 1.0, 0.0)
-    rv_20 = _safe_clip(sf.get("rv_20", 0.0), 0.0, 1.0, 0.0)
-    range_norm = _safe_clip(sf.get("range_norm", 0.0), 0.0, 1.0, 0.0)
-    bb_z = _safe_clip(sf.get("bb_z", 0.0), -3.0, 3.0, 0.0)
-    body_ratio = _safe_clip(sf.get("body_ratio", 0.0), 0.0, 1.0, 0.0)
-    wick_imbalance = _safe_clip(sf.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0)
-    micro_trend_persist = _safe_clip(sf.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0)
+    # -------------------------
+    # monto float
+    # -------------------------
+    try:
+        monto_f = float(monto or 0.0)
+    except Exception:
+        monto_f = 0.0
 
-    # monto/payout normalizados (semántica única)
-    monto_f, payout_total_f, payout_mult_f = _normalizar_payout_desde_monto(payout, monto)
+    # -------------------------
+    # payout robusto
+    # -------------------------
+    payout_total_f = 0.0
+    payout_mult_f = 0.0
+    try:
+        p = float(payout) if payout not in (None, "", "nan", "NaN") else 0.0
+        # si NaN/inf, lo anulamos
+        try:
+            if not math.isfinite(p):
+                p = 0.0
+            if not math.isfinite(monto_f):
+                monto_f = 0.0
+        except Exception:
+            pass
+
+        if p > 0 and p <= 3.5:
+            payout_mult_f = p
+            payout_total_f = (monto_f * payout_mult_f) if monto_f > 0 else 0.0
+        elif p > 3.5:
+            payout_total_f = p
+            payout_mult_f = (payout_total_f / monto_f) if monto_f > 0 else 0.0
+    except Exception:
+        payout_total_f = 0.0
+        payout_mult_f = 0.0
 
     # -------------------------
     # puntaje 0..1
@@ -581,7 +1064,14 @@ def write_pretrade_snapshot(
     now = datetime.now(timezone.utc)
     epoch_val = int(now.timestamp())
     ts_val = now.isoformat()
+    trade_uid = str(kwargs.get("trade_uid", "") or "").strip()
+    if not trade_uid:
+        trade_uid = _build_trade_uid(epoch_val, symbol, direccion, ciclo, kwargs.get("token", "NA"), ts_iso=ts_val)
+    close_snapshot = kwargs.get("close_snapshot", None)
+    closes = _extract_close_snapshot(close_snapshot, n=20)
+    _warn_close_snapshot_insuficiente(closes)
 
+    cuenta_fields = _csv_account_fields(kwargs.get("token"))
     row_dict = {
         "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "activo": symbol,
@@ -604,170 +1094,23 @@ def write_pretrade_snapshot(
         "puntaje_estrategia": float(round(float(puntaje01), 6)),
         "result_bin": "",
         "trade_status": "PRE_TRADE",
+        "token": cuenta_fields.get("token", ""),
+        "cuenta": cuenta_fields.get("cuenta", ""),
+        "modo": cuenta_fields.get("modo", ""),
         "epoch": int(epoch_val),
         "ts": ts_val,
-        "ret_1m": ret_1m,
-        "ret_3m": ret_3m,
-        "ret_5m": ret_5m,
-        "slope_5m": slope_5m,
-        "rv_20": rv_20,
-        "range_norm": range_norm,
-        "bb_z": bb_z,
-        "body_ratio": body_ratio,
-        "wick_imbalance": wick_imbalance,
-        "micro_trend_persist": micro_trend_persist,
         "ia_prob_en_juego": "",
         "ia_prob_source": "",
-        "ia_decision_id": f"{NOMBRE_BOT}|{int(epoch_val)}|C{int(ciclo) if ciclo is not None else 1}|{symbol}|{direccion}|{str(kwargs.get('token', 'NA')).upper()}",
+        "ia_decision_id": trade_uid,
         "ia_gate_real": "",
         "ia_modo_ack": "",
         "ia_ready_ack": "",
     }
+    for i, c in enumerate(closes):
+        row_dict[f"close_{i}"] = "" if c is None else float(c)
 
     _write_row_dict_atomic(archivo_csv, row_dict)
     return epoch_val
-
-
-def _trade_snapshot_key(epoch_pretrade, symbol, direccion, ciclo):
-    return f"{int(epoch_pretrade)}|{str(symbol)}|{str(direccion)}|{int(ciclo)}"
-
-
-def set_trade_snapshot(epoch_pretrade, symbol, direccion, ciclo, scalping_features):
-    try:
-        key = _trade_snapshot_key(epoch_pretrade, symbol, direccion, ciclo)
-        snaps = estado_bot.setdefault("trade_snapshots", {})
-        sf = scalping_features if isinstance(scalping_features, dict) else {}
-        snaps[key] = {
-            "epoch_pretrade": int(epoch_pretrade),
-            "symbol": str(symbol),
-            "direccion": str(direccion),
-            "ciclo": int(ciclo),
-            "ret_1m": _safe_clip(sf.get("ret_1m", 0.0), -1.0, 1.0, 0.0),
-            "ret_3m": _safe_clip(sf.get("ret_3m", 0.0), -1.0, 1.0, 0.0),
-            "ret_5m": _safe_clip(sf.get("ret_5m", 0.0), -1.0, 1.0, 0.0),
-            "slope_5m": _safe_clip(sf.get("slope_5m", 0.0), -1.0, 1.0, 0.0),
-            "rv_20": _safe_clip(sf.get("rv_20", 0.0), 0.0, 1.0, 0.0),
-            "range_norm": _safe_clip(sf.get("range_norm", 0.0), 0.0, 1.0, 0.0),
-            "bb_z": _safe_clip(sf.get("bb_z", 0.0), -3.0, 3.0, 0.0),
-            "body_ratio": _safe_clip(sf.get("body_ratio", 0.0), 0.0, 1.0, 0.0),
-            "wick_imbalance": _safe_clip(sf.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0),
-            "micro_trend_persist": _safe_clip(sf.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0),
-        }
-    except Exception:
-        pass
-
-
-def get_trade_snapshot(epoch_pretrade, symbol, direccion, ciclo):
-    try:
-        snaps = estado_bot.get("trade_snapshots", {})
-        if not isinstance(snaps, dict):
-            return None
-        return snaps.get(_trade_snapshot_key(epoch_pretrade, symbol, direccion, ciclo))
-    except Exception:
-        return None
-
-
-def pop_trade_snapshot(epoch_pretrade, symbol, direccion, ciclo):
-    try:
-        snaps = estado_bot.get("trade_snapshots", {})
-        if not isinstance(snaps, dict):
-            return None
-        return snaps.pop(_trade_snapshot_key(epoch_pretrade, symbol, direccion, ciclo), None)
-    except Exception:
-        return None
-
-
-async def registrar_pretrade_cancelado(
-    archivo_csv,
-    epoch_pretrade,
-    symbol,
-    direccion,
-    ciclo,
-    monto=None,
-    rsi9=None,
-    rsi14=None,
-    sma5=None,
-    sma20=None,
-    cruce=None,
-    breakout=None,
-    rsi_reversion=None,
-    payout=None,
-    condiciones=None,
-):
-    if epoch_pretrade is None:
-        return False
-    try:
-        epoch_val = int(epoch_pretrade)
-        key = _trade_snapshot_key(epoch_val, symbol, direccion, ciclo)
-    except Exception:
-        return False
-
-    cancelled = estado_bot.setdefault("cancelled_pretrades", set())
-    if key in cancelled:
-        return False
-
-    snap = get_trade_snapshot(epoch_val, symbol, direccion, ciclo) or {}
-    ack_ctx = estado_bot.get("ack_ctx", {}) if isinstance(estado_bot.get("ack_ctx", {}), dict) else {}
-    ia_prob_en_juego = ack_ctx.get("ia_prob_en_juego", "")
-    ia_prob_source = str(ack_ctx.get("ia_prob_source", "") or "").strip()
-    ia_ready_ack = bool(ack_ctx.get("ia_ready_ack", False))
-    if isinstance(ia_prob_en_juego, (int, float)):
-        ia_prob_source = ia_prob_source or "HUD"
-        ia_ready_ack = True
-    else:
-        ia_prob_source = ia_prob_source or "NO_READY"
-
-    monto_f, payout_total_f, payout_mult_f = _normalizar_payout_desde_monto(payout, monto)
-    puntaje01 = _norm_puntaje_01(condiciones)
-    now = datetime.now(timezone.utc)
-
-    row_dict = {
-        "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "activo": symbol,
-        "direction": direccion,
-        "monto": float(monto_f),
-        "resultado": "CANCELADO",
-        "ganancia_perdida": "",
-        "rsi_9": rsi9,
-        "rsi_14": rsi14,
-        "sma_5": sma5,
-        "sma_20": sma20,
-        "cruce_sma": int(cruce) if cruce is not None else "",
-        "breakout": int(breakout) if breakout is not None else "",
-        "rsi_reversion": int(rsi_reversion) if rsi_reversion is not None else "",
-        "racha_actual": int(racha_actual_bot),
-        "es_rebote": 1 if int(racha_actual_bot) <= -4 else 0,
-        "ciclo_martingala": int(ciclo),
-        "payout_total": float(round(payout_total_f, 2)),
-        "payout_multiplier": float(round(payout_mult_f, 6)),
-        "puntaje_estrategia": float(round(float(puntaje01), 6)),
-        "result_bin": "",
-        "trade_status": "CANCELADO",
-        "epoch": epoch_val,
-        "ts": now.isoformat(),
-        "ret_1m": _safe_clip(snap.get("ret_1m", 0.0), -1.0, 1.0, 0.0),
-        "ret_3m": _safe_clip(snap.get("ret_3m", 0.0), -1.0, 1.0, 0.0),
-        "ret_5m": _safe_clip(snap.get("ret_5m", 0.0), -1.0, 1.0, 0.0),
-        "slope_5m": _safe_clip(snap.get("slope_5m", 0.0), -1.0, 1.0, 0.0),
-        "rv_20": _safe_clip(snap.get("rv_20", 0.0), 0.0, 1.0, 0.0),
-        "range_norm": _safe_clip(snap.get("range_norm", 0.0), 0.0, 1.0, 0.0),
-        "bb_z": _safe_clip(snap.get("bb_z", 0.0), -3.0, 3.0, 0.0),
-        "body_ratio": _safe_clip(snap.get("body_ratio", 0.0), 0.0, 1.0, 0.0),
-        "wick_imbalance": _safe_clip(snap.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0),
-        "micro_trend_persist": _safe_clip(snap.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0),
-        "ia_prob_en_juego": ia_prob_en_juego,
-        "ia_prob_source": ia_prob_source,
-        "ia_decision_id": ack_ctx.get("ia_decision_id", f"{NOMBRE_BOT}|{epoch_val}"),
-        "ia_gate_real": ack_ctx.get("ia_gate_real", ""),
-        "ia_modo_ack": ack_ctx.get("ia_modo_ack", ""),
-        "ia_ready_ack": ia_ready_ack,
-    }
-
-    async with csv_lock:
-        _write_row_dict_atomic(archivo_csv, row_dict)
-    cancelled.add(key)
-    return True
-
 
 def write_token_atomic(path: str, content: str):
     """
@@ -870,28 +1213,6 @@ def write_csv_atomic(path: str, row):
     old_header = []
     data_rows = []
     file_exists = os.path.exists(path) and os.path.getsize(path) > 0
-
-    # Fast-path append: cuando el header coincide, evitar reescritura completa.
-    try:
-        if file_exists:
-            with open(path, "r", newline="", encoding="utf-8", errors="replace") as f:
-                reader = csv.reader(f)
-                current_header = next(reader, None) or []
-            if current_header == CSV_HEADER:
-                new_row = _norm_len(row, num_cols)
-                with open(path, "a", newline="", encoding="utf-8", errors="replace") as f:
-                    w = csv.writer(f)
-                    w.writerow(new_row)
-                    f.flush()
-                    os.fsync(f.fileno())
-                if fd is not None:
-                    try: os.close(fd)
-                    except Exception: pass
-                    try: os.remove(lock_path)
-                    except Exception: pass
-                return
-    except Exception:
-        pass
 
     needs_repair = False
 
@@ -1177,14 +1498,14 @@ if not os.path.exists(ARCHIVO_CSV):
 
 def leer_token_desde_archivo():
     """
-    Lee ARCHIVO_TOKEN. Si contiene f'REAL:{NOMBRE_BOT}' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
+    Lee ARCHIVO_TOKEN. Si contiene 'REAL:fulll45' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
     """
     try:
         with open(ARCHIVO_TOKEN, "r", encoding="utf-8", errors="replace") as f:
             linea = f.read().strip()
             if linea == f"REAL:{NOMBRE_BOT}":
                 return TOKEN_REAL
-    except Exception:
+    except:
         pass
     return TOKEN_DEMO
 
@@ -1199,136 +1520,6 @@ def calcular_rsi(cierres, periodo=14):
     media_per = mean(perdidas) if perdidas else 0.0001
     rs = media_gan / media_per
     return round(100 - (100 / (1 + rs)), 2)
-
-
-def _safe_clip(value, low, high, default=0.0):
-    try:
-        v = float(value)
-        if not math.isfinite(v):
-            return float(default)
-        if v < low:
-            return float(low)
-        if v > high:
-            return float(high)
-        return float(v)
-    except Exception:
-        return float(default)
-
-
-def _safe_div(num, den, default=0.0):
-    try:
-        n = float(num)
-        d = float(den)
-        if (not math.isfinite(n)) or (not math.isfinite(d)) or abs(d) <= 1e-12:
-            return float(default)
-        out = n / d
-        if not math.isfinite(out):
-            return float(default)
-        return float(out)
-    except Exception:
-        return float(default)
-
-
-def calcular_scalping_features(velas):
-    """
-    Calcula 10 features de scalping desde OHLC reales.
-    Robusta: no lanza excepción, devuelve finitos y acotados.
-    """
-    neutrals = {
-        "ret_1m": 0.0,
-        "ret_3m": 0.0,
-        "ret_5m": 0.0,
-        "slope_5m": 0.0,
-        "rv_20": 0.0,
-        "range_norm": 0.0,
-        "bb_z": 0.0,
-        "body_ratio": 0.0,
-        "wick_imbalance": 0.0,
-        "micro_trend_persist": 0.0,
-    }
-    try:
-        if not isinstance(velas, list) or len(velas) < 2:
-            return dict(neutrals)
-
-        o = [float(v.get("open", 0.0) or 0.0) for v in velas]
-        h = [float(v.get("high", 0.0) or 0.0) for v in velas]
-        l = [float(v.get("low", 0.0) or 0.0) for v in velas]
-        c = [float(v.get("close", 0.0) or 0.0) for v in velas]
-
-        for arr in (o, h, l, c):
-            if any((not math.isfinite(x)) for x in arr):
-                return dict(neutrals)
-
-        n = len(c)
-        last_close = c[-1] if n >= 1 else 0.0
-
-        ret_1m = _safe_div((c[-1] - c[-2]), c[-2], 0.0) if n >= 2 else 0.0
-        ret_3m = _safe_div((c[-1] - c[-4]), c[-4], 0.0) if n >= 4 else 0.0
-        ret_5m = _safe_div((c[-1] - c[-6]), c[-6], 0.0) if n >= 6 else 0.0
-
-        slope_5m = 0.0
-        if n >= 5:
-            y = c[-5:]
-            x = [0.0, 1.0, 2.0, 3.0, 4.0]
-            x_mean = 2.0
-            y_mean = sum(y) / 5.0
-            num = sum((x[i] - x_mean) * (y[i] - y_mean) for i in range(5))
-            den = sum((x[i] - x_mean) ** 2 for i in range(5))
-            slope_raw = _safe_div(num, den, 0.0)
-            slope_5m = _safe_div(slope_raw, max(abs(y_mean), 1e-9), 0.0)
-
-        rets = []
-        for i in range(1, min(20, n)):
-            prev = c[-i - 1]
-            cur = c[-i]
-            rets.append(_safe_div((cur - prev), prev, 0.0))
-        rv_20 = (sum(r * r for r in rets) / max(1, len(rets))) ** 0.5 if rets else 0.0
-
-        tr = []
-        for i in range(max(1, n - 20), n):
-            hi = h[i]
-            lo = l[i]
-            pc = c[i - 1] if i - 1 >= 0 else c[i]
-            tr_i = max(hi - lo, abs(hi - pc), abs(lo - pc))
-            tr.append(max(0.0, tr_i))
-        atr_20 = (sum(tr) / max(1, len(tr))) if tr else 0.0
-        range_norm = _safe_div(atr_20, max(abs(last_close), 1e-9), 0.0)
-
-        win = c[-20:] if n >= 20 else c[:]
-        mu = (sum(win) / len(win)) if win else 0.0
-        var = (sum((x - mu) ** 2 for x in win) / max(1, len(win))) if win else 0.0
-        sigma = var ** 0.5
-        bb_z = _safe_div((last_close - mu), max(sigma, 1e-9), 0.0)
-
-        o1, h1, l1, c1 = o[-1], h[-1], l[-1], c[-1]
-        rng = max(h1 - l1, 1e-9)
-        body_ratio = abs(c1 - o1) / rng
-        upper_w = h1 - max(o1, c1)
-        lower_w = min(o1, c1) - l1
-        wick_imbalance = _safe_div((upper_w - lower_w), rng, 0.0)
-
-        signs = []
-        for i in range(max(1, n - 5), n):
-            d = c[i] - c[i - 1]
-            signs.append(1.0 if d > 0 else -1.0 if d < 0 else 0.0)
-        micro_trend_persist = (sum(signs) / len(signs)) if signs else 0.0
-
-        out = {
-            "ret_1m": _safe_clip(ret_1m, -1.0, 1.0, 0.0),
-            "ret_3m": _safe_clip(ret_3m, -1.0, 1.0, 0.0),
-            "ret_5m": _safe_clip(ret_5m, -1.0, 1.0, 0.0),
-            "slope_5m": _safe_clip(slope_5m, -1.0, 1.0, 0.0),
-            "rv_20": _safe_clip(rv_20, 0.0, 1.0, 0.0),
-            "range_norm": _safe_clip(range_norm, 0.0, 1.0, 0.0),
-            "bb_z": _safe_clip(bb_z, -3.0, 3.0, 0.0),
-            "body_ratio": _safe_clip(body_ratio, 0.0, 1.0, 0.0),
-            "wick_imbalance": _safe_clip(wick_imbalance, -1.0, 1.0, 0.0),
-            "micro_trend_persist": _safe_clip(micro_trend_persist, -1.0, 1.0, 0.0),
-        }
-        return out
-    except Exception:
-        return dict(neutrals)
-
 
 def evaluar_estrategia(velas):
     # Normaliza a float por si Deriv devuelve strings
@@ -1558,7 +1749,7 @@ async def obtener_velas(ws, symbol, token, reintentos=4):
 
 async def check_token_and_reconnect(ws, current_token):
     global ultimo_token
-    global primer_ingreso_real, real_activado_en_bot
+    global primer_ingreso_real, real_activado_en_bot, real_activation_confirmed
     token_desde_archivo = leer_token_desde_archivo()
     if token_desde_archivo != current_token:
         # BLOQUE 2 y 9: Anti-rebote + commit guard
@@ -1583,7 +1774,7 @@ async def check_token_and_reconnect(ws, current_token):
             print(Fore.YELLOW + Style.BRIGHT + f"Token cambió a {'REAL' if token_desde_archivo == TOKEN_REAL else 'DEMO'}. Reconectando...")
             try:
                 await ws.close()
-            except Exception:
+            except:
                 pass
             ws = await websockets.connect(DERIV_WS_URL, **WS_KW)  # BLOQUE 1.2
             await authorize_ws(ws, token_desde_archivo)
@@ -1599,17 +1790,18 @@ async def check_token_and_reconnect(ws, current_token):
                         pass
                     primer_ingreso_real = True
                     real_activado_en_bot = time.time()  # BLOQUE 5 and 2: Set activation time
+                    real_activation_confirmed = True
+                    if _print_once("lxv-activation-ok", ttl=10):
+                        print(Fore.YELLOW + f"LXV_SYNC_ACTIVATION: orden válida -> REAL habilitado para {NOMBRE_BOT}")
                     # Lee la orden del maestro y deja seteado el ciclo para la siguiente vuelta
                     cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
-                    if RESET_CICLO_EN_ENTRADA_REAL:
-                        estado_bot["ciclo_forzado"] = 1
-                        if cyc and int(cyc) > 1:
-                            print(Fore.YELLOW + f"Orden maestro C{cyc} ignorada por seguridad: en entrada REAL reinicio a C1.")
-                        else:
-                            print(Fore.YELLOW + "Entrada REAL detectada: reinicio de martingala a C1 por seguridad.")
-                    elif cyc:
+                    if cyc:
                         estado_bot["ciclo_forzado"] = cyc
                         print(Fore.YELLOW + f"Orden maestro detectada: arrancaré en ciclo #{cyc}.")
+                    else:
+                        estado_bot["ciclo_forzado"] = None
+                        if _print_once("lxv-token-real-sin-orden", ttl=10):
+                            print(Fore.YELLOW + "LXV_SYNC_ABORT: token_real_sin_orden_valida")
 
                     # Silenciar ruido guiado por maestro (BLOQUE 3)
                     if quiet or (str(src).upper() == "MANUAL"):
@@ -1622,10 +1814,14 @@ async def check_token_and_reconnect(ws, current_token):
                         if _print_once("rea-REAL", ttl=180):
                             print(Fore.YELLOW + "Reafirmación de REAL (sin reset de martingala)")
                     cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
-                    if RESET_CICLO_EN_ENTRADA_REAL:
-                        estado_bot["ciclo_forzado"] = 1
-                    elif cyc:
+                    if cyc:
                         estado_bot["ciclo_forzado"] = cyc
+                        if not estado_bot.get("barra_activa", False):
+                            print(Fore.YELLOW + f"Orden maestro detectada: continuaré en ciclo #{cyc}.")
+                    else:
+                        estado_bot["ciclo_forzado"] = None
+                        if not estado_bot.get("barra_activa", False) and _print_once("lxv-token-real-sin-orden-2", ttl=10):
+                            print(Fore.YELLOW + "LXV_SYNC_ABORT: token_real_sin_orden_valida")
 
                     if quiet or (str(src).upper() == "MANUAL"):
                         asyncio.create_task(_silencio_temporal(90, fuente=src))
@@ -1635,6 +1831,7 @@ async def check_token_and_reconnect(ws, current_token):
             else:
                 # Saliste de REAL: prepara el sonido para la próxima ventana
                 primer_ingreso_real = False
+                real_activation_confirmed = False
                 reinicio_forzado.set()
             ultimo_token = token_desde_archivo  # mantén vigilante y lazo alineados
             return ws, token_desde_archivo
@@ -1659,6 +1856,9 @@ async def check_token_and_reconnect(ws, current_token):
                     pass
 
                 primer_ingreso_real = True
+                real_activation_confirmed = True
+                if _print_once("lxv-activation-ok", ttl=10):
+                    print(Fore.YELLOW + f"LXV_SYNC_ACTIVATION: orden válida -> REAL habilitado para {NOMBRE_BOT}")
                 try:
                     real_activado_en_bot = time.time()
                 except Exception:
@@ -1669,6 +1869,13 @@ async def check_token_and_reconnect(ws, current_token):
                 if not (MODO_SILENCIOSO and estado_bot.get("modo_manual")) and not estado_bot.get("barra_activa", False):
                     if _print_once("rea-REAL", ttl=180):
                         print(Fore.YELLOW + "Reafirmación de REAL (sin reset de martingala)")
+            cyc, _, _quiet, _src = leer_orden_real(NOMBRE_BOT)
+            if cyc:
+                estado_bot["ciclo_forzado"] = cyc
+            else:
+                estado_bot["ciclo_forzado"] = None
+                if not estado_bot.get("barra_activa", False) and _print_once("lxv-token-real-sin-orden-3", ttl=10):
+                    print(Fore.YELLOW + "LXV_SYNC_ABORT: token_real_sin_orden_valida")
 
         ultimo_token = token_desde_archivo  # mantén vigilante y lazo alineados
         return ws, current_token
@@ -1701,12 +1908,13 @@ async def vigilar_token():
                 reinicio_forzado.set()
 
 async def consultar_saldo_real(ws):
-    global saldo_real_last
+    global saldo_real_last, saldo_real_last_ts
     try:
         data = await api_call(ws, {"balance": 1}, expect_msg_type="balance", timeout=6.0)
         b = data.get("balance", {}).get("balance")
         if b is not None:
             saldo_real_last = float(b)
+            saldo_real_last_ts = float(time.time())
             return saldo_real_last
         if _print_once("saldo-real-empty-main", ttl=20):
             print(Fore.YELLOW + "Balance REAL no disponible (respuesta vacía). Intento conexión dedicada...")
@@ -1721,12 +1929,16 @@ async def consultar_saldo_real(ws):
             b2 = data2.get("balance", {}).get("balance")
             if b2 is not None:
                 saldo_real_last = float(b2)
+                saldo_real_last_ts = float(time.time())
                 return saldo_real_last
     except Exception as e2:
         if _print_once("saldo-real-error-dedicada", ttl=20):
             print(Fore.RED + Style.BRIGHT + f"[ERROR] al consultar saldo REAL (dedicada): {e2}")
     if _print_once("saldo-real-no-disponible-final", ttl=20):
-        print(Fore.YELLOW + "Balance REAL no disponible. Uso último valor válido y **no compro** si no alcanza.")
+        if isinstance(saldo_real_last, (int, float)):
+            print(Fore.YELLOW + "Balance REAL no disponible. Uso último valor válido cacheado.")
+        else:
+            print(Fore.YELLOW + "Balance REAL no disponible y sin histórico válido.")
     return saldo_real_last
 
 # ==================== LÓGICA DE OPERACIÓN ====================
@@ -1734,7 +1946,7 @@ async def buscar_estrategia(ws, ciclo, token):
     print(Fore.MAGENTA + Style.BRIGHT + f"\nBuscando señal válida para Martingala #{ciclo}")
     for intento in range(1, 11):
         if reinicio_forzado.is_set():
-            return "REINTENTAR", None, None, None, None, None, None, None, None, None
+            return "REINTENTAR", None, None, None, None, None, None, None, None, None, None
         if MODO_SILENCIOSO and estado_bot.get("modo_manual"):
             if intento in (1, 5, 10):
                 print(Fore.YELLOW + f"Intento #{intento} (silencioso)...")
@@ -1747,7 +1959,7 @@ async def buscar_estrategia(ws, ciclo, token):
             velas = await obtener_velas(ws, symbol, token, reintentos=4)
             await asyncio.sleep(0.12 + random.uniform(0.0, 0.18))
             if reinicio_forzado.is_set():
-                return "REINTENTAR", None, None, None, None, None, None, None, None, None
+                return "REINTENTAR", None, None, None, None, None, None, None, None, None, None
             try:
                 if len(velas) < VELAS:
                     activos_invalidos.append(symbol)
@@ -1756,7 +1968,8 @@ async def buscar_estrategia(ws, ciclo, token):
                 if condiciones >= 2:
                     score = puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion)
                     if setup_pasa_filtro(score, condiciones):
-                        mejores.append((score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion))
+                        close_snapshot = _extract_close_snapshot(velas, n=20)
+                        mejores.append((score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion, close_snapshot))
                     else:
                         activos_invalidos.append(symbol)
                 else:
@@ -1767,10 +1980,10 @@ async def buscar_estrategia(ws, ciclo, token):
         if mejores:
             # Prioridad: mayor score; desempate por más condiciones
             mejores.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion = mejores[0]
+            score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion, close_snapshot = mejores[0]
             estado_bot["score_senal"] = float(score)
             print(Fore.GREEN + Style.BRIGHT + f"Estrategia válida en {symbol} | Dirección: {direccion} | Condiciones: {condiciones}/3 | Score={score:.3f}")
-            return symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion
+            return symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion, close_snapshot
 
         if errores_intento:
             print(Fore.RED + f"Error WS en activos: {', '.join(errores_intento)} | Intento #{intento}")
@@ -1794,9 +2007,9 @@ async def buscar_estrategia(ws, ciclo, token):
     except Exception:
         pass
     await asyncio.sleep(30)
-    return "REINTENTAR", None, None, None, None, None, None, None, None, None
+    return "REINTENTAR", None, None, None, None, None, None, None, None, None, None
 
-async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, ciclo, payout, condiciones, token_usado_buy, epoch_pretrade=None):
+async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, ciclo, payout, condiciones, token_usado_buy, epoch_pretrade=None, trade_uid=None, close_snapshot=None):
     # ✅ SIEMPRE cerramos/logueamos con el token real del BUY (aunque el maestro cambie token_actual.txt)
     token_antes = token_usado_buy
     print(Fore.CYAN + "=" * 80)
@@ -1808,10 +2021,11 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                 remaining = 60 - i
                 print(Fore.MAGENTA + Style.BRIGHT + "\nToken cambió: finalizo contrato en segundo plano y libero el ciclo.")
                 # No reutilizar 'ws' para evitar choques de recv: usa una conexión propia
+                _set_bg_close_pending(contract_id, reason="token_change_or_ws_cut")
                 asyncio.create_task(finalizar_contrato_bg(
                     contract_id, remaining, symbol, direccion, monto,
                     rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                    ciclo, payout, condiciones, token_antes, epoch_pretrade=epoch_pretrade
+                    ciclo, payout, condiciones, token_antes, epoch_pretrade=epoch_pretrade, trade_uid=trade_uid, close_snapshot=close_snapshot
                 ))
                 estado_bot["interrumpir_ciclo"] = False
                 estado_bot["ciclo_en_progreso"] = False
@@ -1853,10 +2067,9 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
             color = Fore.GREEN if profit > 0 else Fore.RED
             print(color + Style.BRIGHT + f"{resultado}: {profit:.2f} USD")
             # >>> PATCH BLOQUE 3 y 5
-            if not _registrar_contrato_procesado(contract_id):
-                if epoch_pretrade is not None:
-                    pop_trade_snapshot(int(epoch_pretrade), symbol, direccion, ciclo)
+            if contract_id in _contratos_procesados:
                 return resultado, profit
+            _contratos_procesados.add(contract_id)
             # <<< PATCH
             # Registrar resultado SOLO si es definido, con features enriquecidas
             try:
@@ -1879,13 +2092,47 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                 # Resultado SIEMPRE coherente:
                 #   payout_total_f y ratio_total
                 # ==========================================================
-                monto_f, payout_total_f, ratio_total = _normalizar_payout_desde_monto(payout, monto)
+                payout_total_f = 0.0
+                ratio_total = 0.0
+                # monto
+                try:
+                    monto_f = float(monto) if monto not in (None, "", "nan", "NaN") else 0.0
+                except Exception:
+                    monto_f = 0.0
+
+                # payout (puede venir como multiplier o como total)
+                try:
+                    p = float(payout) if payout not in (None, "", "nan", "NaN") else 0.0
+                except Exception:
+                    p = 0.0
+                # si p es NaN/inf, lo anulamos
+                try:
+                    if not math.isfinite(p):
+                        p = 0.0
+                    if not math.isfinite(monto_f):
+                        monto_f = 0.0
+                except Exception:
+                    pass                   
+                try:
+                    if p > 0 and p <= 3.5:
+                        # payout viene como multiplier (1.95 etc.)
+                        ratio_total = p
+                        payout_total_f = (monto_f * ratio_total) if monto_f > 0 else 0.0
+                    elif p > 3.5:
+                        # payout viene como total (USD)
+                        payout_total_f = p
+                        ratio_total = (payout_total_f / monto_f) if monto_f > 0 else 0.0
+                    else:
+                        payout_total_f = 0.0
+                        ratio_total = 0.0
+                except Exception:
+                    payout_total_f = 0.0
+                    ratio_total = 0.0
 
                 now = datetime.now(timezone.utc)
                 epoch_val = int(epoch_pretrade) if epoch_pretrade is not None else int(now.timestamp())
                 ts_val = now.isoformat()
-                snap = get_trade_snapshot(epoch_val, symbol, direccion, ciclo) or {}
-
+                
                 async with csv_lock:
                     # ==========================
                     # CIERRE CERRADO (DICT MODERNO)
@@ -1901,6 +2148,10 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                     else:
                         ia_prob_source = ia_prob_source or "NO_READY"
 
+                    trade_uid_final = str(trade_uid or "").strip()
+                    if not trade_uid_final:
+                        trade_uid_final = _build_trade_uid(epoch_val, symbol, direccion, ciclo, token_antes, ts_iso=ts_val)
+                    cuenta_fields = _csv_account_fields(token_antes)
                     row_dict = {
                         "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "activo": symbol,
@@ -1923,45 +2174,29 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                         "puntaje_estrategia": float(round(float(puntaje01), 6)),
                         "result_bin": 1 if resultado == "GANANCIA" else 0 if resultado == "PÉRDIDA" else "",
                         "trade_status": "CERRADO",
+                        "token": cuenta_fields.get("token", ""),
+                        "cuenta": cuenta_fields.get("cuenta", ""),
+                        "modo": cuenta_fields.get("modo", ""),
                         "epoch": int(epoch_val),
                         "ts": ts_val,
-                        "ret_1m": _safe_clip(snap.get("ret_1m", 0.0), -1.0, 1.0, 0.0),
-                        "ret_3m": _safe_clip(snap.get("ret_3m", 0.0), -1.0, 1.0, 0.0),
-                        "ret_5m": _safe_clip(snap.get("ret_5m", 0.0), -1.0, 1.0, 0.0),
-                        "slope_5m": _safe_clip(snap.get("slope_5m", 0.0), -1.0, 1.0, 0.0),
-                        "rv_20": _safe_clip(snap.get("rv_20", 0.0), 0.0, 1.0, 0.0),
-                        "range_norm": _safe_clip(snap.get("range_norm", 0.0), 0.0, 1.0, 0.0),
-                        "bb_z": _safe_clip(snap.get("bb_z", 0.0), -3.0, 3.0, 0.0),
-                        "body_ratio": _safe_clip(snap.get("body_ratio", 0.0), 0.0, 1.0, 0.0),
-                        "wick_imbalance": _safe_clip(snap.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0),
-                        "micro_trend_persist": _safe_clip(snap.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0),
                         "ia_prob_en_juego": ia_prob_en_juego,
                         "ia_prob_source": ia_prob_source,
-                        "ia_decision_id": ack_ctx.get("ia_decision_id", f"{NOMBRE_BOT}|{int(epoch_val)}"),
+                        "ia_decision_id": trade_uid_final,
                         "ia_gate_real": ack_ctx.get("ia_gate_real", ""),
                         "ia_modo_ack": ack_ctx.get("ia_modo_ack", ""),
                         "ia_ready_ack": ia_ready_ack,
                     }
+                    closes = _extract_close_snapshot(close_snapshot, n=20)
+                    _warn_close_snapshot_insuficiente(closes)
+                    for i, c in enumerate(closes):
+                        row_dict[f"close_{i}"] = "" if c is None else float(c)
                     _write_row_dict_atomic(ARCHIVO_CSV, row_dict)
 
             except Exception as csv_e:
                 print(Fore.RED + f"[ERROR] al escribir CSV: {csv_e}")
             # Calcular y mostrar % de éxito acumulado (solo cierres auditables)
             try:
-                total_cerrados = 0
-                ganancias = 0
-                pendientes = 0
-                with open(ARCHIVO_CSV, "r", encoding="utf-8", newline="") as fh:
-                    reader = csv.DictReader(fh)
-                    for row in reader:
-                        status = str(row.get("trade_status", "")).strip().upper()
-                        rb = str(row.get("result_bin", "")).strip()
-                        if status == "CERRADO" and rb in {"0", "1"}:
-                            total_cerrados += 1
-                            if rb == "1":
-                                ganancias += 1
-                        elif status in {"PRE_TRADE", "PENDIENTE"}:
-                            pendientes += 1
+                total_cerrados, ganancias, pendientes = _audit_csv_trade_metrics(ARCHIVO_CSV)
 
                 if total_cerrados:
                     porcentaje_exito = (ganancias / total_cerrados) * 100
@@ -1993,8 +2228,6 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
             # >>> PATCH BLOQUE 5
             print(Fore.CYAN + f"Ciclo #{ciclo} | {symbol} {direccion} | payout={float(payout or 0):.2f} | {resultado} {profit:+.2f} USD")
             # <<< PATCH
-            if epoch_pretrade is not None:
-                pop_trade_snapshot(int(epoch_pretrade), symbol, direccion, ciclo)
             return resultado, profit
         except websockets.exceptions.ConnectionClosed:
             if _print_once("no-close-frame", ttl=15):
@@ -2017,7 +2250,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
 
 async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto,
                                 rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                                ciclo, payout, condiciones, token_usado, epoch_pretrade=None):
+                                ciclo, payout, condiciones, token_usado, epoch_pretrade=None, trade_uid=None, close_snapshot=None):
     """
     Finaliza un contrato en background cuando hubo cambio de token / reinicio.
     Importante IA:
@@ -2051,10 +2284,9 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
             pass
 
         # === Evitar doble commit por mismo contrato ===
-        if not _registrar_contrato_procesado(contract_id):
-            if epoch_pretrade is not None:
-                pop_trade_snapshot(int(epoch_pretrade), symbol, direccion, ciclo)
+        if contract_id in _contratos_procesados:
             return
+        _contratos_procesados.add(contract_id)
 
         # === IA / racha / es_rebote (SIN FUGA) ===
         try:
@@ -2079,7 +2311,6 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
         now = datetime.now(timezone.utc)
         epoch_val = int(epoch_pretrade) if epoch_pretrade is not None else int(now.timestamp())
         ts_val = now.isoformat()
-        snap = get_trade_snapshot(epoch_val, symbol, direccion, ciclo) or {}
 
         # ==========================================================
         # payout robusto:
@@ -2089,7 +2320,45 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
         #   payout_total = monto * payout_multiplier
         #   payout_multiplier = payout_total / monto
         # ==========================================================
-        monto_f, payout_total, payout_ratio_total = _normalizar_payout_desde_monto(payout, monto)
+        payout_total = 0.0
+        payout_ratio_total = 0.0
+
+        # monto
+        try:
+            monto_f = float(monto) if monto not in (None, "", "nan", "NaN") else 0.0
+        except Exception:
+            monto_f = 0.0
+
+        # payout (puede venir como multiplier o como total)
+        try:
+            p = float(payout) if payout not in (None, "", "nan", "NaN") else 0.0
+        except Exception:
+            p = 0.0
+
+        # si p es NaN/inf, lo anulamos
+        try:
+            if not math.isfinite(p):
+                p = 0.0
+            if not math.isfinite(monto_f):
+                monto_f = 0.0
+        except Exception:
+            pass
+
+        try:
+            if p > 0 and p <= 3.5:
+                # payout viene como multiplier (1.95 etc.)
+                payout_ratio_total = p
+                payout_total = (monto_f * payout_ratio_total) if monto_f > 0 else 0.0
+            elif p > 3.5:
+                # payout viene como total (15.62 etc.)
+                payout_total = p
+                payout_ratio_total = (payout_total / monto_f) if monto_f > 0 else 0.0
+            else:
+                payout_total = 0.0
+                payout_ratio_total = 0.0
+        except Exception:
+            payout_total = 0.0
+            payout_ratio_total = 0.0
 
         async with csv_lock:
             # ==========================
@@ -2107,7 +2376,14 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
                 payout_mult_f = float(payout_ratio_total or 0.0)
             except Exception:
                 payout_mult_f = 0.0
+            payout_total_f = max(0.0, float(payout_total_f))
+            payout_mult_f = max(0.0, float(payout_mult_f))
+            result_bin_val = 1 if resultado == "GANANCIA" else 0 if resultado == "PÉRDIDA" else ""
             puntaje01 = _norm_puntaje_01(condiciones)  # helper REAL del bot
+            trade_uid_final = str(trade_uid or "").strip()
+            if not trade_uid_final:
+                trade_uid_final = _build_trade_uid(epoch_val, symbol, direccion, ciclo, token_usado, ts_iso=ts_val)
+            cuenta_fields = _csv_account_fields(token_usado)
             row_dict = {
                 "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "activo": symbol,
@@ -2128,24 +2404,21 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
                 "payout_total": float(round(payout_total_f, 2)),
                 "payout_multiplier": float(round(payout_mult_f, 6)),
                 "puntaje_estrategia": float(round(float(puntaje01), 6)),
-                "result_bin": 1 if resultado == "GANANCIA" else 0 if resultado == "PÉRDIDA" else "",
+                "result_bin": result_bin_val,
                 "trade_status": "CERRADO",
+                "token": cuenta_fields.get("token", ""),
+                "cuenta": cuenta_fields.get("cuenta", ""),
+                "modo": cuenta_fields.get("modo", ""),
                 "epoch": int(epoch_val),
                 "ts": ts_val,
-                "ret_1m": _safe_clip(snap.get("ret_1m", 0.0), -1.0, 1.0, 0.0),
-                "ret_3m": _safe_clip(snap.get("ret_3m", 0.0), -1.0, 1.0, 0.0),
-                "ret_5m": _safe_clip(snap.get("ret_5m", 0.0), -1.0, 1.0, 0.0),
-                "slope_5m": _safe_clip(snap.get("slope_5m", 0.0), -1.0, 1.0, 0.0),
-                "rv_20": _safe_clip(snap.get("rv_20", 0.0), 0.0, 1.0, 0.0),
-                "range_norm": _safe_clip(snap.get("range_norm", 0.0), 0.0, 1.0, 0.0),
-                "bb_z": _safe_clip(snap.get("bb_z", 0.0), -3.0, 3.0, 0.0),
-                "body_ratio": _safe_clip(snap.get("body_ratio", 0.0), 0.0, 1.0, 0.0),
-                "wick_imbalance": _safe_clip(snap.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0),
-                "micro_trend_persist": _safe_clip(snap.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0),
+                "ia_decision_id": trade_uid_final,
+                "close_origin": "BG_FINALIZE",
             }
+            closes = _extract_close_snapshot(close_snapshot, n=20)
+            _warn_close_snapshot_insuficiente(closes)
+            for i, c in enumerate(closes):
+                row_dict[f"close_{i}"] = "" if c is None else float(c)
             _write_row_dict_atomic(ARCHIVO_CSV, row_dict)
-        if epoch_pretrade is not None:
-            pop_trade_snapshot(int(epoch_pretrade), symbol, direccion, ciclo)
         # === Logs ===
         msg = Fore.CYAN + f"Contrato #{contract_id} finalizado en background: {resultado} {profit:.2f} USD"
         if estado_bot.get("barra_activa", False):
@@ -2165,6 +2438,7 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
             _buffer_log(msg2)
         else:
             print(msg2)
+        _clear_bg_close_pending(contract_id=contract_id)
 
     except Exception as e:
         msg = Fore.YELLOW + f"finalizar_contrato_bg: {type(e).__name__}: {e!r}"
@@ -2193,55 +2467,89 @@ async def leer_csv():
         return []
 
 async def mostrar_saldos():
-    global saldo_demo_last, saldo_real_last, _last_saldo_ts
+    global saldo_demo_last, saldo_real_last, _last_saldo_ts, saldo_demo_last_ts, saldo_real_last_ts
     print(Fore.GREEN + Style.BRIGHT + "\nConsultando Saldos")
+
+    def _fmt_saldo(label: str, val, ts: float):
+        if isinstance(val, (int, float)):
+            age = max(0, int(time.time() - float(ts or 0.0)))
+            stale_tag = f" [STALE {age}s]" if age > int(REFRESCO_SALDO) else ""
+            return f"{label}: {float(val):.2f} USD{stale_tag}"
+        return f"{label}: -- [SALDO NO DISPONIBLE]"
 
     # BLOQUE 8: Rate-limit with cache
     if time.time() - _last_saldo_ts < REFRESCO_SALDO:
-        print(Fore.LIGHTBLUE_EX + Style.BRIGHT + f"Saldo cuenta DEMO (cached): {saldo_demo_last:.2f} USD")
-        print(Fore.YELLOW + Style.BRIGHT + f"Saldo cuenta REAL (cached): {saldo_real_last:.2f} USD")
+        print(Fore.LIGHTBLUE_EX + Style.BRIGHT + _fmt_saldo("Saldo cuenta DEMO (cached)", saldo_demo_last, saldo_demo_last_ts))
+        print(Fore.YELLOW + Style.BRIGHT + _fmt_saldo("Saldo cuenta REAL (cached)", saldo_real_last, saldo_real_last_ts))
         print(Fore.GREEN + "─" * 80)
         return
 
     saldo_demo = saldo_demo_last
     saldo_real = saldo_real_last
 
-    # DEMO
-    try:
-        async with websockets.connect(DERIV_WS_URL, **WS_KW) as ws:  # BLOQUE 1.2
-            await authorize_ws(ws, TOKEN_DEMO, tries=2, timeout=6.0)
-            data = await api_call(ws, {"balance": 1}, expect_msg_type="balance")
-            b = data.get("balance", {}).get("balance")
-            if b is not None:
-                saldo_demo = float(b)
-                saldo_demo_last = saldo_demo
-            else:
-                if _print_once("saldo-demo-empty", ttl=REFRESCO_SALDO):
-                    print(Fore.YELLOW + "Balance DEMO no disponible, usando último valor válido.")
-    except Exception as e:
-        if _print_once("saldo-demo-error", ttl=REFRESCO_SALDO):
-            print(Fore.YELLOW + Style.BRIGHT + f"[WARN] saldo DEMO: {type(e).__name__}: {e!r}")
-            print(Fore.YELLOW + "Balance DEMO no disponible, usando último valor válido.")
+    async def _consultar_saldo_con_reintentos(token: str, etiqueta: str, cache_val, cache_ts: float):
+        tries = 4
+        last_exc = None
+        for intento in range(1, tries + 1):
+            try:
+                async with websockets.connect(
+                    DERIV_WS_URL,
+                    open_timeout=float(SALDO_CONNECT_OPEN_TIMEOUT_S),
+                    **WS_KW,
+                ) as ws:  # BLOQUE 1.2
+                    timeout_auth = 6.0 + (1.5 * max(0, intento - 1))
+                    timeout_balance = 7.0 + (1.5 * max(0, intento - 1))
+                    await authorize_ws(ws, token, tries=2, timeout=timeout_auth)
+                    data = await api_call(ws, {"balance": 1}, expect_msg_type="balance", timeout=timeout_balance)
+                    b = data.get("balance", {}).get("balance")
+                    if b is not None:
+                        return float(b), float(time.time()), None
+                    last_exc = RuntimeError("balance_missing")
+            except Exception as e:
+                last_exc = e
+                if isinstance(e, (asyncio.TimeoutError, TimeoutError)) and _print_once(f"saldo-connect-timeout-{etiqueta}", ttl=4):
+                    print(Fore.YELLOW + f"SALDO_CONNECT_TIMEOUT bot={NOMBRE_BOT} cuenta={etiqueta}")
+                if (intento < tries) and _es_error_transitorio_ws(e):
+                    espera = min(4.5, 0.7 * intento + random.uniform(0.0, 0.5))
+                    if _print_once(f"saldo-connect-retry-{etiqueta}-{intento}", ttl=2):
+                        print(Fore.YELLOW + f"SALDO_CONNECT_RETRY bot={NOMBRE_BOT} cuenta={etiqueta} intento={intento}/{tries}")
+                    await asyncio.sleep(espera)
+                    continue
+                break
+        return cache_val, cache_ts, last_exc
 
-    # REAL
-    try:
-        async with websockets.connect(DERIV_WS_URL, **WS_KW) as ws:  # BLOQUE 1.2
-            await authorize_ws(ws, TOKEN_REAL, tries=2, timeout=6.0)
-            data = await api_call(ws, {"balance": 1}, expect_msg_type="balance")
-            b = data.get("balance", {}).get("balance")
-            if b is not None:
-                saldo_real = float(b)
-                saldo_real_last = saldo_real
-            else:
-                if _print_once("saldo-real-empty", ttl=REFRESCO_SALDO):
-                    print(Fore.YELLOW + "Balance REAL no disponible, usando último valor válido.")
-    except Exception as e:
-        if _print_once("saldo-real-error", ttl=REFRESCO_SALDO):
-            print(Fore.YELLOW + Style.BRIGHT + f"[WARN] saldo REAL: {type(e).__name__}: {e!r}")
-            print(Fore.YELLOW + "Balance REAL no disponible, usando último valor válido.")
+    saldo_demo, saldo_demo_ts_new, err_demo = await _consultar_saldo_con_reintentos(TOKEN_DEMO, "DEMO", saldo_demo_last, saldo_demo_last_ts)
+    if isinstance(saldo_demo, (int, float)):
+        saldo_demo_last = float(saldo_demo)
+        saldo_demo_last_ts = float(saldo_demo_ts_new or time.time())
+    elif err_demo is None and _print_once("saldo-demo-empty", ttl=REFRESCO_SALDO):
+        print(Fore.YELLOW + "Balance DEMO no disponible, usando último valor válido.")
+    elif err_demo is not None and _print_once("saldo-demo-error", ttl=REFRESCO_SALDO):
+        print(Fore.YELLOW + Style.BRIGHT + f"[WARN] saldo DEMO: {type(err_demo).__name__}: {err_demo!r}")
+        print(Fore.YELLOW + "Balance DEMO no disponible, usando último valor válido.")
+    if not isinstance(saldo_demo, (int, float)):
+        if isinstance(saldo_demo_last, (int, float)) and _print_once("saldo-demo-cache-fallback", ttl=REFRESCO_SALDO):
+            print(Fore.YELLOW + f"SALDO_FALLBACK_CACHE bot={NOMBRE_BOT} cuenta=DEMO")
+        elif _print_once("saldo-demo-no-balance", ttl=REFRESCO_SALDO):
+            print(Fore.YELLOW + f"SALDO_CONTINUE_WITHOUT_BALANCE bot={NOMBRE_BOT}")
 
-    print(Fore.LIGHTBLUE_EX + Style.BRIGHT + f"Saldo cuenta DEMO: {saldo_demo:.2f} USD")
-    print(Fore.YELLOW + Style.BRIGHT + f"Saldo cuenta REAL: {saldo_real:.2f} USD")
+    saldo_real, saldo_real_ts_new, err_real = await _consultar_saldo_con_reintentos(TOKEN_REAL, "REAL", saldo_real_last, saldo_real_last_ts)
+    if isinstance(saldo_real, (int, float)):
+        saldo_real_last = float(saldo_real)
+        saldo_real_last_ts = float(saldo_real_ts_new or time.time())
+    elif err_real is None and _print_once("saldo-real-empty", ttl=REFRESCO_SALDO):
+        print(Fore.YELLOW + "Balance REAL no disponible, usando último valor válido.")
+    elif err_real is not None and _print_once("saldo-real-error", ttl=REFRESCO_SALDO):
+        print(Fore.YELLOW + Style.BRIGHT + f"[WARN] saldo REAL: {type(err_real).__name__}: {err_real!r}")
+        print(Fore.YELLOW + "Balance REAL no disponible, usando último valor válido.")
+    if not isinstance(saldo_real, (int, float)):
+        if isinstance(saldo_real_last, (int, float)) and _print_once("saldo-real-cache-fallback", ttl=REFRESCO_SALDO):
+            print(Fore.YELLOW + f"SALDO_FALLBACK_CACHE bot={NOMBRE_BOT} cuenta=REAL")
+        elif _print_once("saldo-real-no-balance", ttl=REFRESCO_SALDO):
+            print(Fore.YELLOW + f"SALDO_CONTINUE_WITHOUT_BALANCE bot={NOMBRE_BOT}")
+
+    print(Fore.LIGHTBLUE_EX + Style.BRIGHT + _fmt_saldo("Saldo cuenta DEMO", saldo_demo, saldo_demo_last_ts))
+    print(Fore.YELLOW + Style.BRIGHT + _fmt_saldo("Saldo cuenta REAL", saldo_real, saldo_real_last_ts))
     print(Fore.GREEN + "─" * 80)
     print(Fore.GREEN + "─" * 80)
     _last_saldo_ts = time.time()
@@ -2251,9 +2559,10 @@ async def mostrar_saldos():
 async def ejecutar_panel():
     global ultimo_token
     global _ws_fail_streak
-    global primer_ingreso_real, real_activado_en_bot
 
     # Eliminado: reset_csv_and_total() para acumular histórico completo
+    startup_jitter = random.uniform(float(SALDO_STARTUP_JITTER_MIN_S), float(SALDO_STARTUP_JITTER_MAX_S))
+    await asyncio.sleep(startup_jitter)
     await mostrar_saldos()
     # =================== PATCH CSV (SOLO) ===================
     global _CSV_REPARADO_1VEZ
@@ -2302,8 +2611,14 @@ async def ejecutar_panel():
             if reinicio_forzado.is_set():
                 estado_bot["reinicios_consecutivos"] += 1
                 if estado_bot["reinicios_consecutivos"] > 5:
-                    print(Fore.RED + "Demasiados reinicios consecutivos. Fallback a ciclo #1 + backoff 5s.")
-                    estado_bot["ciclo_forzado"] = 1
+                    ciclo_reanudado, src_reanudado = _resolver_ciclo_prioritario(fallback=1)
+                    if ciclo_reanudado:
+                        estado_bot["ciclo_forzado"] = int(ciclo_reanudado)
+                        print(Fore.RED + f"Demasiados reinicios consecutivos: conservando continuidad martingala ({src_reanudado}) en C{int(ciclo_reanudado)}. Sin reset a C1.")
+                    else:
+                        estado_bot["ciclo_forzado"] = None
+                        if _print_once("lxv-sync-abort-reinicio", ttl=5):
+                            print(Fore.YELLOW + "LXV_SYNC_ABORT: token_real_sin_orden_valida")
                     estado_bot["reinicios_consecutivos"] = 0
                     await asyncio.sleep(5)
 
@@ -2339,9 +2654,24 @@ async def ejecutar_panel():
             martingala = MARTINGALA_REAL if modo_real else MARTINGALA_DEMO
 
             sep_ciclo()
-            ciclo_orden, _ts, _quiet, _src = leer_orden_real(NOMBRE_BOT)
-            ciclo_forzado = estado_bot.get("ciclo_forzado")
-            ciclo = ciclo_orden or ciclo_forzado or 1
+            ciclo, ciclo_src = _resolver_ciclo_prioritario(fallback=1)
+            ciclo_orden = ciclo if ciclo_src == "orden" else None
+            ciclo_forzado = ciclo if ciclo_src == "retenido" else estado_bot.get("ciclo_forzado")
+            if ciclo_orden:
+                if _print_once(f"ciclo-maestro-{ciclo_orden}", ttl=30):
+                    print(Fore.YELLOW + f"Ciclo maestro vigente: C{int(ciclo_orden)}.")
+            elif ciclo_forzado:
+                if _print_once(f"ciclo-retenido-{ciclo_forzado}", ttl=30):
+                    print(Fore.YELLOW + f"Reanudando ciclo retenido: C{int(ciclo_forzado)}.")
+            else:
+                if modo_real:
+                    estado_bot["ciclo_forzado"] = None
+                    if _print_once("lxv-sync-abort-c1", ttl=5):
+                        print(Fore.YELLOW + "LXV_SYNC_ABORT: token_real_sin_orden_valida")
+                    await asyncio.sleep(0.35)
+                    continue
+                if _print_once("ciclo-fallback-c1", ttl=30):
+                    print(Fore.YELLOW + "Sin orden fresca ni ciclo retenido: usando fallback C1.")
 
             estado_bot["ciclo_forzado"] = None
             estado_bot["reinicios_consecutivos"] = 0
@@ -2357,9 +2687,8 @@ async def ejecutar_panel():
                 ws, current_token = await check_token_and_reconnect(ws, current_token)
 
                 if reinicio_forzado.is_set():
-                    estado_bot["ciclo_forzado"] = ciclo
-                    proximo = estado_bot.get("ciclo_forzado") or ciclo
-                    print(Fore.YELLOW + Style.BRIGHT + f"Reinicio forzado durante ciclo. Ciclo actual #{ciclo} → siguiente #{proximo}.")
+                    proximo, origen = _retener_ciclo_para_reinicio(ciclo)
+                    print(Fore.YELLOW + Style.BRIGHT + f"Reinicio forzado durante ciclo. Ciclo actual #{ciclo} → siguiente #{proximo} ({origen}).")
                     reinicio_forzado.clear()
                     await asyncio.sleep(2)
                     indefinidos_consecutivos = 0
@@ -2383,22 +2712,32 @@ async def ejecutar_panel():
                         print(Fore.CYAN + Style.BRIGHT + "WS reabierto por salud. Retomando MISMO ciclo.")
                     await asyncio.sleep(0.6 + random.uniform(0.0, 0.5))
 
+                round_next = int(estado_bot.get("round_id_actual", 0) or 0) + 1
+                if bool(LXV_CORE_ENABLE) and (not await esperar_permiso_barrier_siguiente_ronda(round_next, round_local_actual=int(estado_bot.get("round_id_actual", 0) or 0))):
+                    if _print_once(f"bot-abort-prebuy-roundgate-{ciclo}", ttl=3):
+                        print(Fore.YELLOW + f"BOT_ROUND_ABORT_PREBUY bot={NOMBRE_BOT} ciclo={int(ciclo)} motivo=round_gate_denied accion=same_cycle_no_barrier")
+                    continue
+
                 # ========= BUSCAR SEÑAL =========
-                symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion = await buscar_estrategia(ws, ciclo, current_token)
+                symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion, close_snapshot = await buscar_estrategia(ws, ciclo, current_token)
 
                 if symbol == "REINTENTAR" or symbol is None:
+                    if _print_once(f"bot-abort-prebuy-signal-{ciclo}", ttl=3):
+                        print(Fore.YELLOW + f"BOT_ROUND_ABORT_PREBUY bot={NOMBRE_BOT} ciclo={int(ciclo)} motivo=signal_retry accion=same_cycle_no_barrier")
                     continue
 
                 if not all([direccion, rsi9 is not None, rsi14 is not None]):
                     print(Fore.YELLOW + "Datos de estrategia incompletos. Reintentando ciclo.")
+                    if _print_once(f"bot-abort-prebuy-data-{ciclo}", ttl=3):
+                        print(Fore.YELLOW + f"BOT_ROUND_ABORT_PREBUY bot={NOMBRE_BOT} ciclo={int(ciclo)} motivo=datos_incompletos accion=same_cycle_no_barrier")
                     continue
 
                 # Rechequeo token justo antes de avanzar
                 ws, current_token = await check_token_and_reconnect(ws, current_token)
 
                 if reinicio_forzado.is_set():
-                    estado_bot["ciclo_forzado"] = ciclo
-                    print(Fore.YELLOW + Style.BRIGHT + f"Reinicio forzado tras buscar estrategia. Mantengo ciclo #{ciclo}.")
+                    proximo, origen = _retener_ciclo_para_reinicio(ciclo)
+                    print(Fore.YELLOW + Style.BRIGHT + f"Reinicio forzado tras buscar estrategia. Mantengo ciclo #{proximo} ({origen}).")
                     reinicio_forzado.clear()
                     await asyncio.sleep(2)
                     indefinidos_consecutivos = 0
@@ -2406,15 +2745,25 @@ async def ejecutar_panel():
 
                 modo_real_now = (current_token == TOKEN_REAL)
                 if modo_real_now != modo_real:
-                    estado_bot["ciclo_forzado"] = ciclo
-                    print(Fore.YELLOW + Style.BRIGHT + "Token cambió justo antes de validar saldo/compra. Reinicio limpio para mantener sincronía con el maestro.")
+                    proximo, origen = _retener_ciclo_para_reinicio(ciclo)
+                    print(Fore.YELLOW + Style.BRIGHT + f"Token cambió justo antes de validar saldo/compra. Reinicio limpio; siguiente ciclo #{proximo} ({origen}).")
                     reinicio_forzado.set()
                     break
 
                 # ========= SALDO REAL (si aplica) =========
                 if modo_real:
                     saldo = await consultar_saldo_real(ws)
-                    if saldo < monto:
+                    if not isinstance(saldo, (int, float)):
+                        estado_bot["intentos_saldo"] += 1
+                        print(Fore.RED + Style.BRIGHT + "Saldo REAL no disponible. Bloqueando compra hasta refrescar balance.")
+                        if estado_bot["intentos_saldo"] > 3:
+                            release_real_token_if_owned()
+                            estado_bot["intentos_saldo"] = 0
+                            reinicio_forzado.set()
+                        else:
+                            await asyncio.sleep(12 + random.uniform(0.0, 0.5))
+                        continue
+                    if float(saldo) < float(monto):
                         estado_bot["intentos_saldo"] += 1
                         if estado_bot["intentos_saldo"] > 3:
                             print(Fore.RED + Style.BRIGHT + "Saldo no recuperado tras 3 intentos. Paso a DEMO.")
@@ -2431,8 +2780,6 @@ async def ejecutar_panel():
                             await asyncio.sleep(15 + random.uniform(0.0, 0.5))
                         continue
 
-                scalping_snapshot_final = {}
-
                 # ========= REVALIDACIÓN PRE-BUY =========
                 try:
                     score_sel = estado_bot.get("score_senal")
@@ -2446,25 +2793,16 @@ async def ejecutar_panel():
 
                         if (dir2 != direccion) or (int(cond2) < 2) or (float(score2) < piso):
                             print(Fore.YELLOW + Style.BRIGHT + f"Revalidación falló en {symbol}: dir {direccion}->{dir2}, cond={cond2}, score={score2:.3f}<piso {piso:.3f}. Reintentando ciclo...")
+                            if _print_once(f"bot-abort-prebuy-reval-{ciclo}", ttl=3):
+                                print(Fore.YELLOW + f"BOT_ROUND_ABORT_PREBUY bot={NOMBRE_BOT} ciclo={int(ciclo)} motivo=revalidacion_fallo accion=same_cycle_no_barrier")
                             await asyncio.sleep(2.0 + random.uniform(0.0, 0.5))
                             continue
 
                         # refresca snapshot para compra/log consistentes
                         direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion, condiciones = dir2, rsi9_2, rsi14_2, sma5_2, sma20_2, br2, cr2, rev2, cond2
                         estado_bot["score_senal"] = float(score2)
-                        scalping_snapshot_final = calcular_scalping_features(velas_rv)
-                    elif velas_rv:
-                        scalping_snapshot_final = calcular_scalping_features(velas_rv)
                 except Exception:
-                    scalping_snapshot_final = {}
-
-                if not scalping_snapshot_final:
-                    try:
-                        velas_sf = await obtener_velas(ws, symbol, current_token, reintentos=1)
-                        if velas_sf:
-                            scalping_snapshot_final = calcular_scalping_features(velas_sf)
-                    except Exception:
-                        scalping_snapshot_final = {}
+                    pass
 
                 # ========= PROPOSAL =========
                 try:
@@ -2496,8 +2834,8 @@ async def ejecutar_panel():
 
                 # Si token cambió DURANTE proposal → NO compramos, reinicio limpio
                 if reinicio_forzado.is_set():
-                    estado_bot["ciclo_forzado"] = ciclo
-                    print(Fore.YELLOW + Style.BRIGHT + f"Token cambió durante proposal. Cancelo compra y reinicio en ciclo #{ciclo}.")
+                    proximo, origen = _retener_ciclo_para_reinicio(ciclo)
+                    print(Fore.YELLOW + Style.BRIGHT + f"Token cambió durante proposal. Cancelo compra y reinicio en ciclo #{proximo} ({origen}).")
                     reinicio_forzado.clear()
                     await asyncio.sleep(1.2)
                     break
@@ -2520,6 +2858,9 @@ async def ejecutar_panel():
                 print(Fore.CYAN + Style.BRIGHT + f"[{symbol}] Martingala #{ciclo} - {direccion} - {monto} USD")
                 # === PRE-TRADE SNAPSHOT (para inferencia real del Maestro) ===
                 epoch_pre = None
+                now_pre = datetime.now(timezone.utc)
+                ts_pre = now_pre.isoformat()
+                trade_uid = _build_trade_uid(int(now_pre.timestamp()), symbol, direccion, ciclo, current_token, ts_iso=ts_pre)
                 try:
                     # es_rebote PRE-TRADE: venías de 4+ pérdidas ANTES de este trade
                     es_rebote_pre = 1.0 if int(racha_actual_bot) <= -4 else 0.0
@@ -2543,10 +2884,9 @@ async def ejecutar_panel():
                         payout=float(payout),
                         puntaje_estrategia=float(condiciones),  # tu score
                         token=current_token,
-                        scalping_features=scalping_snapshot_final,
+                        trade_uid=trade_uid,
+                        close_snapshot=close_snapshot,
                     )
-                    if epoch_pre is not None:
-                        set_trade_snapshot(epoch_pre, symbol, direccion, ciclo, scalping_snapshot_final)
                 except Exception:
                     epoch_pre = None
 
@@ -2634,19 +2974,42 @@ async def ejecutar_panel():
                             Fore.YELLOW + Style.BRIGHT +
                             f"[VENTANA IA] Token cambió durante la decisión. Reintentando ciclo #{ciclo} (sin comprar)."
                         )
-                        if epoch_pre is not None:
-                            await registrar_pretrade_cancelado(
-                                ARCHIVO_CSV, epoch_pre, symbol, direccion, ciclo,
-                                monto=monto, rsi9=rsi9, rsi14=rsi14, sma5=sma5, sma20=sma20,
-                                cruce=cruce, breakout=breakout, rsi_reversion=rsi_reversion,
-                                payout=payout, condiciones=condiciones,
-                            )
-                            pop_trade_snapshot(int(epoch_pre), symbol, direccion, ciclo)
                         reinicio_forzado.clear()
                         await asyncio.sleep(0.8)
                         continue
 
 # ==================== /VENTANA DE DECISIÓN IA ====================
+
+                data_lxv_buy = None
+                if modo_real:
+                    ok_lxv_buy, motivo_lxv_buy, data_lxv_buy = validar_permiso_buy_lxv_sync(
+                        NOMBRE_BOT,
+                        ciclo=int(ciclo),
+                        token_actual=current_token,
+                        owner_ok=True,
+                    )
+                    if isinstance(data_lxv_buy, dict):
+                        src_lxv = str(data_lxv_buy.get("src", "") or "").upper()
+                        if src_lxv == "LXV_CORE":
+                            snap_ok = str(data_lxv_buy.get("snapshot_id", "") or "").strip()
+                            round_ok = int(data_lxv_buy.get("round_lxv", 0) or 0)
+                            ciclo_ok = int(data_lxv_buy.get("ciclo", 0) or 0)
+                            if snap_ok and _print_once(f"lxv-prebuy-ok-{round_ok}-{snap_ok}", ttl=8):
+                                print(Fore.YELLOW + f"LXV_SYNC_PREBUY_OK bot={NOMBRE_BOT} round={int(round_ok)} snapshot={snap_ok} src=LXV_CORE ciclo={int(ciclo_ok)}")
+
+                    if not ok_lxv_buy:
+                        if _print_once(f"bot-abort-prebuy-lxv-{ciclo}-{motivo_lxv_buy}", ttl=3):
+                            print(Fore.YELLOW + f"BOT_ROUND_ABORT_PREBUY bot={NOMBRE_BOT} ciclo={int(ciclo)} motivo={motivo_lxv_buy} accion=same_cycle_no_barrier")
+                        if _print_once(f"lxv-buy-abort-{motivo_lxv_buy}", ttl=10):
+                            print(Fore.YELLOW + f"LXV_SYNC_ABORT: {motivo_lxv_buy}")
+                        if isinstance(data_lxv_buy, dict):
+                            snap_retry = str(data_lxv_buy.get("snapshot_id", "") or "").strip()
+                            round_retry = int(data_lxv_buy.get("round_lxv", 0) or 0)
+                            if snap_retry and motivo_lxv_buy not in {"snapshot_ya_consumido", "ronda_ya_consumida"}:
+                                if _print_once(f"lxv-retry-allowed-{round_retry}-{snap_retry}-{motivo_lxv_buy}", ttl=8):
+                                    print(Fore.YELLOW + f"LXV_SYNC_RETRY_ALLOWED bot={NOMBRE_BOT} round={int(round_retry)} snapshot={snap_retry} motivo={motivo_lxv_buy}")
+                        await asyncio.sleep(0.8)
+                        continue
 
                 try:
                     data_buy = await api_call(ws, {
@@ -2664,14 +3027,8 @@ async def ejecutar_panel():
                     }, expect_msg_type="buy", timeout=8.0)
                 except RuntimeError as api_e:
                     print(Fore.RED + Style.BRIGHT + f"[ERROR] Compra: {api_e}. Reintentando mismo ciclo...")
-                    if epoch_pre is not None:
-                        await registrar_pretrade_cancelado(
-                            ARCHIVO_CSV, epoch_pre, symbol, direccion, ciclo,
-                            monto=monto, rsi9=rsi9, rsi14=rsi14, sma5=sma5, sma20=sma20,
-                            cruce=cruce, breakout=breakout, rsi_reversion=rsi_reversion,
-                            payout=payout, condiciones=condiciones,
-                        )
-                        pop_trade_snapshot(int(epoch_pre), symbol, direccion, ciclo)
+                    if _print_once(f"bot-abort-prebuy-buy-runtime-{ciclo}", ttl=3):
+                        print(Fore.YELLOW + f"BOT_ROUND_ABORT_PREBUY bot={NOMBRE_BOT} ciclo={int(ciclo)} motivo=buy_runtime_error accion=same_cycle_no_barrier")
                     estado_bot["token_msg_mostrado"] = False
                     await asyncio.sleep(10 + random.uniform(0.0, 0.5))
                     continue
@@ -2679,29 +3036,33 @@ async def ejecutar_panel():
                     if _es_error_transitorio_ws(e):
                         if _print_once("buy-transient", ttl=8):
                             print(Fore.YELLOW + Style.BRIGHT + f"[WARN] Compra inestable ({type(e).__name__}). Reabro WS y mantengo ciclo #{ciclo}.")
-                        if epoch_pre is not None:
-                            await registrar_pretrade_cancelado(
-                                ARCHIVO_CSV, epoch_pre, symbol, direccion, ciclo,
-                                monto=monto, rsi9=rsi9, rsi14=rsi14, sma5=sma5, sma20=sma20,
-                                cruce=cruce, breakout=breakout, rsi_reversion=rsi_reversion,
-                                payout=payout, condiciones=condiciones,
-                            )
-                            pop_trade_snapshot(int(epoch_pre), symbol, direccion, ciclo)
                         await _cerrar_ws(ws)
                         ws = await _abrir_ws(current_token)
                         await asyncio.sleep(0.6 + random.uniform(0.0, 0.4))
                         continue
-                    if epoch_pre is not None:
-                        await registrar_pretrade_cancelado(
-                            ARCHIVO_CSV, epoch_pre, symbol, direccion, ciclo,
-                            monto=monto, rsi9=rsi9, rsi14=rsi14, sma5=sma5, sma20=sma20,
-                            cruce=cruce, breakout=breakout, rsi_reversion=rsi_reversion,
-                            payout=payout, condiciones=condiciones,
-                        )
-                        pop_trade_snapshot(int(epoch_pre), symbol, direccion, ciclo)
                     raise
 
                 contract_id = data_buy["buy"]["contract_id"]
+                round_armed_local = int(estado_bot.get("round_id_actual", 0) or 0) + 1
+                estado_bot["round_id_actual"] = int(round_armed_local)
+                trade_ack_ctx = _build_trade_ack_ctx(round_local=round_armed_local, data_lxv_buy=data_lxv_buy)
+                estado_bot["trade_ack_ctx"] = dict(trade_ack_ctx)
+                round_armed = int(trade_ack_ctx.get("round_ack", round_armed_local) or round_armed_local)
+                if _print_once(f"bot-round-armed-{round_armed}", ttl=3):
+                    src_tag = str(trade_ack_ctx.get("src", "") or "LOCAL")
+                    snap_tag = str(trade_ack_ctx.get("snapshot_id", "") or "--")
+                    print(Fore.YELLOW + f"BOT_ROUND_ARMED bot={NOMBRE_BOT} round={int(round_armed)} src={src_tag} snapshot={snap_tag}")
+                if isinstance(data_lxv_buy, dict):
+                    try:
+                        estado_bot["last_lxv_snapshot_consumed"] = str(data_lxv_buy.get("snapshot_id", "") or "")
+                        estado_bot["last_lxv_round_consumed"] = int(data_lxv_buy.get("round_lxv", 0) or 0)
+                        snap_ok = str(data_lxv_buy.get("snapshot_id", "") or "").strip()
+                        round_ok = int(data_lxv_buy.get("round_lxv", 0) or 0)
+                        escribir_ack_consumed_real_lxv(NOMBRE_BOT, round_ok, snap_ok, contract_id=contract_id)
+                        if snap_ok and _print_once(f"lxv-consumed-real-{round_ok}-{snap_ok}", ttl=8):
+                            print(Fore.YELLOW + f"LXV_SYNC_CONSUMED_REAL bot={NOMBRE_BOT} round={int(round_ok)} snapshot={snap_ok} contract_id={contract_id}")
+                    except Exception:
+                        pass
 
                 # ✅ Ciclo en progreso significa: YA hay contrato abierto
                 estado_bot["ciclo_en_progreso"] = True
@@ -2718,11 +3079,15 @@ async def ejecutar_panel():
                 resultado, profit = await esperar_resultado(
                     ws, contract_id, symbol, direccion, monto,
                     rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                    ciclo, payout, condiciones, current_token, epoch_pre
+                    ciclo, payout, condiciones, current_token, epoch_pre, trade_uid=trade_uid, close_snapshot=close_snapshot
                 )
 
                 if resultado == "INDEFINIDO":
                     print(Fore.YELLOW + "INDEFINIDO: WS/Token restart. Se mantiene MISMO ciclo (BG resolverá).")
+                    trade_ack_ctx = estado_bot.get("trade_ack_ctx", {}) if isinstance(estado_bot.get("trade_ack_ctx", {}), dict) else {}
+                    round_local = int(trade_ack_ctx.get("round_ack", estado_bot.get("round_id_actual", 0)) or 0)
+                    if _print_once(f"bot-indefinido-local-{round_local}", ttl=3):
+                        print(Fore.YELLOW + f"BOT_RESULT_INDEFINIDO_LOCAL bot={NOMBRE_BOT} round={int(round_local)} accion=no_barrier_same_cycle")
                     indefinidos_consecutivos += 1
 
                     if indefinidos_consecutivos > 5:
@@ -2748,6 +3113,31 @@ async def ejecutar_panel():
                 estado_bot["intentos_saldo"] = 0
                 estado_bot["ciclo_en_progreso"] = False
                 estado_bot["token_msg_mostrado"] = False
+                trade_ack_ctx = estado_bot.get("trade_ack_ctx", {}) if isinstance(estado_bot.get("trade_ack_ctx", {}), dict) else {}
+                round_cerrada = int(trade_ack_ctx.get("round_ack", estado_bot.get("round_id_actual", 0)) or 0)
+                round_siguiente = int(round_cerrada) + 1
+                try:
+                    escribir_ack_cierre_ronda(
+                        int(round_cerrada),
+                        str(resultado or ""),
+                        trade_uid=str(trade_uid or ""),
+                        epoch_ref=epoch_pre,
+                    )
+                except Exception:
+                    pass
+
+                trade_src = str(trade_ack_ctx.get("src", "") or "LOCAL").upper().strip() if isinstance(trade_ack_ctx, dict) else "LOCAL"
+                wait_hard_barrier = bool(LXV_CORE_ENABLE) and bool(BARRIER_ENABLED) and int(round_cerrada) > 0 and _debe_esperar_barrera_dura_post_ack(trade_ack_ctx)
+                if wait_hard_barrier:
+                    if _print_once(f"bot-post-ack-hard-{round_cerrada}", ttl=4):
+                        st_wait = leer_barrier_state() or {}
+                        rr_wait = int(st_wait.get("release_round", 1) or 1)
+                        snap_wait = str(trade_ack_ctx.get("snapshot_id", "") or "--")
+                        print(Fore.YELLOW + f"BOT_POST_ACK_HARD_BARRIER bot={NOMBRE_BOT} round={int(round_cerrada)} src={trade_src} snapshot={snap_wait} release_round={int(rr_wait)}")
+                    await esperar_permiso_barrier_siguiente_ronda(int(round_siguiente), round_local_actual=int(round_cerrada))
+                elif (not modo_real):
+                    if _print_once(f"bot-post-ack-local-{round_cerrada}", ttl=4):
+                        print(Fore.YELLOW + f"BOT_POST_ACK_LOCAL_CONTINUE bot={NOMBRE_BOT} round={int(round_cerrada)} src=LOCAL")
 
                 print(Back.BLUE + Style.BRIGHT + f"\nTotal DEMO: {resultado_global['demo']:.2f} USD | Total REAL: {resultado_global['real']:.2f} USD")
                 await mostrar_saldos()
@@ -2769,11 +3159,11 @@ async def ejecutar_panel():
 
                     # ✅ Importantísimo: resetear ventana para que PASO_A_REAL suene la próxima vez
                     try:
-                        primer_ingreso_real = False
+                        globals()["primer_ingreso_real"] = False
                     except Exception:
                         pass
                     try:
-                        real_activado_en_bot = 0.0
+                        globals()["real_activado_en_bot"] = 0.0
                     except Exception:
                         pass
 
@@ -2788,6 +3178,10 @@ async def ejecutar_panel():
 
 
                 # ========= DEMO =========
+                try:
+                    await esperar_nivelacion_suave_post_ronda(int(round_cerrada))
+                except Exception:
+                    pass
                 print(Fore.YELLOW + f"Pausa de {PAUSA_POST_OPERACION_S}s antes de continuar...")
                 await asyncio.sleep(PAUSA_POST_OPERACION_S + random.uniform(0.0, 0.5))
 
@@ -2838,9 +3232,6 @@ async def main():
     await monitor()
 
 if __name__ == "__main__":
-    if not WEBSOCKETS_OK:
-        print(Fore.RED + "⛔ Dependencia faltante: websockets. Instálala para ejecutar el bot.")
-        sys.exit(1)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
