@@ -1,19 +1,56 @@
 # -*- coding: utf-8 -*-
 import asyncio
-import websockets
 import json
 import csv
 import os
 import sys
 from datetime import datetime, timezone
 from statistics import mean
-from colorama import Fore, Back, Style, init
-import pygame
 import pandas as pd
 import time  # Added for timestamps in orden_real and BLOQUE 5
 import random  # Added for jitter in BLOQUE 1.3
 import itertools  # For req_counter in api_call
 import math
+import importlib
+import warnings
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
+def _load_optional_module(name: str):
+    try:
+        if str(name) == "pygame":
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="pkg_resources is deprecated as an API.*",
+                    category=UserWarning,
+                )
+                return importlib.import_module(name)
+        return importlib.import_module(name)
+    except Exception:
+        return None
+
+websockets = _load_optional_module("websockets")
+WEBSOCKETS_OK = websockets is not None
+
+colorama = _load_optional_module("colorama")
+if colorama is not None:
+    Fore = colorama.Fore
+    Back = colorama.Back
+    Style = colorama.Style
+    init = colorama.init
+else:
+    class _NoColor:
+        def __getattr__(self, _name):
+            return ""
+    Fore = _NoColor()
+    Back = _NoColor()
+    Style = _NoColor()
+    def init(*args, **kwargs):
+        return None
+
+pygame = _load_optional_module("pygame")
+PYGAME_OK = pygame is not None
 
 # === BLINDAJE: señales limpias ===
 import signal
@@ -135,14 +172,14 @@ ARCHIVO_CSV = f"registro_enriquecido_{NOMBRE_BOT}.csv"
 ARCHIVO_TOKEN = "token_actual.txt"  # Fuente única de verdad (coincide con 5R6M)
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 ACTIVOS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
-MARTINGALA_DEMO = [1, 2, 4, 8, 16, 32]
-MARTINGALA_REAL = [1, 2, 4, 8, 16, 32]
+MARTINGALA_DEMO = [1, 2, 4, 8]
+MARTINGALA_REAL = [1, 2, 4, 8]
 VELAS = 20
 PAUSA_POST_OPERACION_S = 8  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
 # ==================== VENTANA DE DECISIÓN IA ====================
 # Objetivo: dar tiempo al MAESTRO + humano para decidir pasar a REAL ANTES del BUY.
 # (0 para desactivar)
-VENTANA_DECISION_IA_S = 12        # segundos
+VENTANA_DECISION_IA_S = 30        # segundos (alineado con maestro)
 VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
 # === Filtro avanzado (sin cambiar 13 features) ===
 SCORE_MIN = 2.35            # score mínimo para aceptar un setup
@@ -179,7 +216,7 @@ last_real_contract_id = None
 real_buy_commit_until = 0.0
 
 # Higiene de riesgo: al saltar a REAL, arrancar en C1 (aunque el maestro sugiera C2+)
-RESET_CICLO_EN_ENTRADA_REAL = True
+RESET_CICLO_EN_ENTRADA_REAL = False
 
 def commit_guard_active() -> bool:
     return (last_real_contract_id is not None) and (time.time() < real_buy_commit_until)
@@ -1361,15 +1398,15 @@ async def check_token_and_reconnect(ws, current_token):
                     real_activado_en_bot = time.time()  # BLOQUE 5 and 2: Set activation time
                     # Lee la orden del maestro y deja seteado el ciclo para la siguiente vuelta
                     cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
-                    if RESET_CICLO_EN_ENTRADA_REAL:
+                    ciclo_objetivo = cyc if cyc else estado_bot.get("ciclo_forzado")
+                    if ciclo_objetivo:
+                        estado_bot["ciclo_forzado"] = int(max(1, min(int(ciclo_objetivo), MAX_CICLOS)))
+                        if cyc:
+                            print(Fore.YELLOW + f"Orden maestro detectada: arrancaré en ciclo #{estado_bot['ciclo_forzado']}.")
+                    else:
                         estado_bot["ciclo_forzado"] = 1
-                        if cyc and int(cyc) > 1:
-                            print(Fore.YELLOW + f"Orden maestro C{cyc} ignorada por seguridad: en entrada REAL reinicio a C1.")
-                        else:
+                        if RESET_CICLO_EN_ENTRADA_REAL:
                             print(Fore.YELLOW + "Entrada REAL detectada: reinicio de martingala a C1 por seguridad.")
-                    elif cyc:
-                        estado_bot["ciclo_forzado"] = cyc
-                        print(Fore.YELLOW + f"Orden maestro detectada: arrancaré en ciclo #{cyc}.")
 
                     # Silenciar ruido guiado por maestro (BLOQUE 3)
                     if quiet or (str(src).upper() == "MANUAL"):
@@ -1382,10 +1419,11 @@ async def check_token_and_reconnect(ws, current_token):
                         if _print_once("rea-REAL", ttl=180):
                             print(Fore.YELLOW + "Reafirmación de REAL (sin reset de martingala)")
                     cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
-                    if RESET_CICLO_EN_ENTRADA_REAL:
+                    ciclo_objetivo = cyc if cyc else estado_bot.get("ciclo_forzado")
+                    if ciclo_objetivo:
+                        estado_bot["ciclo_forzado"] = int(max(1, min(int(ciclo_objetivo), MAX_CICLOS)))
+                    elif RESET_CICLO_EN_ENTRADA_REAL:
                         estado_bot["ciclo_forzado"] = 1
-                    elif cyc:
-                        estado_bot["ciclo_forzado"] = cyc
 
                     if quiet or (str(src).upper() == "MANUAL"):
                         asyncio.create_task(_silencio_temporal(90, fuente=src))
@@ -2589,6 +2627,12 @@ async def monitor():
         await asyncio.sleep(2)
 
 async def main():
+    if not WEBSOCKETS_OK:
+        print(Fore.YELLOW + "[WARN] websockets no disponible; bot en espera sin operar.")
+        while not stop_event.is_set():
+            await asyncio.sleep(2)
+        return
+
     # watcher del token (CRÍTICO para GateWin)
     try:
         asyncio.create_task(vigilar_token())
