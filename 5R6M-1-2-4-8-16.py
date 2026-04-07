@@ -1259,6 +1259,10 @@ estado_bots = {
         "ia_pattern_col_bonus": 0.0,
         "ia_pattern_col_penal": 0.0,
         "ia_pattern_col_delta": 0.0,
+        "sync_wait": False,
+        "last_sync_round": 1,
+        "last_seen_ts": 0.0,
+        "estado_visual": "ACTIVO",
     }
     for bot in BOT_NAMES
 }
@@ -15294,6 +15298,7 @@ async def cargar_datos_bot(bot, token_actual):
         # Gate rápido (opcional): si el archivo no creció, salimos sin leer todo el CSV
         actual = contar_filas_csv(bot)
         if actual <= snapshot:
+            _sync_round_apply_visual_heartbeat(bot)
             return
 
         df = pd.read_csv(ruta, encoding="utf-8", on_bad_lines="skip")
