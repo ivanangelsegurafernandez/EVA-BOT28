@@ -2200,6 +2200,125 @@ def path_orden(bot: str) -> str:
     _ensure_dir(ORDEN_DIR)
     return os.path.join(ORDEN_DIR, f"{bot}.json")
 
+# === LXV_SYNC_COLUMN: sincronización de ronda/columna maestro↔bots ===
+SYNC_ROUND_DIR = "sync_round"
+SYNC_ROUND_STATE_PATH = os.path.join(SYNC_ROUND_DIR, "state.json")
+_SYNC_ROUND_LAST_ANNOUNCED = None
+_SYNC_ROUND_LAST_CLOSED_COUNT = {}
+
+def _sync_round_ack_path(bot: str) -> str:
+    _ensure_dir(SYNC_ROUND_DIR)
+    return os.path.join(SYNC_ROUND_DIR, f"{bot}.json")
+
+def _sync_round_safe_read_json(path: str):
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+def _sync_round_write_json_atomic(path: str, payload: dict) -> bool:
+    try:
+        _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2))
+        return True
+    except Exception:
+        return False
+
+def _sync_round_bootstrap_state(force: bool = False):
+    _ensure_dir(SYNC_ROUND_DIR)
+    if (not force) and os.path.exists(SYNC_ROUND_STATE_PATH):
+        return
+    payload = {
+        "round_id": 1,
+        "released_round": 1,
+        "expected_bots": list(BOT_NAMES),
+        "closed_bots": {},
+        "completed": False,
+        "status": "running",
+        "reason": "boot",
+        "ts": time.time(),
+    }
+    _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+
+def _sync_round_tick_maestro():
+    global _SYNC_ROUND_LAST_ANNOUNCED
+    _sync_round_bootstrap_state(force=False)
+    st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+
+    try:
+        round_id = max(1, int(st.get("round_id", 1) or 1))
+    except Exception:
+        round_id = 1
+    try:
+        released_round = max(1, int(st.get("released_round", round_id) or round_id))
+    except Exception:
+        released_round = round_id
+
+    expected = st.get("expected_bots")
+    if not isinstance(expected, list) or not expected:
+        expected = list(BOT_NAMES)
+    expected = [b for b in expected if b in BOT_NAMES]
+    if not expected:
+        expected = list(BOT_NAMES)
+
+    if _SYNC_ROUND_LAST_ANNOUNCED != round_id:
+        agregar_evento(f"🧭 LXV_SYNC_COLUMN ronda #{round_id} iniciada ({len(expected)} bots esperados).")
+        _SYNC_ROUND_LAST_ANNOUNCED = round_id
+
+    closed = {}
+    for bot in expected:
+        ack = _sync_round_safe_read_json(_sync_round_ack_path(bot))
+        if not isinstance(ack, dict):
+            continue
+        try:
+            ack_round = int(ack.get("round_id", 0) or 0)
+        except Exception:
+            continue
+        if ack_round != round_id:
+            continue
+        if str(ack.get("status", "")).lower().strip() != "closed":
+            continue
+        res = str(ack.get("resultado", "")).upper().strip()
+        if res not in ("GANANCIA", "PÉRDIDA"):
+            continue
+        closed[bot] = {
+            "resultado": res,
+            "ts": float(ack.get("ts", 0.0) or 0.0),
+            "contract_id": ack.get("contract_id"),
+            "asset": ack.get("asset"),
+            "ciclo": ack.get("ciclo"),
+        }
+
+    n_closed = len(closed)
+    prev_n = int(_SYNC_ROUND_LAST_CLOSED_COUNT.get(round_id, -1))
+    if n_closed != prev_n:
+        _SYNC_ROUND_LAST_CLOSED_COUNT[round_id] = n_closed
+        agregar_evento(f"🧩 LXV_SYNC_COLUMN cierres ronda #{round_id}: {n_closed}/{len(expected)}.")
+
+    completed = bool(n_closed >= len(expected))
+    next_round = round_id + 1 if completed else round_id
+    next_released = max(released_round, next_round if completed else released_round)
+
+    payload = {
+        "round_id": next_round if completed else round_id,
+        "released_round": next_released,
+        "expected_bots": expected,
+        "closed_bots": closed,
+        "completed": completed,
+        "status": "released" if completed else "waiting_closures",
+        "reason": "all_bots_closed" if completed else "waiting_bots",
+        "ts": time.time(),
+    }
+    _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+
+    if completed:
+        agregar_evento(f"✅ LXV_SYNC_COLUMN columna/ronda #{round_id} COMPLETA.")
+        agregar_evento(f"🚀 LXV_SYNC_COLUMN ronda #{next_round} LIBERADA.")
+# === /LXV_SYNC_COLUMN ===
+
 # === PATCH: REAL INMEDIATO EN HUD AL EMITIR ORDEN (sin esperar compra) ===
 # Objetivo:
 # - Al emitir una ORDEN manual (bot+ciclo), reservar REAL y mostrarlo YA en HUD.
@@ -15790,6 +15909,7 @@ async def main():
 
         set_etapa("BOOT_04", "Sincronizando HUD con CSV")
         # Pasada inicial para sincronizar HUD con CSV existentes
+        _sync_round_bootstrap_state(force=False)
         token_actual_loop = "--"  # Dummy para carga inicial
         for bot in BOT_NAMES:
             await cargar_datos_bot(bot, token_actual_loop)
@@ -15831,6 +15951,7 @@ async def main():
                     REAL_LOCK_MISMATCH_SINCE = 0.0
                 # Heartbeat: mantiene ACK alineado al HUD aunque no entren filas nuevas ese tick.
                 refrescar_ia_ack_desde_hud(intervalo_s=1.0)
+                _sync_round_tick_maestro()
 
                 try:
                     last_a = globals().get("_IA_BOOT_STALE_AUDIT_TS", 0.0) or 0.0
