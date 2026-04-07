@@ -200,6 +200,11 @@ estado_bot = {
     "score_senal": None,
     "ciclo_actual": 1,
     "sync_round_id": 1,
+    "sync_wait": False,
+    "pending_contract_resolution": False,
+    "pending_contract_id": None,
+    "pending_since_ts": 0.0,
+    "pending_round_id": None,
 }  # Added modo_manual and barra_activa
 racha_actual_bot = 0  # racha del bot: >0 = racha de GANANCIAS, <0 = racha de PÉRDIDAS
 
@@ -329,10 +334,23 @@ def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, 
         print(Fore.YELLOW + f"🧷 LXV_SYNC_COLUMN ACK cierre | {NOMBRE_BOT} | ronda #{rid} | {res}")
     return ok
 
+def _sync_round_write_wait_heartbeat(round_id: int, next_round: int):
+    path = _sync_round_ack_path()
+    prev = _sync_round_safe_read_json(path) or {}
+    payload = dict(prev) if isinstance(prev, dict) else {}
+    payload["bot"] = NOMBRE_BOT
+    payload["round_id"] = int(round_id)
+    payload["status"] = "closed"
+    payload["sync_wait"] = True
+    payload["waiting_release_round"] = int(next_round)
+    payload["last_seen_ts"] = time.time()
+    _sync_round_write_json_atomic(path, payload)
+
 async def _sync_round_wait_release(round_id: int) -> int:
     rid = max(1, int(round_id or 1))
     next_round = rid + 1
     print(Fore.YELLOW + Style.BRIGHT + f"⏸️ LXV_SYNC_COLUMN standby columna: {NOMBRE_BOT} ronda #{rid} esperando liberación #{next_round}...")
+    estado_bot["sync_wait"] = True
     while not stop_event.is_set():
         st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
         try:
@@ -340,12 +358,16 @@ async def _sync_round_wait_release(round_id: int) -> int:
         except Exception:
             released = 1
         if released >= next_round:
+            estado_bot["sync_wait"] = False
+            _sync_round_write_wait_heartbeat(rid, next_round)
             print(Fore.GREEN + f"🔓 LXV_SYNC_COLUMN liberación detectada: ronda #{released} (bot {NOMBRE_BOT})")
             print(Fore.GREEN + Style.BRIGHT + f"▶️ LXV_SYNC_COLUMN salida standby: {NOMBRE_BOT} → ronda #{next_round}")
             return next_round
+        _sync_round_write_wait_heartbeat(rid, next_round)
         if _print_once(f"sync-standby-{rid}", ttl=6.0):
             print(Fore.CYAN + f"… standby columna {NOMBRE_BOT}: ronda #{rid}, released_round={released}")
         await asyncio.sleep(0.35)
+    estado_bot["sync_wait"] = False
     return rid
 # === /LXV_SYNC_COLUMN ===
 
