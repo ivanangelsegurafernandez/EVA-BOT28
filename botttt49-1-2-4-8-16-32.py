@@ -1,58 +1,22 @@
 # -*- coding: utf-8 -*-
 import asyncio
-import importlib
+import websockets
 import json
 import csv
 import os
 import sys
 from datetime import datetime, timezone
 from statistics import mean
+from colorama import Fore, Back, Style, init
+import pygame
+import pandas as pd
 import time  # Added for timestamps in orden_real and BLOQUE 5
 import random  # Added for jitter in BLOQUE 1.3
 import itertools  # For req_counter in api_call
 import math
 import unicodedata
-import traceback
 
 os.environ.setdefault("PYTHONUTF8", "1")
-BOOT_SMOKE_TEST = str(os.getenv("BOOT_SMOKE_TEST", os.getenv("DRY_BOOT_ONLY", "0"))).strip() == "1"
-
-def _safe_import_module(name):
-    try:
-        return importlib.import_module(name)
-    except Exception:
-        return None
-
-websockets = _safe_import_module("websockets")
-
-# Fallbacks de imports opcionales para arranque/smoke
-class _DummyColor:
-    def __getattr__(self, _):
-        return ""
-
-class _DummyPygame:
-    class mixer:
-        @staticmethod
-        def get_init(): return True
-        @staticmethod
-        def init(*args, **kwargs): return None
-        @staticmethod
-        def set_num_channels(*args, **kwargs): return None
-
-_colorama = _safe_import_module("colorama")
-if _colorama is None:
-    Fore = Back = Style = _DummyColor()
-    def init(*args, **kwargs):
-        return None
-else:
-    Fore = _colorama.Fore
-    Back = _colorama.Back
-    Style = _colorama.Style
-    init = _colorama.init
-
-pygame = _safe_import_module("pygame") or _DummyPygame()
-pd = _safe_import_module("pandas")
-
 
 def _configure_console_output_safe():
     for _stream_name in ("stdout", "stderr"):
@@ -71,41 +35,15 @@ _configure_console_output_safe()
 import signal
 from contextlib import suppress
 stop_event = asyncio.Event()
-STOP_REASON = "unknown"
-FATAL_BOOT_LOG = f"fatal_boot_{NOMBRE_BOT}.log" if "NOMBRE_BOT" in globals() else "fatal_boot_unknown.log"
 
 def handle_stop(sig, frame):
-    global STOP_REASON
     # no tumbar de golpe; pedimos apagado ordenado
     if not stop_event.is_set():
-        STOP_REASON = f"signal_{getattr(sig, 'name', sig)}"
         stop_event.set()
 
 for _sig in (signal.SIGINT, signal.SIGTERM):
     with suppress(Exception):
         signal.signal(_sig, handle_stop)
-
-
-def _log_fatal_boot_error(exc: Exception):
-    try:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        tb = traceback.format_exc()
-        with open(FATAL_BOOT_LOG, "a", encoding="utf-8") as fh:
-            fh.write(f"[{ts}] bot={NOMBRE_BOT} type={type(exc).__name__} err={exc!r}\n")
-            fh.write(tb + "\n")
-    except Exception:
-        pass
-
-def _task_exception_logger(task: asyncio.Task):
-    try:
-        exc = task.exception()
-        if exc:
-            print(Fore.RED + Style.BRIGHT + f"[TASK-ERROR] {NOMBRE_BOT} task={task.get_name()} err={type(exc).__name__}: {exc}")
-            _log_fatal_boot_error(exc)
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        pass
 
 # === /BLINDAJE ===
 
@@ -210,7 +148,6 @@ _sfx_load_all()
 # ==================== CONFIG BÁSICA ====================
 NOMBRE_BOT = "fulll49"
 ARCHIVO_CSV = f"registro_enriquecido_{NOMBRE_BOT}.csv"
-FATAL_BOOT_LOG = f"fatal_boot_{NOMBRE_BOT}.log"
 ARCHIVO_TOKEN = "token_actual.txt"  # Fuente única de verdad (coincide con 5R6M)
 BG_CLOSE_GUARD_DIR = "bg_close_guard"
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
@@ -339,22 +276,40 @@ def _has_bg_close_pending() -> bool:
         return False
 
 # >>> PATCH 1 — Helpers de orden de ciclo
-ORDEN_DIR = "orden_real_disabled"  # compat: sin uso operativo en DEMO-only
+ORDEN_DIR = "orden_real"  # misma carpeta usada por el maestro
 # === IA ACK (handshake maestro→bot) ===
-IA_ACK_DIR = "ia_ack_disabled"
+IA_ACK_DIR = "ia_ack"
 try:
     os.makedirs(IA_ACK_DIR, exist_ok=True)
 except Exception:
     pass
 
-LXV_CONSUMED_ACK_DIR = "lxv_consumed_ack_disabled"
+LXV_CONSUMED_ACK_DIR = "lxv_consumed_ack"
 try:
     os.makedirs(LXV_CONSUMED_ACK_DIR, exist_ok=True)
 except Exception:
     pass
 
 def escribir_ack_consumed_real_lxv(bot: str, round_lxv: int, snapshot_id: str, contract_id=None):
-    return False
+    try:
+        payload = {
+            "bot": str(bot or ""),
+            "round_lxv": int(round_lxv or 0),
+            "snapshot_id": str(snapshot_id or ""),
+            "ts": float(time.time()),
+            "contract_id": str(contract_id or ""),
+            "estado": "consumed_real",
+        }
+        path = os.path.join(LXV_CONSUMED_ACK_DIR, f"{bot}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
 
 def leer_ia_ack(bot: str):
     path = os.path.join(IA_ACK_DIR, f"{bot}.json")
@@ -373,10 +328,10 @@ try:
 except Exception:
     pass
 
-SYNC_ROUND_DIR = "sync_round_disabled"
-BARRIER_ENABLED = False
-LXV_CORE_ENABLE = False
-LXV_SOFT_LEVEL_ENABLE = False
+SYNC_ROUND_DIR = "sync_round"
+BARRIER_ENABLED = True
+LXV_CORE_ENABLE = True
+LXV_SOFT_LEVEL_ENABLE = True
 LXV_SOFT_LEVEL_MAX_WAIT_S = 20.0
 LXV_SOFT_LEVEL_POLL_S = 0.5
 
@@ -521,10 +476,10 @@ def escribir_ack_cierre_ronda(round_id: int, resultado: str, trade_uid: str = ""
         pass
 
 
-def _is_demo_owner_valid_now() -> bool:
+def _is_real_owner_valid_now() -> bool:
     return False
 
-def _lxv_post_demo_confirmed() -> bool:
+def _lxv_post_real_confirmed() -> bool:
     return False
 
 def _lxv_sync_tiene_pendiente_abierta(archivo_csv: str) -> bool:
@@ -1390,7 +1345,6 @@ def cargar_tokens():
             time.sleep(3)
 
 TOKEN_DEMO, TOKEN_REAL = cargar_tokens()
-TOKEN_REAL = TOKEN_DEMO  # DEMO-only operativo
 
 def reset_csv_and_total():
     """
@@ -2977,33 +2931,21 @@ async def ejecutar_panel():
             pass
 
 async def monitor():
-    global STOP_REASON
     while not stop_event.is_set():
         await ejecutar_panel()
         if stop_event.is_set():
-            if STOP_REASON == "unknown":
-                STOP_REASON = "stop_event_set"
             break
         await asyncio.sleep(2)
-    if STOP_REASON == "unknown":
-        STOP_REASON = "monitor_loop_finished"
-    print(Fore.YELLOW + Style.BRIGHT + f"[EXIT] {NOMBRE_BOT} monitor() finalizó. reason={STOP_REASON}")
 
 async def main():
-    if BOOT_SMOKE_TEST:
-        print(Fore.GREEN + Style.BRIGHT + f"[BOOT OK] {NOMBRE_BOT} smoke test DEMO-only")
-        return
-
-    if websockets is None:
-        raise RuntimeError("Dependencia requerida ausente: websockets")
-
     # watcher del token (CRÍTICO para GateWin)
-    watcher_task = None
     try:
-        watcher_task = asyncio.create_task(vigilar_token(), name=f"{NOMBRE_BOT}_vigilar_token")
-        watcher_task.add_done_callback(_task_exception_logger)
+        asyncio.create_task(vigilar_token())
     except Exception as e:
-        print(Fore.YELLOW + f"[WARN] no pude iniciar vigilar_token(): {e!r}")
+        try:
+            print(Fore.YELLOW + f"[WARN] no pude iniciar vigilar_token(): {e!r}")
+        except Exception:
+            print(f"[WARN] no pude iniciar vigilar_token(): {e!r}")
 
     # loop principal
     await monitor()
@@ -3011,8 +2953,6 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-        print(Fore.YELLOW + Style.BRIGHT + f"[EXIT] {NOMBRE_BOT} terminó main() de forma limpia pero inesperada. reason={STOP_REASON}")
-        time.sleep(8)
     except KeyboardInterrupt:
         try:
             if not stop_event.is_set():
@@ -3020,11 +2960,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         print(Fore.YELLOW + "\n⛔ Interrumpido por usuario.")
-        time.sleep(2)
-    except Exception as e:
-        print(Fore.RED + Style.BRIGHT + f"[FATAL] {NOMBRE_BOT} falló al arrancar o ejecutar: {type(e).__name__}: {e!r}")
-        traceback.print_exc()
-        _log_fatal_boot_error(e)
-        print(Fore.YELLOW + "Esperando 8s antes de salir...")
-        time.sleep(8)
-        raise
