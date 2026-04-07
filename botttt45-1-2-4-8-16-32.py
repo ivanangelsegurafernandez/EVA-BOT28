@@ -276,22 +276,40 @@ def _has_bg_close_pending() -> bool:
         return False
 
 # >>> PATCH 1 — Helpers de orden de ciclo
-ORDEN_DIR = "orden_real_disabled"  # compat: sin uso operativo en DEMO-only
+ORDEN_DIR = "orden_real"  # misma carpeta usada por el maestro
 # === IA ACK (handshake maestro→bot) ===
-IA_ACK_DIR = "ia_ack_disabled"
+IA_ACK_DIR = "ia_ack"
 try:
     os.makedirs(IA_ACK_DIR, exist_ok=True)
 except Exception:
     pass
 
-LXV_CONSUMED_ACK_DIR = "lxv_consumed_ack_disabled"
+LXV_CONSUMED_ACK_DIR = "lxv_consumed_ack"
 try:
     os.makedirs(LXV_CONSUMED_ACK_DIR, exist_ok=True)
 except Exception:
     pass
 
 def escribir_ack_consumed_real_lxv(bot: str, round_lxv: int, snapshot_id: str, contract_id=None):
-    return False
+    try:
+        payload = {
+            "bot": str(bot or ""),
+            "round_lxv": int(round_lxv or 0),
+            "snapshot_id": str(snapshot_id or ""),
+            "ts": float(time.time()),
+            "contract_id": str(contract_id or ""),
+            "estado": "consumed_real",
+        }
+        path = os.path.join(LXV_CONSUMED_ACK_DIR, f"{bot}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
 
 def leer_ia_ack(bot: str):
     path = os.path.join(IA_ACK_DIR, f"{bot}.json")
@@ -310,10 +328,10 @@ try:
 except Exception:
     pass
 
-SYNC_ROUND_DIR = "sync_round_disabled"
-BARRIER_ENABLED = False
-LXV_CORE_ENABLE = False
-LXV_SOFT_LEVEL_ENABLE = False
+SYNC_ROUND_DIR = "sync_round"
+BARRIER_ENABLED = True
+LXV_CORE_ENABLE = True
+LXV_SOFT_LEVEL_ENABLE = True
 LXV_SOFT_LEVEL_MAX_WAIT_S = 20.0
 LXV_SOFT_LEVEL_POLL_S = 0.5
 
@@ -1551,7 +1569,6 @@ def cargar_tokens():
             time.sleep(3)
 
 TOKEN_DEMO, TOKEN_REAL = cargar_tokens()
-TOKEN_REAL = TOKEN_DEMO  # DEMO-only operativo
 
 def reset_csv_and_total():
     """

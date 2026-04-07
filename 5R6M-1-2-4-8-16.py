@@ -398,7 +398,7 @@ IA_METRIC_THRESHOLD = AUTO_REAL_DISABLED_THR_MIN
 # Modo clásico: activación REAL con umbral operativo vigente (hoy 65%, con techo dinámico base 70%).
 # Mantiene lock de un solo bot en REAL y ciclo martingala global en HUD.
 REAL_CLASSIC_GATE = True
-LXV_CORE_ENABLE = False
+LXV_CORE_ENABLE = True
 LXV_CORE_REAL_ROUTE_ENABLE = True
 LXV_CORE_BYPASS_GLOBAL_GATE = True
 LXV_CORE_REQUIRE_HARD_SAFETY_ONLY = True
@@ -2629,112 +2629,375 @@ anexar_incremental_desde_bot = _anexar_incremental_desde_bot_CANON
 # === FIN BLOQUE 6 ===
 
 # === BLOQUE 7 — ORDEN DE REAL Y CONTROL DE TOKEN ===
-# DEMO-only: rutas legacy de REAL/sync/barrier neutralizadas.
-ORDEN_DIR = "orden_real_disabled"
-SYNC_ROUND_DIR = "sync_round_disabled"
-LXV_CONSUMED_ACK_DIR = "lxv_consumed_ack_disabled"
-BARRIER_STATE_FILE = os.path.join(SYNC_ROUND_DIR, "barrier_state.disabled.json")
-BARRIER_ENABLED = False
-BARRIER_ACK_TIMEOUT_S = 0
-BARRIER_STRICT_MODE = False
+# === ORDEN DE REAL (handshake maestro→bot) ===
+ORDEN_DIR = "orden_real"
+SYNC_ROUND_DIR = "sync_round"
+LXV_CONSUMED_ACK_DIR = "lxv_consumed_ack"
+BARRIER_STATE_FILE = os.path.join(SYNC_ROUND_DIR, "barrier_state.json")
+BARRIER_ENABLED = True
+BARRIER_ACK_TIMEOUT_S = 45
+BARRIER_STRICT_MODE = True
 BARRIER_ALLOW_TEMP_EXCLUDE = False
-LXV_CORE_ROUND_TIMEOUT_S = 0
+LXV_CORE_ROUND_TIMEOUT_S = 120
 
 
 def _ensure_dir(p):
     try:
         os.makedirs(p, exist_ok=True)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ Falló creación de dir {p}: {e}")
 
 
 def _atomic_write(path: str, text: str):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def path_orden(bot: str) -> str:
+    _ensure_dir(ORDEN_DIR)
+    return os.path.join(ORDEN_DIR, f"{bot}.json")
+
+
+def _lxv_consumed_ack_path(bot: str) -> str:
+    _ensure_dir(LXV_CONSUMED_ACK_DIR)
+    return os.path.join(LXV_CONSUMED_ACK_DIR, f"{bot}.json")
+
+def leer_lxv_consumed_ack(bot: str) -> dict | None:
+    p = _lxv_consumed_ack_path(bot)
     try:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush(); os.fsync(f.fileno())
-        os.replace(tmp, path)
+        if not os.path.exists(p):
+            return None
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+def consumir_lxv_consumed_ack(bot: str, expected_round: int | None = None, expected_snapshot: str | None = None) -> bool:
+    ack = leer_lxv_consumed_ack(bot)
+    if not isinstance(ack, dict):
+        return False
+    estado = str(ack.get("estado", "") or "").strip().lower()
+    round_ack = int(ack.get("round_lxv", 0) or 0)
+    snap_ack = str(ack.get("snapshot_id", "") or "").strip()
+    if estado != "consumed_real" or round_ack <= 0 or not snap_ack:
+        return False
+    if expected_round is not None and int(round_ack) != int(expected_round):
+        return False
+    if expected_snapshot is not None and str(snap_ack) != str(expected_snapshot):
+        return False
+    if str(snap_ack) == str(LAST_LXV_SYNC_SNAPSHOT_CONSUMED or "") and int(round_ack) <= int(LAST_LXV_SYNC_ROUND_CONSUMED or 0):
+        return False
+    globals()["LAST_LXV_SYNC_SNAPSHOT_ID"] = str(snap_ack)
+    globals()["LAST_LXV_SYNC_SNAPSHOT_CONSUMED"] = str(snap_ack)
+    globals()["LAST_LXV_SYNC_ROUND_CONSUMED"] = int(round_ack)
+    globals()["LAST_LXV_SYNC_SELECTED_BOT"] = str(bot or "")
+    globals()["LAST_LXV_SYNC_TS"] = float(time.time())
+    try:
+        os.remove(_lxv_consumed_ack_path(bot))
+    except Exception:
+        pass
+    agregar_evento(f"LXV_CORE_CONSUMED_ACK bot={str(bot)} round={int(round_ack)} snapshot={snap_ack}")
+    return True
+
+def _sync_round_ack_path(bot: str, round_id: int) -> str:
+    _ensure_dir(SYNC_ROUND_DIR)
+    rid = max(1, int(round_id or 1))
+    d = os.path.join(SYNC_ROUND_DIR, f"round_{rid}")
+    _ensure_dir(d)
+    return os.path.join(d, f"{bot}.json")
+
+
+def leer_barrier_state() -> dict:
+    try:
+        if not os.path.exists(BARRIER_STATE_FILE):
+            return {
+                "barrier_enabled": bool(BARRIER_ENABLED),
+                "current_round": 1,
+                "release_round": 1,
+                "all_closed": False,
+                "pending_bots": list(BOT_NAMES),
+                "last_evaluated_round": 0,
+                "selected_bot": "",
+                "lxv_ready": False,
+                "ts": float(time.time()),
+            }
+        with open(BARRIER_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def escribir_barrier_state_atomic(state: dict):
+    _ensure_dir(SYNC_ROUND_DIR)
+    _atomic_write(BARRIER_STATE_FILE, json.dumps(dict(state or {}), ensure_ascii=False))
+
+def reset_barrier_state_on_start():
+    now = float(time.time())
+    try:
+        if os.path.isdir(SYNC_ROUND_DIR):
+            for name in os.listdir(SYNC_ROUND_DIR):
+                if not str(name).startswith("round_"):
+                    continue
+                dpath = os.path.join(SYNC_ROUND_DIR, str(name))
+                if not os.path.isdir(dpath):
+                    continue
+                for fn in os.listdir(dpath):
+                    fp = os.path.join(dpath, fn)
+                    if os.path.isfile(fp):
+                        try:
+                            os.remove(fp)
+                        except Exception:
+                            pass
+                try:
+                    os.rmdir(dpath)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    out = {
+        "barrier_enabled": True,
+        "current_round": 1,
+        "release_round": 1,
+        "all_closed": False,
+        "pending_bots": list(BOT_NAMES),
+        "last_evaluated_round": 0,
+        "selected_bot": "",
+        "lxv_ready": False,
+        "round_state": "ROUND_WAIT_ACK",
+        "round_open_ts": now,
+        "ts": now,
+    }
+    escribir_barrier_state_atomic(out)
+    agregar_evento("BARRIER_RESET_ON_START current_round=1 release_round=1")
+
+
+def leer_ack_ronda_bot(bot: str, round_id: int) -> dict | None:
+    p = _sync_round_ack_path(bot, round_id)
+    try:
+        if not os.path.exists(p):
+            return None
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+
+
+def _ack_resultado_es_valido(resultado_norm: str) -> bool:
+    txt = str(resultado_norm or '').strip().upper()
+    return txt in {"GANANCIA", "PERDIDA", "PÉRDIDA", "WIN", "LOSS", "G", "R", "X"}
+
+
+def validar_ack_ronda_bot(bot: str, round_id: int, ack: dict | None) -> tuple[bool, str]:
+    if not isinstance(ack, dict) or not ack:
+        return False, "missing"
+    bot_exp = str(bot or "").strip()
+    if bot_exp not in set(BOT_NAMES):
+        return False, "bot_no_esperado"
+    ack_bot = str(ack.get("bot", "") or "").strip()
+    if ack_bot and ack_bot != bot_exp:
+        return False, "bot_mismatch"
+    ack_round = int(ack.get("round_id", 0) or 0)
+    round_ok = int(round_id)
+    if ack_round != round_ok:
+        return False, ("round_vieja" if ack_round < round_ok else "round_futura")
+    ack_status = str(ack.get("status", "") or "").strip().upper()
+    if ack_status != "CERRADO":
+        return False, "status_invalido"
+    if bool(ack.get("pending_open", False)):
+        return False, "pending_open"
+    if not bool(ack.get("resultado_definido", False)):
+        return False, "resultado_indefinido"
+    res_norm = str(ack.get("resultado_norm", ack.get("resultado", "")) or "").strip().upper()
+    if not _ack_resultado_es_valido(res_norm):
+        return False, "resultado_invalido"
+    return True, "ok"
+
+
+def barrier_round_status(round_id: int) -> tuple[list[str], int]:
+    pending = []
+    valid_count = 0
+    now = float(time.time())
+    seen = set()
+    expected = set(str(b) for b in BOT_NAMES)
+    for b in BOT_NAMES:
+        b = str(b)
+        ack = leer_ack_ronda_bot(b, round_id)
+        ok, reason = validar_ack_ronda_bot(b, round_id, ack)
+        if not ok:
+            pending.append(b)
+            if reason != "missing" and _print_once(f"ack-invalid-{round_id}-{b}-{reason}", ttl=4):
+                agregar_evento(f"ROUND_ACK_INVALID round={int(round_id)} bot={b} reason={reason}")
+            continue
+        ts_close = float((ack or {}).get("ts_close", 0.0) or 0.0)
+        if ts_close > 0 and (now - ts_close) > float(BARRIER_ACK_TIMEOUT_S * 4):
+            pending.append(b)
+            if _print_once(f"ack-invalid-timeout-{round_id}-{b}", ttl=4):
+                agregar_evento(f"ROUND_ACK_INVALID round={int(round_id)} bot={b} reason=stale_close")
+            continue
+        if b in seen:
+            pending.append(b)
+            if _print_once(f"ack-dup-{round_id}-{b}", ttl=4):
+                agregar_evento(f"ROUND_ACK_DUPLICATE round={int(round_id)} bot={b}")
+            continue
+        seen.add(b)
+        valid_count += 1
+    extras = sorted(set(seen) - expected)
+    for eb in extras:
+        if _print_once(f"ack-extra-{round_id}-{eb}", ttl=6):
+            agregar_evento(f"ROUND_ACK_INVALID round={int(round_id)} bot={eb} reason=bot_no_esperado")
+    total_bots = int(len(BOT_NAMES))
+    if _print_once(f"ack-progress-{round_id}-{valid_count}-{'-'.join(sorted(pending))}", ttl=2):
+        faltan = ','.join(sorted(pending)) if pending else '--'
+        agregar_evento(f"ROUND_ACK_PROGRESS round={int(round_id)} ack={int(valid_count)}/{int(total_bots)} faltan={faltan}")
+    if valid_count == int(total_bots):
+        if _print_once(f"ack-complete-{round_id}", ttl=5):
+            agregar_evento(f"ROUND_ACK_COMPLETE round={int(round_id)} ack=6/6")
+    return pending, valid_count
+def barrier_round_pendiente(round_id: int) -> list[str]:
+    pending, _ = barrier_round_status(int(round_id))
+    return list(pending or [])
+
+
+def barrier_round_completa(round_id: int) -> tuple[bool, list[str]]:
+    pending, valid_count = barrier_round_status(int(round_id))
+    return (int(valid_count) == int(len(BOT_NAMES))), list(pending or [])
+
+
+def escribir_barrier_release(current_round: int, selected_bot: str = "", lxv_ready: bool = False):
+    st = leer_barrier_state() or {}
+    out = {
+        "barrier_enabled": bool(BARRIER_ENABLED),
+        "current_round": int(current_round),
+        "release_round": int(current_round) + 1,
+        "all_closed": True,
+        "pending_bots": [],
+        "last_evaluated_round": int(current_round),
+        "selected_bot": str(selected_bot or ""),
+        "lxv_ready": bool(lxv_ready),
+        "ts": float(time.time()),
+    }
+    out.update({k: v for k, v in st.items() if k not in out and k not in {"pending_bots"}})
+    escribir_barrier_state_atomic(out)
+
+    # Limpieza de rondas antiguas para que no crezca infinito sync_round/
+    try:
+        keep_from = max(1, int(current_round) - 2)
+        for name in os.listdir(SYNC_ROUND_DIR):
+            if not str(name).startswith("round_"):
+                continue
+            dpath = os.path.join(SYNC_ROUND_DIR, str(name))
+            if not os.path.isdir(dpath):
+                continue
+            try:
+                rid = int(str(name).split("_", 1)[1])
+            except Exception:
+                continue
+            if int(rid) >= int(keep_from):
+                continue
+            for fn in os.listdir(dpath):
+                fp = os.path.join(dpath, fn)
+                if os.path.isfile(fp):
+                    try:
+                        os.remove(fp)
+                    except Exception:
+                        pass
+            try:
+                os.rmdir(dpath)
+            except Exception:
+                pass
     except Exception:
         pass
 
 
-def path_orden(bot: str) -> str:
-    return os.path.join(ORDEN_DIR, f"{bot}.disabled.json")
-
-
-def _lxv_consumed_ack_path(bot: str) -> str:
-    return os.path.join(LXV_CONSUMED_ACK_DIR, f"{bot}.disabled.json")
-
-
-def leer_lxv_consumed_ack(bot: str) -> dict | None:
-    return None
-
-
-def consumir_lxv_consumed_ack(bot: str, expected_round: int | None = None, expected_snapshot: str | None = None) -> bool:
-    return False
-
-
-def _sync_round_ack_path(bot: str, round_id: int) -> str:
-    return os.path.join(SYNC_ROUND_DIR, f"round_{max(1, int(round_id or 1))}", f"{bot}.disabled.json")
-
-
-def leer_barrier_state() -> dict:
-    return {
-        "barrier_enabled": False,
-        "current_round": 1,
-        "release_round": 1,
-        "all_closed": True,
-        "pending_bots": [],
-        "last_evaluated_round": 0,
-        "selected_bot": "",
-        "lxv_ready": False,
-        "ts": float(time.time()),
-    }
-
-
-def escribir_barrier_state_atomic(state: dict):
-    return None
-
-
-def reset_barrier_state_on_start():
-    return None
-
-
-def leer_ack_ronda_bot(bot: str, round_id: int) -> dict | None:
-    return None
-
-
-def _ack_resultado_es_valido(resultado_norm: str) -> bool:
-    return True
-
-
-def validar_ack_ronda_bot(bot: str, round_id: int, ack: dict | None) -> tuple[bool, str]:
-    return True, "disabled"
-
-
-def barrier_round_status(round_id: int) -> tuple[list[str], int]:
-    return [], int(len(BOT_NAMES))
-
-
-def barrier_round_pendiente(round_id: int) -> list[str]:
-    return []
-
-
-def barrier_round_completa(round_id: int) -> tuple[bool, list[str]]:
-    return True, []
-
-
-def escribir_barrier_release(current_round: int, selected_bot: str = "", lxv_ready: bool = False):
-    return None
-
-
 def resolver_barrier_round_canonico(st_bar: dict, logica_unica_real: dict, bot_names: list[str]) -> tuple[int, bool, list[str], str]:
-    return 1, True, [], "disabled"
+    barrier_round = int((st_bar or {}).get("current_round", 0) or 0)
+
+    if barrier_round > 0:
+        ok_bar, pend_bar = barrier_round_completa(barrier_round)
+        return int(barrier_round), bool(ok_bar), list(pend_bar or []), ("ok" if ok_bar else "acks_incompletos")
+
+    return 1, False, list(bot_names or []), "acks_incompletos"
 
 
 def _lxv_core_resolver_ronda(logica_unica_real: dict, bot_names: list[str]) -> tuple[int, bool, list[str], str, str]:
-    return 1, True, [], "disabled", "ROUND_RELEASE_NEXT"
+    """
+    Resuelve una ronda LXV_CORE con barrera estricta por ACK 6/6:
+    estados: ROUND_OPEN -> ROUND_WAIT_ACK -> ROUND_EVAL_LXV -> ROUND_RELEASE_NEXT.
+    """
+    st_bar = leer_barrier_state() or {}
+    now = float(time.time())
+    round_id = int(st_bar.get("current_round", 1) or 1)
+    release_round = int(st_bar.get("release_round", max(1, round_id)) or max(1, round_id))
+    round_open_ts = float(st_bar.get("round_open_ts", 0.0) or 0.0)
+    if round_open_ts <= 0.0:
+        round_open_ts = now
+        agregar_evento(f"LXV_CORE_ROUND_OPEN round={int(round_id)}")
+    pending = barrier_round_pendiente(int(round_id))
+    for b in [str(x) for x in bot_names if str(x) not in set(pending)]:
+        agregar_evento(f"LXV_CORE_ACK_OK bot={b} round={int(round_id)}")
+    if pending:
+        agregar_evento(f"LXV_CORE_ACK_MISSING round={int(round_id)} bots={pending}")
+    elapsed = max(0.0, now - round_open_ts)
+    timeout_hit = bool(pending) and elapsed >= float(LXV_CORE_ROUND_TIMEOUT_S)
+    ack_complete = (len(pending) == 0)
+    if timeout_hit:
+        agregar_evento(f"ROUND_TIMEOUT_PENDING round={int(round_id)} faltan={pending}")
+
+    gate_open = bool(ack_complete or timeout_hit)
+    state = "ROUND_EVAL_LXV" if gate_open else "ROUND_WAIT_ACK"
+    if state == "ROUND_EVAL_LXV":
+        next_round = int(round_id) + 1
+        timeout_release = bool(timeout_hit and (not ack_complete))
+        out = {
+            "barrier_enabled": bool(BARRIER_ENABLED),
+            "current_round": int(next_round),
+            "release_round": int(max(release_round, next_round)),
+            "all_closed": bool(ack_complete),
+            "pending_bots": list(pending or []),
+            "last_evaluated_round": int(round_id),
+            "selected_bot": "",
+            "lxv_ready": False,
+            "round_state": "ROUND_RELEASE_NEXT",
+            "round_open_ts": now,
+            "ts": now,
+        }
+        escribir_barrier_state_atomic(out)
+        if timeout_release:
+            agregar_evento(
+                f"ROUND_TIMEOUT_RELEASE round={int(round_id)} release_round={int(out['release_round'])} faltan={list(pending or [])}"
+            )
+        else:
+            agregar_evento(f"ROUND_RELEASE_NEXT round={int(round_id)} release_round={int(out['release_round'])}")
+    else:
+        st_bar.update({
+            "barrier_enabled": bool(BARRIER_ENABLED),
+            "current_round": int(round_id),
+            "release_round": int(round_id),
+            "pending_bots": list(pending or []),
+            "all_closed": False,
+            "round_state": "ROUND_WAIT_ACK",
+            "round_open_ts": float(round_open_ts),
+            "ts": now,
+        })
+        escribir_barrier_state_atomic(st_bar)
+    reason = "ok" if ack_complete else ("timeout_release" if timeout_hit else "wait_ack")
+    return int(round_id), bool(gate_open), list(pending or []), reason, state
+
+# === PATCH: REAL INMEDIATO EN HUD AL EMITIR ORDEN (sin esperar compra) ===
+# Objetivo:
+# - Al emitir una ORDEN manual (bot+ciclo), reservar REAL y mostrarlo YA en HUD.
+# - Evitar recursión/doble llamada.
+# - Si activar_demo_neutralizado se llama desde otro flujo (no orden_real),
+#   asegurar que el bot tenga también su orden_real.json escrita (sin recursión).
 
 _last_real_push_ts = {bot: 0.0 for bot in BOT_NAMES}
 LAST_LXV_SYNC_SNAPSHOT_ID = ""  # compat legacy: alias del snapshot consumido
