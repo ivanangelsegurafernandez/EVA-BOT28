@@ -271,6 +271,7 @@ IA_METRIC_THRESHOLD = AUTO_REAL_THR_MIN
 # Modo clásico: activación REAL con umbral operativo vigente (hoy 65%, con techo dinámico base 70%).
 # Mantiene lock de un solo bot en REAL y ciclo martingala global en HUD.
 REAL_CLASSIC_GATE = True
+MODO_PURIFICACION_REAL = True  # Llave maestra: bypassea toda promoción/activación REAL sin apagar IA/HUD.
 
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
@@ -618,9 +619,34 @@ def _pattern_v1_log_bot(bot: str, pattern_score: float, bonus_dual: float, penal
         pass
 
 
+def _purificacion_real_activa() -> bool:
+    """Llave maestra centralizada para apagar capa REAL sin romper flujo IA/HUD."""
+    try:
+        return bool(globals().get("MODO_PURIFICACION_REAL", False))
+    except Exception:
+        return False
+
+
+def _emitir_marca_purificacion_real() -> None:
+    """Marca visual/evento con cooldown para confirmar bypass REAL activo."""
+    global _LAST_PURIFICACION_REAL_EVENT_TS
+    try:
+        if not _purificacion_real_activa():
+            return
+        now = float(time.time())
+        if (now - float(_LAST_PURIFICACION_REAL_EVENT_TS or 0.0)) < float(PURIFICACION_REAL_EVENT_COOLDOWN_S):
+            return
+        _LAST_PURIFICACION_REAL_EVENT_TS = now
+        agregar_evento("🧪 MODO PURIFICACION REAL ACTIVO: promoción/orden REAL desactivada (bypass).")
+    except Exception:
+        pass
+
+
 def _resolver_estado_real(meta_live: dict | None = None) -> str:
     """Estado operativo REAL: SHADOW, MICRO, NORMAL."""
     try:
+        if _purificacion_real_activa():
+            return "SHADOW"
         if not bool(REAL_PILOT_MODE_ENABLE):
             return "NORMAL"
         meta = meta_live if isinstance(meta_live, dict) else (_ORACLE_CACHE.get("meta") or leer_model_meta() or {})
@@ -1242,6 +1268,8 @@ HUD_BLOQUEO_WINDOW = 120
 HUD_BLOQUEOS_RECIENTES = deque(maxlen=HUD_BLOQUEO_WINDOW)
 HUD_BOT_GATE_DIAG_EVERY_S = 6.0
 _LAST_HUD_BOT_GATE_DIAG_TS = 0.0
+PURIFICACION_REAL_EVENT_COOLDOWN_S = 90.0
+_LAST_PURIFICACION_REAL_EVENT_TS = 0.0
 
 EVENTO_MAX_CHARS = 220
 
@@ -2202,6 +2230,9 @@ def _set_ui_token_holder(holder: str | None):
     para evitar "REAL fantasma" y escudos pegados.
     """
     try:
+        if _purificacion_real_activa() and holder in BOT_NAMES:
+            _emitir_marca_purificacion_real()
+            return
         now = time.time()
         for b in BOT_NAMES:
             # ultra defensivo: si por algo falta el dict del bot, lo crea
@@ -2286,6 +2317,9 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
     global LIMPIEZA_PANEL_HASTA, sonido_disparado, marti_paso, REAL_OWNER_LOCK, REAL_ENTRY_BASELINE
 
     try:
+        if _purificacion_real_activa():
+            _emitir_marca_purificacion_real()
+            return False
         if bot not in BOT_NAMES:
             return False
 
@@ -2445,6 +2479,10 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
     - Activa REAL inmediato en HUD + token file
     """
     ciclo = max(1, min(int(ciclo), MAX_CICLOS))
+
+    if _purificacion_real_activa():
+        _emitir_marca_purificacion_real()
+        return False
 
     # 🔒 No crear orden si ya hay otro owner REAL activo.
     try:
@@ -12005,6 +12043,8 @@ def mostrar_panel():
 
     # Línea de estado general
     print(padding + Fore.GREEN + "🟢 MODO OPERACIÓN ACTIVO – Escaneando…")
+    if _purificacion_real_activa():
+        print(padding + Fore.YELLOW + "🧪 MODO PURIFICACION REAL ACTIVO | PROMOCION REAL DESACTIVADA")
 
     # Etapa activa para depuración de flujo
     try:
@@ -14505,6 +14545,30 @@ def _registrar_estado_embudo(data: dict | None = None) -> dict:
 
 def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real: str, meta_live: dict | None) -> dict:
     """Embudo unificado: selección -> calidad blanda -> modulación -> estado final."""
+    if _purificacion_real_activa():
+        _emitir_marca_purificacion_real()
+        top1_bot = str(candidatos[0][1]) if candidatos else None
+        top1_prob = float(candidatos[0][2] or 0.0) if candidatos else 0.0
+        top2_bot = str(candidatos[1][1]) if len(candidatos) > 1 else None
+        top2_prob = float(candidatos[1][2] or 0.0) if len(candidatos) > 1 else 0.0
+        gap_value = float(top1_prob - top2_prob) if candidatos else 0.0
+        return _registrar_estado_embudo({
+            "decision_final": "REAL_DISABLED",
+            "decision_reason": "purificacion_real",
+            "gate_quality": "disabled",
+            "risk_mode": "REAL_DISABLED",
+            "hard_block_reason": "purificacion_real",
+            "soft_wait_reason": "purificacion_real",
+            "top1_bot": top1_bot,
+            "top2_bot": top2_bot,
+            "gap_value": gap_value,
+            "top1_prob": top1_prob,
+            "top2_prob": top2_prob,
+            "degrade_from": "purificacion_real",
+            "ia_real_backed": 0,
+            "real_source": "PURIFICACION_REAL",
+            "ia_model_mature": 0,
+        })
     out = _registrar_estado_embudo({
         "decision_final": EMBUDO_FINAL_WAIT_SOFT,
         "decision_reason": "sin_candidatos",
