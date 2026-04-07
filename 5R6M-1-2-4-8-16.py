@@ -272,8 +272,6 @@ IA_METRIC_THRESHOLD = AUTO_REAL_THR_MIN
 # Mantiene lock de un solo bot en REAL y ciclo martingala global en HUD.
 REAL_CLASSIC_GATE = True
 MODO_PURIFICACION_REAL = True  # Llave maestra: bypassea toda promoción/activación REAL sin apagar IA/HUD.
-LXV_SYNC_REAL_ROUTE_ENABLE = True
-LXV_SYNC_REAL_SOURCE = "LXV_SYNC"
 
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
@@ -624,9 +622,6 @@ def _pattern_v1_log_bot(bot: str, pattern_score: float, bonus_dual: float, penal
 def _purificacion_real_activa() -> bool:
     """Llave maestra centralizada para apagar capa REAL sin romper flujo IA/HUD."""
     try:
-        route_src = str(globals().get("_REAL_ROUTE_SOURCE", "") or "").strip().upper()
-        if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and route_src == str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper():
-            return False
         return bool(globals().get("MODO_PURIFICACION_REAL", False))
     except Exception:
         return False
@@ -2209,82 +2204,11 @@ def path_orden(bot: str) -> str:
     _ensure_dir(ORDEN_DIR)
     return os.path.join(ORDEN_DIR, f"{bot}.json")
 
-# === SALDO LIVE FEED (maestro -> monitor_saldo_pro) ===
-SALDO_LIVE_FILE = "saldo_real_live.json"
-SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
-SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
-SALDO_LIVE_SHARED_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))))
-SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_LIVE_HISTORY_SHARED_PATH", os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE))))
-SALDO_SERIES_CSV_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_SERIES_CSV_PATH", os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_SERIES_CSV_FILE))))
-
-def _saldo_feed_targets() -> dict:
-    local_live = os.path.abspath(os.path.join(script_dir, SALDO_LIVE_FILE))
-    local_hist = os.path.abspath(os.path.join(script_dir, SALDO_LIVE_HISTORY_FILE))
-    local_csv = os.path.abspath(os.path.join(script_dir, SALDO_SERIES_CSV_FILE))
-    return {
-        "live": [local_live, SALDO_LIVE_SHARED_PATH],
-        "history": [local_hist, SALDO_LIVE_HISTORY_SHARED_PATH],
-        "series": [local_csv, SALDO_SERIES_CSV_PATH],
-    }
-
-def _append_line_safe(path: str, line: str):
-    try:
-        _ensure_dir(os.path.dirname(path) or ".")
-    except Exception:
-        pass
-    tmp_lock = f"{os.path.basename(path)}.lock"
-    with file_lock_required(tmp_lock, timeout=2.0, stale_after=20.0) as got:
-        if not got:
-            return
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line)
-            f.flush()
-            os.fsync(f.fileno())
-
-def _update_saldo_monitor_feed(valor_saldo: float):
-    try:
-        val = float(valor_saldo)
-    except Exception:
-        return
-    now = float(time.time())
-    ts_iso = datetime.now(timezone.utc).isoformat()
-    payload_live = {
-        "saldo_real": val,
-        "equity": val,
-        "balance": val,
-        "timestamp": ts_iso,
-        "ts": now,
-        "source": "MAESTRO_5R6M",
-    }
-    payload_hist = {"timestamp": ts_iso, "equity": val, "source": "MAESTRO_5R6M"}
-    csv_line = f"{ts_iso},{val:.2f},MAESTRO_5R6M\n"
-    for p in dict.fromkeys(_saldo_feed_targets()["live"]):
-        try:
-            _atomic_write(p, json.dumps(payload_live, ensure_ascii=False))
-        except Exception:
-            pass
-    for p in dict.fromkeys(_saldo_feed_targets()["history"]):
-        try:
-            _append_line_safe(p, json.dumps(payload_hist, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-    for p in dict.fromkeys(_saldo_feed_targets()["series"]):
-        try:
-            if not os.path.exists(p):
-                _append_line_safe(p, "timestamp,equity,source\n")
-            _append_line_safe(p, csv_line)
-        except Exception:
-            pass
-# === /SALDO LIVE FEED ===
-
 # === LXV_SYNC_COLUMN: sincronización de ronda/columna maestro↔bots ===
 SYNC_ROUND_DIR = "sync_round"
 SYNC_ROUND_STATE_PATH = os.path.join(SYNC_ROUND_DIR, "state.json")
-TTL_ACK_SYNC_ROUND_S = 300.0
-ACK_SYNC_ROUND_FUTURE_DRIFT_S = 20.0
 _SYNC_ROUND_LAST_ANNOUNCED = None
 _SYNC_ROUND_LAST_CLOSED_COUNT = {}
-_LXV_LAST_EMITTED_ROUND = 0
 
 def _sync_round_ack_path(bot: str) -> str:
     _ensure_dir(SYNC_ROUND_DIR)
@@ -2323,90 +2247,8 @@ def _sync_round_bootstrap_state(force: bool = False):
     }
     _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
 
-def _sync_round_apply_visual_heartbeat(bot: str) -> None:
-    """
-    Mantiene señal visual de vida/standby sin releer CSV completo.
-    """
-    try:
-        if bot not in BOT_NAMES:
-            return
-        st = estado_bots.get(bot, {})
-        if not isinstance(st, dict):
-            return
-        ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
-        gstate = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
-        round_id = int(gstate.get("round_id", 1) or 1)
-        released = int(gstate.get("released_round", 1) or 1)
-        wait_flag = bool(ack.get("sync_wait", False))
-        wait_round = int(ack.get("round_id", 0) or 0)
-        waiting_release = int(ack.get("waiting_release_round", wait_round + 1) or (wait_round + 1))
-        active_wait = bool(wait_flag and wait_round == round_id and released < waiting_release)
-        st["sync_wait"] = active_wait
-        st["last_sync_round"] = wait_round if wait_round > 0 else round_id
-        st["last_seen_ts"] = float(ack.get("last_seen_ts", time.time()) or time.time())
-        st["estado_visual"] = "STANDBY_RONDA" if active_wait else st.get("estado_visual", "ACTIVO")
-        if active_wait:
-            last_update_time[bot] = time.time()
-    except Exception:
-        pass
-
-def _lxv_round_snapshot(round_id: int, closed: dict) -> list[dict]:
-    out = []
-    for bot in BOT_NAMES:
-        c = closed.get(bot)
-        if not isinstance(c, dict):
-            continue
-        st = estado_bots.get(bot, {})
-        out.append({
-            "bot": bot,
-            "round_id": int(round_id),
-            "resultado": str(c.get("resultado", "")).upper().strip(),
-            "ciclo": int(c.get("ciclo", st.get("ciclo_actual", 1)) or 1),
-            "asset": c.get("asset"),
-            "ts": float(c.get("ts", 0.0) or 0.0),
-            "prob_ia_oper": st.get("prob_ia_oper"),
-            "prob_ia": st.get("prob_ia"),
-            "score_senal": st.get("ia_score_hibrido", st.get("ia_regime_score")),
-            "payout": c.get("payout"),
-            "winrate": st.get("porcentaje_exito"),
-        })
-    return out
-
-def _lxv_rank_key(item: dict) -> tuple:
-    def _num(v, default=-1e9):
-        try:
-            return float(v)
-        except Exception:
-            return float(default)
-    bot = str(item.get("bot", ""))
-    order_idx = BOT_NAMES.index(bot) if bot in BOT_NAMES else 999
-    return (
-        _num(item.get("prob_ia_oper"), -1e9),
-        _num(item.get("prob_ia"), -1e9),
-        _num(item.get("score_senal"), -1e9),
-        _num(item.get("payout"), -1e9),
-        _num(item.get("winrate"), -1e9),
-        _num(item.get("ts"), -1e9),
-        -float(order_idx),
-    )
-
-def _lxv_evaluar_columna(round_id: int, snapshot: list[dict]) -> tuple[dict | None, str, str]:
-    verdes = [x for x in snapshot if x.get("resultado") == "GANANCIA"]
-    rojos = [x for x in snapshot if x.get("resultado") == "PÉRDIDA"]
-    patron = f"{len(verdes)}V/{len(rojos)}X"
-    if len(verdes) == 5 and len(rojos) == 1:
-        pick = dict(rojos[0])
-        motivo = "5 verdes / 1 X (X única)"
-        return pick, patron, motivo
-    if len(verdes) == 4 and len(rojos) == 2:
-        ranked = sorted(rojos, key=_lxv_rank_key, reverse=True)
-        pick = dict(ranked[0]) if ranked else None
-        motivo = "4 verdes / 2 X (mayor peso: prob_ia_oper > prob_ia > score > payout > winrate > ts > BOT_NAMES)"
-        return pick, patron, motivo
-    return None, patron, "patrón no válido para LXV_REAL"
-
 def _sync_round_tick_maestro():
-    global _SYNC_ROUND_LAST_ANNOUNCED, _LXV_LAST_EMITTED_ROUND
+    global _SYNC_ROUND_LAST_ANNOUNCED
     _sync_round_bootstrap_state(force=False)
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
 
@@ -2431,7 +2273,6 @@ def _sync_round_tick_maestro():
         _SYNC_ROUND_LAST_ANNOUNCED = round_id
 
     closed = {}
-    now_ts = float(time.time())
     for bot in expected:
         ack = _sync_round_safe_read_json(_sync_round_ack_path(bot))
         if not isinstance(ack, dict):
@@ -2443,16 +2284,6 @@ def _sync_round_tick_maestro():
         if ack_round != round_id:
             continue
         if str(ack.get("status", "")).lower().strip() != "closed":
-            continue
-        try:
-            ack_ts = float(ack.get("ts", 0.0) or 0.0)
-        except Exception:
-            continue
-        if ack_ts <= 0:
-            continue
-        if (now_ts - ack_ts) > float(TTL_ACK_SYNC_ROUND_S):
-            continue
-        if ack_ts > (now_ts + float(ACK_SYNC_ROUND_FUTURE_DRIFT_S)):
             continue
         res = str(ack.get("resultado", "")).upper().strip()
         if res not in ("GANANCIA", "PÉRDIDA"):
@@ -2490,32 +2321,6 @@ def _sync_round_tick_maestro():
     if completed:
         agregar_evento(f"✅ LXV_SYNC_COLUMN columna/ronda #{round_id} COMPLETA.")
         agregar_evento(f"🚀 LXV_SYNC_COLUMN ronda #{next_round} LIBERADA.")
-        snapshot = _lxv_round_snapshot(round_id, closed)
-        pick, patron, motivo = _lxv_evaluar_columna(round_id, snapshot)
-        if pick:
-            bot_pick = str(pick.get("bot"))
-            ciclo_pick = int(pick.get("ciclo", estado_bots.get(bot_pick, {}).get("ciclo_actual", 1)) or 1)
-            agregar_evento(f"🧠 LXV columna #{round_id}: {patron} → candidato REAL {bot_pick} ({motivo}).")
-            if int(_LXV_LAST_EMITTED_ROUND or 0) != int(round_id):
-                ok_emit = emitir_real_autorizado(bot_pick, ciclo_pick, source=LXV_SYNC_REAL_SOURCE)
-                _LXV_LAST_EMITTED_ROUND = int(round_id) if ok_emit else int(_LXV_LAST_EMITTED_ROUND or 0)
-                if ok_emit:
-                    agregar_evento(f"🚨 LXV_SYNC REAL emitido: ronda #{round_id} -> {bot_pick} ciclo #{ciclo_pick}.")
-                else:
-                    agregar_evento(f"⚠️ LXV_SYNC REAL no emitido en ronda #{round_id} (lock/purificación/estado).")
-        else:
-            agregar_evento(f"ℹ️ LXV columna #{round_id}: {patron} → {motivo}.")
-        # Higiene mínima: baja "sync_wait" en bots ya contabilizados
-        for bot in closed.keys():
-            try:
-                ack_path = _sync_round_ack_path(bot)
-                ack_cur = _sync_round_safe_read_json(ack_path) or {}
-                if isinstance(ack_cur, dict):
-                    ack_cur["sync_wait"] = False
-                    ack_cur["last_seen_ts"] = time.time()
-                    _sync_round_write_json_atomic(ack_path, ack_cur)
-            except Exception:
-                pass
 # === /LXV_SYNC_COLUMN ===
 
 # === PATCH: REAL INMEDIATO EN HUD AL EMITIR ORDEN (sin esperar compra) ===
@@ -15511,12 +15316,7 @@ async def cargar_datos_bot(bot, token_actual):
         # Gate rápido (opcional): si el archivo no creció, salimos sin leer todo el CSV
         actual = contar_filas_csv(bot)
         if actual <= snapshot:
-            try:
-                _sync_round_apply_visual_heartbeat(bot)
-            except NameError:
-                pass
-            except Exception:
-                pass
+            _sync_round_apply_visual_heartbeat(bot)
             return
 
         df = pd.read_csv(ruta, encoding="utf-8", on_bad_lines="skip")
