@@ -36,20 +36,24 @@ import os, csv, time, random, asyncio, json, re
 from collections import deque
 from unicodedata import normalize
 import threading
-from datetime import datetime, timedelta, timezone
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
+from datetime import datetime, timedelta
 from contextlib import contextmanager
 import sys
 import shutil
 import joblib
+import numpy as np
+import pandas as pd
 import importlib
 import traceback
 
 import math
 import hashlib
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, f1_score, fbeta_score, brier_score_loss
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.isotonic import IsotonicRegression
 
 import warnings
 warnings.filterwarnings(
@@ -59,21 +63,6 @@ warnings.filterwarnings(
 
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
-
-os.environ.setdefault("PYTHONUTF8", "1")
-
-def _configure_console_output_safe():
-    for _stream_name in ("stdout", "stderr"):
-        _stream = getattr(sys, _stream_name, None)
-        if _stream is None:
-            continue
-        try:
-            if hasattr(_stream, "reconfigure"):
-                _stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
-_configure_console_output_safe()
 
 def _load_optional_module(name: str):
     try:
@@ -89,125 +78,9 @@ def _load_optional_module(name: str):
     except Exception:
         return None
 
-np = _load_optional_module("numpy")
-pd = _load_optional_module("pandas")
-NUMPY_OK = np is not None
-PANDAS_OK = pd is not None
-
-if not NUMPY_OK:
-    class _NPErrStateCompat:
-        def __enter__(self):
-            return None
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    class _NumpyCompat:
-        """Shim mínimo para evitar fallo de arranque cuando numpy no está instalado."""
-        nan = float("nan")
-        inf = float("inf")
-        integer = int
-        floating = float
-        ndarray = list
-
-        @staticmethod
-        def errstate(**_kwargs):
-            return _NPErrStateCompat()
-
-        @staticmethod
-        def asarray(values):
-            return list(values) if isinstance(values, (list, tuple, deque)) else [values]
-
-        @staticmethod
-        def isfinite(v):
-            try:
-                return math.isfinite(float(v))
-            except Exception:
-                return False
-
-        def __getattr__(self, _name):
-            def _fallback(*_args, **_kwargs):
-                return 0.0
-            return _fallback
-
-    np = _NumpyCompat()
-
-if not PANDAS_OK:
-    class _PandasSeriesCompat(list):
-        empty = True
-
-        def dropna(self):
-            return self
-
-    class _PandasDataFrameCompat(dict):
-        empty = True
-
-    class _PandasCompat:
-        """Shim mínimo para preservar bootstrap cuando pandas no está disponible."""
-        DataFrame = _PandasDataFrameCompat
-        Series = _PandasSeriesCompat
-
-        @staticmethod
-        def read_csv(*_args, **_kwargs):
-            return _PandasDataFrameCompat()
-
-        @staticmethod
-        def concat(*_args, **_kwargs):
-            return _PandasDataFrameCompat()
-
-        @staticmethod
-        def isna(*_args, **_kwargs):
-            return False
-
-        @staticmethod
-        def notna(*_args, **_kwargs):
-            return True
-
-        @staticmethod
-        def to_datetime(*_args, **_kwargs):
-            return _PandasSeriesCompat()
-
-        @staticmethod
-        def to_numeric(*_args, **_kwargs):
-            return _PandasSeriesCompat()
-
-    pd = _PandasCompat()
-
-_sk_model_selection = _load_optional_module("sklearn.model_selection")
-_sk_preprocessing = _load_optional_module("sklearn.preprocessing")
-_sk_metrics = _load_optional_module("sklearn.metrics")
-_sk_calibration = _load_optional_module("sklearn.calibration")
-_sk_linear_model = _load_optional_module("sklearn.linear_model")
-_sk_isotonic = _load_optional_module("sklearn.isotonic")
-
-train_test_split = getattr(_sk_model_selection, "train_test_split", None)
-TimeSeriesSplit = getattr(_sk_model_selection, "TimeSeriesSplit", None)
-StandardScaler = getattr(_sk_preprocessing, "StandardScaler", None)
-roc_auc_score = getattr(_sk_metrics, "roc_auc_score", None)
-f1_score = getattr(_sk_metrics, "f1_score", None)
-fbeta_score = getattr(_sk_metrics, "fbeta_score", None)
-brier_score_loss = getattr(_sk_metrics, "brier_score_loss", None)
-CalibratedClassifierCV = getattr(_sk_calibration, "CalibratedClassifierCV", None)
-LogisticRegression = getattr(_sk_linear_model, "LogisticRegression", None)
-IsotonicRegression = getattr(_sk_isotonic, "IsotonicRegression", None)
-
-SKLEARN_OK = all([
-    train_test_split is not None,
-    TimeSeriesSplit is not None,
-    StandardScaler is not None,
-    roc_auc_score is not None,
-    f1_score is not None,
-    fbeta_score is not None,
-    brier_score_loss is not None,
-    CalibratedClassifierCV is not None,
-    LogisticRegression is not None,
-    IsotonicRegression is not None,
-])
-
 
 def _safe_mean_np(values, default=None):
     """Media robusta: evita RuntimeWarning en slices vacíos y NaN-only."""
-    if not NUMPY_OK:
-        return default
     try:
         arr = np.asarray(values)
         if arr.size <= 0:
@@ -385,23 +258,19 @@ IA_REDUNDANCY_SCORE_PENALTY = 0.03
 IA_SENSOR_PLANO_SCORE_PENALTY = 0.04
 IA_SUCESO_SCORE_WEIGHT = 0.08
 IA_OBSERVE_THR = 0.70
-AUTO_REAL_DISABLED_THR = IA_OBJETIVO_REAL_THR      # techo dinámico objetivo (70%)
-AUTO_REAL_DISABLED_BASE_FLOOR = 0.60                 # piso base dinámico para evitar bloqueo permanente en MODELO experimental
-AUTO_REAL_DISABLED_THR_MIN = max(float(IA_ACTIVACION_REAL_THR), float(AUTO_REAL_DISABLED_BASE_FLOOR))
-AUTO_REAL_DISABLED_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
-AUTO_REAL_DISABLED_MARGIN = 0.01   # pequeño margen para evitar quedar fuera por décimas
-AUTO_REAL_DISABLED_LOG_MAX_ROWS = 300  # máximo de señales históricas usadas en la calibración
-AUTO_REAL_DISABLED_LIVE_MIN_BOTS = 3   # mínimos bots con prob viva para calibración por tick
+AUTO_REAL_THR = IA_OBJETIVO_REAL_THR      # techo dinámico objetivo (70%)
+AUTO_REAL_BASE_FLOOR = 0.60                 # piso base dinámico para evitar bloqueo permanente en MODELO experimental
+AUTO_REAL_THR_MIN = max(float(IA_ACTIVACION_REAL_THR), float(AUTO_REAL_BASE_FLOOR))
+AUTO_REAL_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
+AUTO_REAL_MARGIN = 0.01   # pequeño margen para evitar quedar fuera por décimas
+AUTO_REAL_LOG_MAX_ROWS = 300  # máximo de señales históricas usadas en la calibración
+AUTO_REAL_LIVE_MIN_BOTS = 3   # mínimos bots con prob viva para calibración por tick
 
 # Umbral "operativo/UI" (señales actuales, semáforo, etc.)
-IA_METRIC_THRESHOLD = AUTO_REAL_DISABLED_THR_MIN
+IA_METRIC_THRESHOLD = AUTO_REAL_THR_MIN
 # Modo clásico: activación REAL con umbral operativo vigente (hoy 65%, con techo dinámico base 70%).
 # Mantiene lock de un solo bot en REAL y ciclo martingala global en HUD.
 REAL_CLASSIC_GATE = True
-LXV_CORE_ENABLE = True
-LXV_CORE_REAL_ROUTE_ENABLE = True
-LXV_CORE_BYPASS_GLOBAL_GATE = True
-LXV_CORE_REQUIRE_HARD_SAFETY_ONLY = True
 
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
@@ -410,12 +279,6 @@ IA_CALIB_GOAL_THRESHOLD = IA_OBJETIVO_REAL_THR  # objetivo real: medir cierres f
 IA_CALIB_MIN_CLOSED = 200  # mínimo recomendado para considerar estable la auditoría
 REAL_GO_N_MIN = 180
 REAL_GO_CLOSED_MIN = 50
-REAL_EARLY_MICRO_OVERRIDE_ENABLE = True
-REAL_EARLY_MICRO_OVERRIDE_MIN_N = 100
-REAL_EARLY_MICRO_OVERRIDE_MIN_AUC = 0.65
-REAL_EARLY_MICRO_OVERRIDE_MIN_PROB_MARGIN = 0.00
-REAL_EARLY_MICRO_OVERRIDE_ALLOW_UNRELIABLE = True
-REAL_EARLY_MICRO_OVERRIDE_REQUIRE_WARMUP_ONLY = True
 
 # Recomendaciones operativas conservadoras (anti-sobreconfianza)
 IA_TEMP_THR_HIGH = 0.80              # umbral temporal sugerido cuando la muestra fuerte es baja
@@ -463,39 +326,32 @@ IA_WARMUP_CAP_RAMP_ROWS = 120         # rampa de cap en warmup: permite tocar 75
 IA_WARMUP_LOW_EVIDENCE_CAP_BASE = 0.80
 IA_WARMUP_LOW_EVIDENCE_CAP_POST_N15 = 0.85
 
-AUTO_REAL_DISABLED_ALLOW_UNRELIABLE_POST_N15 = True
-AUTO_REAL_DISABLED_UNRELIABLE_MIN_N = 0
-AUTO_REAL_DISABLED_UNRELIABLE_MIN_PROB = 0.535  # ajuste moderado: reduce bloqueos por borde (ej. 53.8 vs 54.0)
-AUTO_REAL_DISABLED_UNRELIABLE_MIN_AUC = 0.52   # unreliable conservador: evita activaciones con AUC marginal débil
-AUTO_REAL_DISABLED_BLOCK_WHEN_WARMUP = False   # no bloquear REAL por warmup (perfil prueba protegida)
+AUTO_REAL_ALLOW_UNRELIABLE_POST_N15 = True
+AUTO_REAL_UNRELIABLE_MIN_N = 0
+AUTO_REAL_UNRELIABLE_MIN_PROB = 0.54  # modo unreliable conservador: exige mejor discriminación antes de REAL
+AUTO_REAL_UNRELIABLE_MIN_AUC = 0.52   # unreliable conservador: evita activaciones con AUC marginal débil
+AUTO_REAL_BLOCK_WHEN_WARMUP = False   # no bloquear REAL por warmup (perfil prueba protegida)
 # Ajuste mínimo anti-congelamiento lateral: permite bajar el umbral UNREL
 # solo cuando hay evidencia operativa consistente por bot.
-AUTO_REAL_DISABLED_UNREL_LATERAL_ADAPT_ENABLE = True
-AUTO_REAL_DISABLED_UNREL_LATERAL_MIN_N = 50
-AUTO_REAL_DISABLED_UNREL_LATERAL_MIN_WR = 0.50
-AUTO_REAL_DISABLED_UNREL_LATERAL_MIN_PROB = 0.50
-AUTO_REAL_DISABLED_UNRELIABLE_FLOOR = 0.51      # piso REAL temporal cuando reliable=false y ya hay n mínimo por bot
+AUTO_REAL_UNREL_LATERAL_ADAPT_ENABLE = True
+AUTO_REAL_UNREL_LATERAL_MIN_N = 50
+AUTO_REAL_UNREL_LATERAL_MIN_WR = 0.50
+AUTO_REAL_UNREL_LATERAL_MIN_PROB = 0.50
+AUTO_REAL_UNRELIABLE_FLOOR = 0.51      # piso REAL temporal cuando reliable=false y ya hay n mínimo por bot
 # Micro-relajación gradual del umbral UNREL basada en cierres auditados reales.
 # Solo aplica cuando ya hay muestra suficiente y rendimiento sostenido.
-AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_ENABLE = True
-AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MIN_CLOSED = 20
-AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MIN_WINRATE = 0.70
-AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MAX_DELTA = 0.02
-AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_LOG_COOLDOWN_S = 45.0
+AUTO_REAL_UNREL_MICRO_RELAX_ENABLE = True
+AUTO_REAL_UNREL_MICRO_RELAX_MIN_CLOSED = 20
+AUTO_REAL_UNREL_MICRO_RELAX_MIN_WINRATE = 0.70
+AUTO_REAL_UNREL_MICRO_RELAX_MAX_DELTA = 0.02
+AUTO_REAL_UNREL_MICRO_RELAX_LOG_COOLDOWN_S = 45.0
 # Bypass controlado: si la compuerta REAL ya está sólida en vivo, permitir AUTO
 # aunque el modelo siga en warmup/reliable=false.
-AUTO_REAL_DISABLED_UNRELIABLE_ALLOW_STRONG_GATE = True
-AUTO_REAL_DISABLED_UNRELIABLE_GATE_MIN_PROB = 0.535
-# Bootstrap temprano de banderas LEGACY para evitar uso antes de definición.
-LEGACY_QUARANTINE_ENABLE = True
-LEGACY_ENABLE_PATTERN_V1 = not LEGACY_QUARANTINE_ENABLE
-LEGACY_ENABLE_PATTERN_COLUMNS = False
-LEGACY_ENABLE_SHADOW_MICRO = not LEGACY_QUARANTINE_ENABLE
-LEGACY_ENABLE_MICRO_STRONG_FALLBACK = not LEGACY_QUARANTINE_ENABLE
-LEGACY_ENABLE_EARLY_CONFIRM_OVERRIDE = not LEGACY_QUARANTINE_ENABLE
-AUTO_REAL_DISABLED_MICRO_EARLY_CONFIRM_ENABLE = bool(LEGACY_ENABLE_EARLY_CONFIRM_OVERRIDE)
-AUTO_REAL_DISABLED_MICRO_EARLY_CONFIRM_MARGIN = 0.02
-AUTO_REAL_DISABLED_MICRO_EARLY_CONFIRM_DEFICIT_MAX = 1
+AUTO_REAL_UNRELIABLE_ALLOW_STRONG_GATE = True
+AUTO_REAL_UNRELIABLE_GATE_MIN_PROB = IA_ACTIVACION_REAL_THR_POST_N15
+AUTO_REAL_MICRO_EARLY_CONFIRM_ENABLE = True
+AUTO_REAL_MICRO_EARLY_CONFIRM_MARGIN = 0.02
+AUTO_REAL_MICRO_EARLY_CONFIRM_DEFICIT_MAX = 1
 
 # Guardas por bot para reducir desalineación Prob IA vs % Éxito observado en HUD.
 IA_PROMO_MIN_WR_POR_BOT = 0.45         # no promover bots con WR rolling claramente negativo
@@ -581,19 +437,18 @@ MODAL_ACTIVO = False
 sonido_disparado = False
 # === FIN BLOQUE 2 ===
 
-# === BLOQUE 2.5 — MRV (MOTOR DE RÉGIMEN VERDE) + CUARENTENA LEGACY ===
-# MRV es el motor estructural activo de contexto operativo.
-# La capa heredada (pattern/micro/shadow) queda en cuarentena para compatibilidad/telemetría.
-# DYN_ROOF se conserva como guardrail mínimo (anti-ráfaga/cooldown/gap), sin gobernar el contexto principal.
-# Banderas LEGACY tomadas del bootstrap temprano de BLOQUE 2.
-
-PATTERN_V1_ENABLE = False  # CUARENTENA: sin efecto operativo
+# === BLOQUE 2.5 — PLAN OPERATIVO PATRÓN V1 (RESUMEN EJECUTIVO) ===
+# IMPORTANTE:
+# - Este bloque NO reemplaza todavía la lógica de entrada actual.
+# - Sirve para dejar la integración preparada y revisable.
+# - Los candados existentes (hard_guard/confirm/trigger/roof) se mantienen.
+PATTERN_V1_ENABLE = True
 PATTERN_V1_SCORE_THR = 6.0
 PATTERN_V1_BONUS_DUAL = 1.0
 PATTERN_V1_PENAL_TARDIA = 2.0
 PATTERN_V1_REQUIRE_CONFIRM_FULL = True   # confirm=2/2
 PATTERN_V1_REQUIRE_TRIGGER_OK = True     # trigger_ok=sí
-PATTERN_V1_USE_HYBRID_RANKING = False   # CUARENTENA: sin impacto operativo en ranking
+PATTERN_V1_USE_HYBRID_RANKING = True    # ranking híbrido operativo (prob + pattern + evidencia)
 PATTERN_V1_LOG_COOLDOWN_S = 25.0
 PATTERN_V1_HYBRID_PTS_TO_PROB = 0.03  # 1 punto pattern = 3pp sobre score probabilístico
 PATTERN_COL_WINDOW = 40
@@ -603,7 +458,7 @@ PATTERN_REBOTE_LOOKBACK = 12
 PATTERN_REBOTE_MIN = 0.65
 PATTERN_REBOTE_MIN_SAMPLES = 3
 PATTERN_STRONG_STREAK_BLOCK = 2
-PATTERN_ENABLE = False  # CUARENTENA: telemetría sin efecto en decisión
+PATTERN_ENABLE = True
 PATTERN_COL_BONUS_CONTINUIDAD = 0.60
 PATTERN_COL_BONUS_REBOTE = 0.80
 PATTERN_COL_PENAL_SATURACION = 1.20
@@ -637,9 +492,8 @@ PATTERN_V1_Q2_PROXY = {
     "volatilidad": 0.049,
 }
 PATTERN_V1_LAST_LOG_TS = {}
-# Fase operativa REAL heredada (SHADOW -> MICRO -> NORMAL):
-# desactivada como cerebro operativo; queda solo para telemetría/compatibilidad.
-REAL_PILOT_MODE_ENABLE = False
+# Fase operativa REAL por madurez: SHADOW -> MICRO -> NORMAL
+REAL_PILOT_MODE_ENABLE = True
 REAL_MICRO_REQUIRE_PATTERN = False
 REAL_MICRO_PATTERN_MIN_TOTAL = 4.0
 REAL_MICRO_REQUIRE_DUAL = False
@@ -651,7 +505,7 @@ REAL_MICRO_ALLOW_SOFT_HIGH_PROB = True
 REAL_MICRO_SOFT_MIN_PROB = 0.58
 REAL_MICRO_SOFT_MIN_SUCESO = 18.0
 REAL_MICRO_SOFT_MIN_WR = 0.47
-REAL_SHADOW_MICRO_ENABLE = bool(LEGACY_ENABLE_SHADOW_MICRO)
+REAL_SHADOW_MICRO_ENABLE = True
 REAL_SHADOW_MICRO_MIN_PROB = 0.56
 REAL_SHADOW_MICRO_MAX_ENTRIES = 6
 REAL_SHADOW_MICRO_WINDOW_S = 300
@@ -659,236 +513,17 @@ REAL_SHADOW_MICRO_TOP_K = 1
 REAL_SHADOW_MICRO_LOG_COOLDOWN_S = 20.0
 _REAL_SHADOW_MICRO_OPEN_TS = deque(maxlen=64)
 _REAL_SHADOW_MICRO_LAST_LOG_TS = 0.0
-REAL_MICRO_STRONG_GATE_FALLBACK_ENABLE = bool(LEGACY_ENABLE_MICRO_STRONG_FALLBACK)
+REAL_MICRO_STRONG_GATE_FALLBACK_ENABLE = True
 REAL_MICRO_STRONG_GATE_MIN_PROB = 0.60
 EMBUDO_FINAL_BLOCK_HARD = "BLOCK_HARD"
-EMBUDO_FINAL_WAIT = "WAIT"
 EMBUDO_FINAL_WAIT_SOFT = "WAIT_SOFT"
-EMBUDO_FINAL_REAL_OK = "REAL_OK"
-# Aliases de compatibilidad (sin fragmentar la decisión final).
-EMBUDO_FINAL_REAL_MICRO = EMBUDO_FINAL_REAL_OK
-EMBUDO_FINAL_REAL_NORMAL = EMBUDO_FINAL_REAL_OK
-EMBUDO_FINAL_SHADOW_OK = EMBUDO_FINAL_WAIT_SOFT
-OVERRIDE_REZAGADA_ENABLE = True
-OVERRIDE_REZAGADA_MIN_VALID = 5
-OVERRIDE_REZAGADA_GREENS_OK = (4, 5)
-OVERRIDE_REZAGADA_REDS_OK = (1, 2)
-EMBUDO_MAIN_BLOCK_ON_MODE_C_PENDING = True
-EMBUDO_MAIN_REQUIRE_TRIGGER_OR_CONTEXT = True
-
-# === LXV_SYNC como única lógica de promoción a REAL ===
-LXV_PROMO_REAL_SOLO_SYNC = True
-if bool(LXV_PROMO_REAL_SOLO_SYNC):
-    IA_HARD_GUARD_ENABLE = False
-    ASSET_PROTECT_ENABLE = False
-    GATE_SEGMENTO_ENABLED = False
-    SMART_LOCKS_ENABLE = False
-    EMBUDO_MAIN_BLOCK_ON_MODE_C_PENDING = False
-    EMBUDO_MAIN_REQUIRE_TRIGGER_OR_CONTEXT = False
-    REAL_CLASSIC_GATE = False
+EMBUDO_FINAL_REAL_MICRO = "REAL_MICRO"
+EMBUDO_FINAL_REAL_NORMAL = "REAL_NORMAL"
+EMBUDO_FINAL_SHADOW_OK = "SHADOW_OK"
 IA_PROB_POLARIZE_ENABLE = True
 IA_PROB_POLARIZE_FACTOR_RELIABLE = 1.25
 IA_PROB_POLARIZE_FACTOR_UNRELIABLE = 2.05
 IA_PROB_POLARIZE_CENTER = 0.50
-
-# === MRV: Motor de Régimen Verde (motor estructural) ===
-MRV_ENABLE = False  # desactivado: no gobierna promoción a REAL
-MRV_WINDOW_SHORT = 8
-MRV_WINDOW_MED = 16
-MRV_MIN_HISTORY = 6
-MRV_FALLBACK_VIDA = 2.5
-MRV_SCORE_REAL_OK_MIN = 0.52
-MRV_RUPTURA_HARD_MAX = 0.68
-MRV_VIDA_MIN_REAL = 0.80
-IA_FLOOR_EDGE_TOL = 0.003  # tolerancia de borde para evitar bloqueos por redondeo marginal.
-MRV_ESTADOS = ["ESPERA", "PRE_ZONA", "ZONA_CONFIRMADA", "ZONA_MADURA", "AGOTAMIENTO"]
-MRV_ESTADO_TO_NUM = {"ESPERA": 0.0, "PRE_ZONA": 1.0, "ZONA_CONFIRMADA": 2.0, "ZONA_MADURA": 3.0, "AGOTAMIENTO": 4.0}
-MRV_FEATURE_NAMES = [
-    "mrv_p_inicio", "mrv_p_continuidad", "mrv_p_ruptura_inmediata", "mrv_p_agotamiento_progresivo",
-    "mrv_score_zona", "mrv_vida_util_restante", "mrv_estado_num",
-    "mrv_densidad_corta", "mrv_densidad_media", "mrv_compacidad", "mrv_fragmentacion",
-]
-
-# === PERFIL_COMUN_FLEX: capa adicional de activación flexible por familias ===
-PERFIL_COMUN_FLEX_ENABLE = False  # desactivado: no gobierna promoción a REAL
-PERFIL_COMUN_FLEX_WINDOW = 40
-PERFIL_COMUN_FLEX_MIN_VALID = 18
-PERFIL_COMUN_FLEX_GREEN40_SOFT_MIN = 22
-PERFIL_COMUN_FLEX_GREEN40_SOFT_MAX = 32
-PERFIL_COMUN_FLEX_GREEN8_SOFT_MIN = 4
-PERFIL_COMUN_FLEX_GREEN16_SOFT_MIN = 9
-PERFIL_COMUN_FLEX_MAX_END_RED_STREAK_HARD = 3
-PERFIL_COMUN_FLEX_MAX_RED_CLUSTERS_GE3_HARD = 2
-PERFIL_COMUN_FLEX_MAX_INDEF_40_SOFT = 8
-PERFIL_COMUN_FLEX_SCORE_MIN = 0.58
-PERFIL_COMUN_FLEX_SCORE_STRONG = 0.72
-PERFIL_COMUN_FLEX_IA_MIN_ABS = 0.53
-PERFIL_COMUN_FLEX_IA_EDGE_RELAX = -0.015
-PERFIL_COMUN_FLEX_MRV_SCORE_MIN = 0.47
-PERFIL_COMUN_FLEX_MRV_VIDA_MIN = 0.55
-PERFIL_COMUN_FLEX_MRV_RUPT_MAX = 0.68
-PERFIL_COMUN_FLEX_ESTADOS_OK = ("PRE_ZONA", "ZONA_CONFIRMADA", "ZONA_MADURA", "ESPERA")
-PERFIL_COMUN_FLEX_SHORT_VALID_MAX = 27
-PERFIL_COMUN_FLEX_MODE_C_RESCUE_ENABLE = True
-PERFIL_COMUN_FLEX_MODE_C_RESCUE_MRV_SCORE_MIN = 0.42
-PERFIL_COMUN_FLEX_MODE_C_RESCUE_MRV_VIDA_MIN = 0.50
-PERFIL_COMUN_FLEX_MODE_C_RESCUE_MRV_RUPT_MAX = 0.68
-PERFIL_COMUN_FLEX_MODE_C_RESCUE_FAMILIES_OK = ("CONTINUIDAD", "REBOTE")
-
-
-def _mrv_default_payload(now_ts: float | None = None, reason: str = "default") -> dict:
-    ts = float(time.time() if now_ts is None else now_ts)
-    return {
-        "mrv_p_inicio": 0.20,
-        "mrv_p_continuidad": 0.35,
-        "mrv_p_ruptura_inmediata": 0.40,
-        "mrv_p_agotamiento_progresivo": 0.45,
-        "mrv_score_zona": 0.30,
-        "mrv_vida_util_restante": float(MRV_FALLBACK_VIDA),
-        "mrv_estado": "ESPERA",
-        "mrv_estado_num": float(MRV_ESTADO_TO_NUM.get("ESPERA", 0.0)),
-        "mrv_last_update_ts": ts,
-        "mrv_densidad_corta": 0.50,
-        "mrv_densidad_media": 0.50,
-        "mrv_compacidad": 0.50,
-        "mrv_fragmentacion": 0.50,
-        "mrv_fallback_reason": str(reason),
-    }
-
-
-def _mrv_historico_bot(bot: str) -> dict:
-    """MRV histórico: usa solo historial cerrado del bot (sin look-ahead)."""
-    st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
-    rr = list(st.get("resultados", []) or [])
-    vals = []
-    for x in rr[-max(4, int(MRV_WINDOW_MED)):]:
-        sx = str(x).upper()
-        vals.append(1.0 if sx in ("GANANCIA", "WIN", "G") else 0.0)
-    if not vals:
-        return {
-            "n": 0,
-            "dens_short": 0.5,
-            "dens_med": 0.5,
-            "alternancia": 0.5,
-            "fragmentacion": 0.5,
-            "stability": 0.5,
-        }
-    arr = np.asarray(vals, dtype=float)
-    n = int(arr.size)
-    ws = int(max(2, min(n, int(MRV_WINDOW_SHORT))))
-    wm = int(max(ws, min(n, int(MRV_WINDOW_MED))))
-    short = arr[-ws:]
-    med = arr[-wm:]
-    dens_short = float(np.mean(short))
-    dens_med = float(np.mean(med))
-    if n >= 2:
-        dif = np.abs(np.diff(arr))
-        alternancia = float(np.mean(dif))
-        fragmentacion = float(np.clip(alternancia, 0.0, 1.0))
-        stability = float(1.0 - fragmentacion)
-    else:
-        alternancia = 0.5
-        fragmentacion = 0.5
-        stability = 0.5
-    return {
-        "n": n,
-        "dens_short": dens_short,
-        "dens_med": dens_med,
-        "alternancia": alternancia,
-        "fragmentacion": fragmentacion,
-        "stability": stability,
-    }
-
-
-def _mrv_online_bot(bot: str, row: dict | None = None) -> dict:
-    """MRV online: borde derecho + histórico cerrado + contexto comparativo entre bots."""
-    now = float(time.time())
-    if not bool(MRV_ENABLE):
-        return _mrv_default_payload(now_ts=now, reason="mrv_disabled")
-    try:
-        hist = _mrv_historico_bot(bot)
-        n = int(hist.get("n", 0) or 0)
-        if n < int(MRV_MIN_HISTORY):
-            out = _mrv_default_payload(now_ts=now, reason="low_history")
-            out["mrv_densidad_corta"] = float(hist.get("dens_short", 0.5) or 0.5)
-            out["mrv_densidad_media"] = float(hist.get("dens_med", 0.5) or 0.5)
-            out["mrv_fragmentacion"] = float(hist.get("fragmentacion", 0.5) or 0.5)
-            out["mrv_compacidad"] = float(1.0 - out["mrv_fragmentacion"])
-            return out
-
-        dens_s = float(hist.get("dens_short", 0.5) or 0.5)
-        dens_m = float(hist.get("dens_med", 0.5) or 0.5)
-        frag = float(hist.get("fragmentacion", 0.5) or 0.5)
-        comp = float(np.clip(1.0 - frag, 0.0, 1.0))
-        stability = float(hist.get("stability", 0.5) or 0.5)
-
-        d = row if isinstance(row, dict) else {}
-        racha = float(d.get("racha_actual", 0.0) or 0.0)
-        rebote = float(d.get("es_rebote", 0.0) or 0.0)
-        vol = float(d.get("volatilidad", 0.5) or 0.5)
-        slope = float(d.get("slope_5m", 0.0) or 0.0)
-        p_ia = float(estado_bots.get(bot, {}).get("prob_ia_oper", estado_bots.get(bot, {}).get("prob_ia", 0.5)) or 0.5)
-
-        peers = []
-        for b in BOT_NAMES:
-            stp = estado_bots.get(b, {}) if isinstance(estado_bots, dict) else {}
-            peers.append(float(stp.get("mrv_score_zona", 0.3) or 0.3))
-        peers_mean = float(np.mean(peers)) if peers else 0.3
-        rel_ctx = float(np.clip(0.5 + (peers_mean - 0.3), 0.0, 1.0))
-
-        p_inicio = float(np.clip(0.35 * (1.0 - dens_m) + 0.20 * max(0.0, rebote) + 0.20 * max(0.0, slope) + 0.10 * (1.0 - vol) + 0.15 * comp, 0.0, 1.0))
-        p_cont = float(np.clip(0.40 * dens_s + 0.20 * dens_m + 0.15 * comp + 0.10 * max(0.0, slope) + 0.10 * max(0.0, racha / 6.0) + 0.05 * rel_ctx, 0.0, 1.0))
-        p_rupt = float(np.clip(0.35 * frag + 0.25 * vol + 0.20 * max(0.0, -slope) + 0.20 * max(0.0, -racha / 6.0), 0.0, 1.0))
-        p_agot = float(np.clip(0.30 * max(0.0, dens_m - dens_s) + 0.25 * max(0.0, racha / 8.0) + 0.20 * (1.0 - stability) + 0.25 * p_rupt, 0.0, 1.0))
-        score = float(np.clip(0.45 * p_cont + 0.20 * p_inicio + 0.15 * comp + 0.10 * p_ia + 0.10 * (1.0 - p_rupt), 0.0, 1.0))
-        dur_total = float(np.clip(1.0 + 8.0 * p_cont + 2.0 * p_inicio - 4.0 * p_agot, 1.0, 12.0))
-        vida_restante = float(np.clip(dur_total * max(0.1, (1.0 - max(p_rupt, p_agot))), 0.5, 12.0))
-        # Anti-congelamiento MRV: con historia suficiente, evitar estado artificialmente muerto.
-        if n >= int(max(MRV_MIN_HISTORY, 12)):
-            if p_rupt < 0.75:
-                score = float(max(score, 0.18))
-            vida_restante = float(max(vida_restante, 0.80))
-
-        if score < 0.40:
-            estado = "ESPERA"
-        elif p_inicio >= 0.55 and p_cont < 0.55:
-            estado = "PRE_ZONA"
-        elif p_cont >= 0.68 and score >= 0.68 and p_rupt < 0.45:
-            estado = "ZONA_MADURA"
-        elif p_cont >= 0.55 and score >= 0.55:
-            estado = "ZONA_CONFIRMADA"
-        else:
-            estado = "AGOTAMIENTO" if (p_agot >= 0.55 or p_rupt >= 0.60) else "PRE_ZONA"
-        if n >= int(max(MRV_MIN_HISTORY, 12)) and estado == "ESPERA" and score >= 0.34 and p_rupt < 0.70:
-            estado = "PRE_ZONA"
-
-        return {
-            "mrv_p_inicio": p_inicio,
-            "mrv_p_continuidad": p_cont,
-            "mrv_p_ruptura_inmediata": p_rupt,
-            "mrv_p_agotamiento_progresivo": p_agot,
-            "mrv_score_zona": score,
-            "mrv_vida_util_restante": vida_restante,
-            "mrv_estado": estado,
-            "mrv_estado_num": float(MRV_ESTADO_TO_NUM.get(estado, 0.0)),
-            "mrv_last_update_ts": now,
-            "mrv_densidad_corta": dens_s,
-            "mrv_densidad_media": dens_m,
-            "mrv_compacidad": comp,
-            "mrv_fragmentacion": frag,
-            "mrv_fallback_reason": "",
-        }
-    except Exception:
-        return _mrv_default_payload(now_ts=now, reason="calc_error")
-
-
-def _mrv_update_bot_state(bot: str, row: dict | None = None) -> dict:
-    payload = _mrv_online_bot(bot, row=row)
-    try:
-        estado_bots.get(bot, {}).update(payload)
-    except Exception:
-        pass
-    return payload
 
 
 def _validar_pattern_v1_config() -> None:
@@ -984,7 +619,7 @@ def _pattern_v1_log_bot(bot: str, pattern_score: float, bonus_dual: float, penal
 
 
 def _resolver_estado_real(meta_live: dict | None = None) -> str:
-    """Estado heredado SHADOW/MICRO/NORMAL (solo telemetría, no decisión principal)."""
+    """Estado operativo REAL: SHADOW, MICRO, NORMAL."""
     try:
         if not bool(REAL_PILOT_MODE_ENABLE):
             return "NORMAL"
@@ -1000,12 +635,62 @@ def _resolver_estado_real(meta_live: dict | None = None) -> str:
             return "MICRO"
         return "SHADOW"
     except Exception:
-        return "NORMAL" if (not bool(REAL_PILOT_MODE_ENABLE)) else "SHADOW"
+        return "SHADOW"
 
 
 def _micro_pattern_gate_ok(bot: str, ctx: dict | None = None) -> tuple[bool, str]:
-    """CUARENTENA FUNCIONAL: gate heredado de patrón sin efecto operativo."""
-    return True, "quarantine_off"
+    """Filtro principal en MICRO: patrón dual + estructura + recencia mínima."""
+    try:
+        if not bool(REAL_MICRO_REQUIRE_PATTERN):
+            return True, "off"
+        st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
+        c = ctx if isinstance(ctx, dict) else _ultimo_contexto_operativo_bot(bot)
+        q3, q2 = _pattern_v1_thresholds_proxy()
+        p_score, p_bonus, p_penal, p_total = pattern_score_operativo_v1(c or {}, q3, q2)
+        strict_ok = True
+        why = f"pat={p_total:.1f}"
+        if float(p_total) < float(REAL_MICRO_PATTERN_MIN_TOTAL):
+            strict_ok = False
+            why = f"pat<{REAL_MICRO_PATTERN_MIN_TOTAL:.1f}"
+        if strict_ok and bool(REAL_MICRO_REQUIRE_DUAL) and float(p_bonus) <= 0.0:
+            strict_ok = False
+            why = "dual=no"
+        if strict_ok and bool(REAL_MICRO_REQUIRE_STRUCTURE):
+            breakout_ok = bool(float((c or {}).get("breakout", 0.0) or 0.0) >= float(q3.get("breakout", 1e9)))
+            cruce_ok = bool(float((c or {}).get("cruce_sma", 0.0) or 0.0) >= float(q3.get("cruce_sma", 1e9)))
+            if not (breakout_ok or cruce_ok):
+                strict_ok = False
+                why = "struct=no"
+
+        g = int(st.get("ganancias", 0) or 0)
+        d = int(st.get("perdidas", 0) or 0)
+        n = int(max(0, g + d))
+        wr = float((g + 1.0) / (n + 2.0))
+        if strict_ok and n >= int(REAL_MICRO_MIN_TRADES) and wr < float(REAL_MICRO_MIN_WR):
+            strict_ok = False
+            why = f"wr<{REAL_MICRO_MIN_WR*100:.0f}%"
+        if strict_ok and float(p_penal) > 0.0:
+            strict_ok = False
+            why = "late=veto"
+        if strict_ok:
+            return True, why
+
+        # Fallback suave: permite fluir entradas cuando la calidad viva es alta
+        # aunque el patrón dual/estructura no complete en ese tick.
+        if bool(REAL_MICRO_ALLOW_SOFT_HIGH_PROB):
+            p_oper = float(st.get("prob_ia_oper", st.get("prob_ia", 0.0)) or 0.0)
+            suceso = float(st.get("ia_suceso_idx", 0.0) or 0.0)
+            if (
+                p_oper >= float(REAL_MICRO_SOFT_MIN_PROB)
+                and suceso >= float(REAL_MICRO_SOFT_MIN_SUCESO)
+                and wr >= float(REAL_MICRO_SOFT_MIN_WR)
+                and float(p_penal) <= float(PATTERN_V1_PENAL_TARDIA)
+            ):
+                return True, f"soft:p={p_oper*100:.1f}%/s={suceso:.1f}"
+
+        return False, why
+    except Exception:
+        return False, "pattern_err"
 
 
 def _shadow_micro_quota_status(now_ts: float | None = None) -> tuple[int, int, float]:
@@ -1024,13 +709,80 @@ def _shadow_micro_quota_status(now_ts: float | None = None) -> tuple[int, int, f
 
 
 def _shadow_micro_gate_ok(candidatos: list, dyn_gate: dict | None = None) -> tuple[bool, str]:
-    """CUARENTENA FUNCIONAL: bypass SHADOW/MICRO heredado desactivado."""
-    return False, "quarantine_off"
+    """Bypass seguro para permitir micro-REAL temporal aun en SHADOW."""
+    global _REAL_SHADOW_MICRO_LAST_LOG_TS
+    try:
+        if not bool(REAL_SHADOW_MICRO_ENABLE):
+            return False, "off"
+        if not candidatos:
+            return False, "sin_candidatos"
+        if not bool(_todos_bots_con_n_minimo_real()):
+            return False, "n_min_real"
+
+        dgate = dyn_gate if isinstance(dyn_gate, dict) else {}
+        confirm_need = int(dgate.get("confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
+        confirm_ok = int(dgate.get("confirm_streak", 0) or 0) >= confirm_need
+        trigger_ok = bool(dgate.get("trigger_ok", False))
+        allow_gate = bool(dgate.get("allow_real", False))
+
+        best = candidatos[0]
+        best_bot = str(best[1])
+        p_best = float(best[2] or 0.0)
+        if best_bot != str(dgate.get("best_bot", best_bot)):
+            return False, "best_mismatch"
+        if p_best < float(REAL_SHADOW_MICRO_MIN_PROB):
+            return False, f"p<{REAL_SHADOW_MICRO_MIN_PROB*100:.0f}%"
+        if not (confirm_ok and trigger_ok and allow_gate):
+            return False, "gate_debil"
+
+        hg = _estado_guardrail_ia_fuerte(force=False)
+        if bool(hg.get("hard_block", False)):
+            return False, "hard_guard"
+
+        left, used, window_s = _shadow_micro_quota_status()
+        if left <= 0:
+            return False, f"quota:{used}/{max(1, int(REAL_SHADOW_MICRO_MAX_ENTRIES))}/{int(window_s//60)}m"
+
+        now = time.time()
+        if (now - float(_REAL_SHADOW_MICRO_LAST_LOG_TS or 0.0)) >= float(REAL_SHADOW_MICRO_LOG_COOLDOWN_S):
+            _REAL_SHADOW_MICRO_LAST_LOG_TS = float(now)
+            agregar_evento(
+                f"🟢 REAL=SHADOW→MICRO temporal: {best_bot} p={p_best*100:.1f}% "
+                f"confirm={int(dgate.get('confirm_streak', 0))}/{confirm_need} trigger_ok=sí "
+                f"quota={used}/{max(1, int(REAL_SHADOW_MICRO_MAX_ENTRIES))}"
+            )
+        return True, "ok"
+    except Exception:
+        return False, "shadow_micro_err"
 
 
 def _micro_strong_gate_fallback_ok(candidatos: list, dyn_gate: dict | None = None) -> tuple[bool, str]:
-    """CUARENTENA FUNCIONAL: fallback fuerte heredado desactivado."""
-    return False, "quarantine_off"
+    """Fallback moderado para MICRO cuando el patrón no completa pero la compuerta está sólida."""
+    try:
+        if not bool(REAL_MICRO_STRONG_GATE_FALLBACK_ENABLE):
+            return False, "off"
+        if not candidatos:
+            return False, "sin_candidatos"
+        dgate = dyn_gate if isinstance(dyn_gate, dict) else {}
+        top = candidatos[0]
+        best_bot = str(top[1])
+        p_best = float(top[2] or 0.0)
+        confirm_need = int(dgate.get("confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
+        confirm_ok = int(dgate.get("confirm_streak", 0) or 0) >= confirm_need
+        trigger_ok = bool(dgate.get("trigger_ok", False))
+        allow_gate = bool(dgate.get("allow_real", False))
+        if best_bot != str(dgate.get("best_bot", best_bot)):
+            return False, "best_mismatch"
+        if p_best < float(REAL_MICRO_STRONG_GATE_MIN_PROB):
+            return False, f"p<{REAL_MICRO_STRONG_GATE_MIN_PROB*100:.0f}%"
+        if not (confirm_ok and trigger_ok and allow_gate):
+            return False, "gate_debil"
+        hg = _estado_guardrail_ia_fuerte(force=False)
+        if bool(hg.get("hard_block", False)):
+            return False, "hard_guard"
+        return True, f"p={p_best*100:.1f}%"
+    except Exception:
+        return False, "micro_fallback_err"
 
 
 _validar_pattern_v1_config()
@@ -1358,62 +1110,6 @@ def write_token_atomic(path, content):
             pass
         return False
 
-BG_CLOSE_GUARD_DIR = "bg_close_guard"
-_bg_close_block_log_ts = {}
-_bg_close_release_log_ts = {}
-_bg_close_prev_pending = {}
-
-def _read_bg_close_pending(bot: str):
-    path = os.path.join(BG_CLOSE_GUARD_DIR, f"{bot}.json")
-    try:
-        if not os.path.exists(path):
-            return False, {}
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            raw = f.read()
-        data = json.loads(raw) if raw.strip() else {}
-        pending = bool(data.get("bg_close_pending", False))
-        return pending, data
-    except Exception as e:
-        low = ""
-        try:
-            low = (raw or "").lower()
-        except Exception:
-            low = ""
-        pending_hint = '"bg_close_pending"' in low and "true" in low
-        if _print_once(f"bg-guard-read-{bot}", ttl=20):
-            try:
-                agregar_evento(f"⚠️ BG guard inválido {bot}: {type(e).__name__}")
-            except Exception:
-                pass
-        return bool(pending_hint), {}
-
-def _bot_blocked_by_bg_close(bot: str) -> bool:
-    pending, data = _read_bg_close_pending(bot)
-    if not pending:
-        if bool(_bg_close_prev_pending.get(bot, False)):
-            now = time.time()
-            last_rel = float(_bg_close_release_log_ts.get(bot, 0.0) or 0.0)
-            if now - last_rel >= 8.0:
-                _bg_close_release_log_ts[bot] = now
-                try:
-                    agregar_evento(f"LXV_BG_RELEASED: {bot} bg_close resuelto, vuelve a ser elegible")
-                except Exception:
-                    pass
-        _bg_close_prev_pending[bot] = False
-        return False
-    _bg_close_prev_pending[bot] = True
-    now = time.time()
-    last = float(_bg_close_block_log_ts.get(bot, 0.0) or 0.0)
-    if now - last >= 8.0:
-        _bg_close_block_log_ts[bot] = now
-        contract_id = str((data or {}).get("contract_id", "") or "")
-        try:
-            agregar_evento(f"LXV_BG_BLOCK: {bot} waiting_bg_close contract_id={contract_id}")
-            agregar_evento(f"LXV_EXEC_BLOCKED: bot={bot} | motivo=bg_close_pending")
-        except Exception:
-            pass
-    return True
-
 
 # Orden operativo recomendado (calidad real primero):
 # 1) fulll47: mejor hit-rate y menor inflación del set comparado.
@@ -1428,98 +1124,6 @@ DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 saldo_real = "--"
 SALDO_INICIAL = None
 META = None
-META_OBJETIVO_PCT = 0.15  # política vigente: meta operativa +15%
-SALDO_STATUS = "UNKNOWN"  # KNOWN | STALE | UNKNOWN
-SALDO_STATUS_REASON = "BOOTSTRAP_PENDING"
-SALDO_STATUS_DETAIL = ""
-SALDO_STATUS_TS = 0.0
-SALDO_LAST_VALID_VALUE = None
-SALDO_LAST_VALID_TS = 0.0
-SALDO_LAST_EVENT_KEY = ""
-SALDO_LAST_EVENT_TS = 0.0
-SALDO_LIVE_FILE = "saldo_real_live.json"
-SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SALDO_LIVE_SHARED_PATH = os.path.abspath(
-    os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))
-)
-SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(
-    os.getenv(
-        "SALDO_LIVE_HISTORY_SHARED_PATH",
-        os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE),
-    )
-)
-SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
-def resolver_ruta_saldo_series() -> str:
-    custom = os.getenv("SALDO_SERIES_CSV_PATH", "").strip()
-    if custom:
-        return os.path.abspath(os.path.expanduser(custom))
-    return os.path.abspath(os.path.join(SCRIPT_DIR, SALDO_SERIES_CSV_FILE))
-
-SALDO_SERIES_CSV_PATH = resolver_ruta_saldo_series()
-PROTECTION_HEALTH_STATE_FILE = "protection_health_state.json"
-PROTECTION_HEALTH_STATE_PATH = os.path.abspath(
-    os.getenv(
-        "PROTECTION_HEALTH_STATE_PATH",
-        os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), PROTECTION_HEALTH_STATE_FILE),
-    )
-)
-PROTECTION_RESET_REQUEST_FILE = "protection_reset_request.json"
-PROTECTION_RESET_REQUEST_PATH = os.path.abspath(
-    os.getenv(
-        "PROTECTION_RESET_REQUEST_PATH",
-        os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), PROTECTION_RESET_REQUEST_FILE),
-    )
-)
-PROTECTION_RESET_ACK_FILE = "protection_reset_ack.json"
-PROTECTION_RESET_ACK_PATH = os.path.abspath(
-    os.getenv(
-        "PROTECTION_RESET_ACK_PATH",
-        os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), PROTECTION_RESET_ACK_FILE),
-    )
-)
-PROTECTION_EPOCH_STATE_FILE = "protection_epoch_state.json"
-PROTECTION_EPOCH_STATE_PATH = os.path.abspath(
-    os.getenv(
-        "PROTECTION_EPOCH_STATE_PATH",
-        os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), PROTECTION_EPOCH_STATE_FILE),
-    )
-)
-EMA_ALERTA_SPAN = 8
-EMA_CALMA_SPAN = 26
-DD_PROTECTION_THRESHOLD_PCT = -2.5
-EQUITY_BREAK_LOOKBACK = 40
-EQUITY_BREAK_STD_FACTOR = 1.2
-EQUITY_BREAK_DRAWDOWN = -0.06
-EQUITY_BREAK_FAST_DROP = -2.0
-PROTECTION_PAUSE_SECONDS = 30 * 60
-PROTECTION_LOG_COOLDOWN_S = 30.0
-PROTECTION_REARM_COOLDOWN_S = 90.0
-PROTECTION_REARM_DD_RELEASE_MARGIN_PCT = 0.50
-PROTECTION_SHOCK_MIN_S = 20 * 60
-PROTECTION_TREND_MIN_S = 30 * 60
-PROTECTION_EXTENSION_S = 10 * 60
-PROTECTION_RESAMPLE_RULE = "1min"
-PROTECTION_MIN_POINTS = 20
-PROTECTION_NO_NEW_LOWS_WINDOW_S = 10 * 60
-PROTECTION_NO_NEW_LOWS_STALE_S = 5 * 60
-PROTECTION_TEST_RESET_HOLD_S = 120.0
-PROTECTION_POST_RESET_MIN_SAMPLES = 20
-PROTECTION_POST_RESET_MIN_SECONDS = 120.0
-SALDO_CSV_LOG_LAST_TS = 0.0
-print(f"[SALDO LIVE] destino: {SALDO_LIVE_SHARED_PATH}")
-print(f"[SALDO HIST] destino: {SALDO_LIVE_HISTORY_SHARED_PATH}")
-print(f"[SALDO CSV] destino: {SALDO_SERIES_CSV_PATH}")
-print(f"[PROTECTION] estado compartido: {PROTECTION_HEALTH_STATE_PATH}")
-def _safe_saldo_display_tz():
-    if ZoneInfo is None:
-        return timezone.utc
-    try:
-        return ZoneInfo("America/Lima")
-    except Exception:
-        return timezone.utc
-
-SALDO_DISPLAY_TZ = _safe_saldo_display_tz()
 meta_mostrada = False
 eventos_recentes = deque(maxlen=8)
 reinicio_forzado = asyncio.Event()
@@ -1531,10 +1135,6 @@ reinicio_manual = False
 LIMPIEZA_PANEL_HASTA = 0
 ULTIMA_ACT_SALDO = 0
 REFRESCO_SALDO = 12
-SALDO_HISTORY_HEARTBEAT_S = 15
-HUD_RENDER_MIN_INTERVAL_S = 1.20
-HUD_LAST_RENDER_TS = 0.0
-HUD_LAST_RENDER_SIG = ""
 MAX_CICLOS = len(MARTI_ESCALADO)
 huellas_usadas = {bot: set() for bot in BOT_NAMES}
 SNAPSHOT_FILAS = {bot: 0 for bot in BOT_NAMES}
@@ -1545,7 +1145,6 @@ last_update_time = {bot: time.time() for bot in BOT_NAMES}
 LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mismo cierre REAL varias veces
 CTT_CLOSE_EVENTS = deque(maxlen=6000)
 CTT_CLOSE_SEEN = set()
-HUD_CLOSE_LOG_TS = {}
 CTT_STATE = {
     "status": "NEUTRAL",
     "regime": "NEUTRAL",
@@ -1572,64 +1171,21 @@ CTT_STATE = {
 REAL_OWNER_LOCK = None  # owner REAL en memoria (evita carreras de lectura de archivo)
 REAL_LOCK_MISMATCH_SINCE = 0.0
 REAL_LOCK_RECONCILE_S = 6.0
-protection_pause_active = False
-protection_pause_reason = ""
-protection_pause_started_ts = 0.0
-protection_pause_until_ts = 0.0
-protection_pause_last_trigger_ts = 0.0
-protection_last_trigger_ts = 0.0
-protection_last_peak_equity = 0.0
-protection_last_drawdown_pct = 0.0
-protection_ema_alerta = 0.0
-protection_ema_calma = 0.0
-protection_mode = ""
-protection_release_ok_streak = 0
-protection_pause_min_seconds = float(PROTECTION_TREND_MIN_S)
-protection_pause_extended_count = 0
-protection_release_score = 0
-protection_no_new_lows_ok = False
-protection_ema_turn_ok = False
-protection_dd_recovery_ok = False
-protection_calm_band_ok = False
-protection_vol_base = 0.0
-protection_drop_3m = 0.0
-protection_pct_drop_3m = 0.0
-protection_peak_ref = 0.0
-protection_worst_saldo = 0.0
-protection_worst_dd = 0.0
-protection_last_eval_ts = 0.0
-protection_last_new_low_ts = 0.0
-protection_resume_status = "IDLE"
-protection_rearm_blocked = False
-protection_rearm_blocked_until = 0.0
-protection_last_release_ts = 0.0
-protection_test_reset_hold_until_ts = 0.0
-protection_last_reset_request_id = ""
-protection_last_reset_request_ts = 0.0
-protection_last_force_resume_request_id = ""
-protection_last_force_resume_request_ts = 0.0
-protection_eval_from_ts = 0.0
-protection_reset_baseline_equity = 0.0
-protection_reset_baseline_peak = 0.0
-protection_post_reset_samples = 0
-protection_post_reset_span_s = 0.0
-protection_epoch_id = 0
-protection_epoch_last_seen_ts = 0.0
-protection_incident_id = ""
-protection_incident_reason = ""
-protection_incident_anchor_peak = 0.0
-protection_incident_anchor_ts = 0.0
-protection_incident_lock_active = False
-protection_incident_last_drawdown = 0.0
-PROTECTION_LAST_JSON_WARN_TS = 0.0
-PROTECTION_LAST_ACTIVE_LOG_TS = 0.0
-PROTECTION_DIAG_STATUS = "ok"
-PROTECTION_DIAG_REASON = ""
-PROTECTION_SOURCE_COLUMN = ""
-PROTECTION_SERIES_LEN = 0
-PROTECTION_DIAG_LOG_LAST_TS = {}
-PROTECTION_DIAG_LOG_COOLDOWN_S = 30.0
-PROTECTION_CSV_WRITE_WARN_LAST_TS = 0.0
+
+EMBUDO_DECISION_STATE = {
+    "decision_final": EMBUDO_FINAL_WAIT_SOFT,
+    "decision_reason": "init",
+    "gate_quality": "weak",
+    "risk_mode": "WAIT_SOFT",
+    "hard_block_reason": "",
+    "soft_wait_reason": "init",
+    "top1_bot": None,
+    "top2_bot": None,
+    "gap_value": 0.0,
+    "top1_prob": 0.0,
+    "top2_prob": 0.0,
+    "degrade_from": "none",
+}
 
 try:
     last_sig_por_bot
@@ -1677,20 +1233,6 @@ estado_bots = {
         "ia_pattern_col_bonus": 0.0,
         "ia_pattern_col_penal": 0.0,
         "ia_pattern_col_delta": 0.0,
-        # MRV (Motor de Régimen Verde)
-        "mrv_p_inicio": 0.20,
-        "mrv_p_continuidad": 0.35,
-        "mrv_p_ruptura_inmediata": 0.40,
-        "mrv_p_agotamiento_progresivo": 0.45,
-        "mrv_score_zona": 0.30,
-        "mrv_vida_util_restante": float(MRV_FALLBACK_VIDA),
-        "mrv_estado": "ESPERA",
-        "mrv_estado_num": 0.0,
-        "mrv_last_update_ts": 0.0,
-        "mrv_densidad_corta": 0.50,
-        "mrv_densidad_media": 0.50,
-        "mrv_compacidad": 0.50,
-        "mrv_fragmentacion": 0.50,
     }
     for bot in BOT_NAMES
 }
@@ -1917,9 +1459,6 @@ INCREMENTAL_META_FLAGS = ["row_has_proxy_features", "row_train_eligible"]
 for _c in INCREMENTAL_CLOSE_COLS:
     if _c not in INCREMENTAL_FEATURES_V2:
         INCREMENTAL_FEATURES_V2.append(_c)
-for _mrv_f in MRV_FEATURE_NAMES:
-    if _mrv_f not in INCREMENTAL_FEATURES_V2:
-        INCREMENTAL_FEATURES_V2.append(_mrv_f)
 # === LOCK ESTRICTO (solo para escrituras sensibles como incremental.csv) ===
 @contextmanager
 def file_lock_required(path: str, timeout: float = 6.0, stale_after: float = 30.0):
@@ -2631,15 +2170,6 @@ anexar_incremental_desde_bot = _anexar_incremental_desde_bot_CANON
 # === BLOQUE 7 — ORDEN DE REAL Y CONTROL DE TOKEN ===
 # === ORDEN DE REAL (handshake maestro→bot) ===
 ORDEN_DIR = "orden_real"
-SYNC_ROUND_DIR = "sync_round"
-LXV_CONSUMED_ACK_DIR = "lxv_consumed_ack"
-BARRIER_STATE_FILE = os.path.join(SYNC_ROUND_DIR, "barrier_state.json")
-BARRIER_ENABLED = True
-BARRIER_ACK_TIMEOUT_S = 45
-BARRIER_STRICT_MODE = True
-BARRIER_ALLOW_TEMP_EXCLUDE = False
-LXV_CORE_ROUND_TIMEOUT_S = 120
-
 
 def _ensure_dir(p):
     try:
@@ -2647,370 +2177,37 @@ def _ensure_dir(p):
     except Exception as e:
         print(f"⚠️ Falló creación de dir {p}: {e}")
 
-
 def _atomic_write(path: str, text: str):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
+        f.flush(); os.fsync(f.fileno())
     os.replace(tmp, path)
-
 
 def path_orden(bot: str) -> str:
     _ensure_dir(ORDEN_DIR)
     return os.path.join(ORDEN_DIR, f"{bot}.json")
 
-
-def _lxv_consumed_ack_path(bot: str) -> str:
-    _ensure_dir(LXV_CONSUMED_ACK_DIR)
-    return os.path.join(LXV_CONSUMED_ACK_DIR, f"{bot}.json")
-
-def leer_lxv_consumed_ack(bot: str) -> dict | None:
-    p = _lxv_consumed_ack_path(bot)
-    try:
-        if not os.path.exists(p):
-            return None
-        with open(p, "r", encoding="utf-8") as f:
-            d = json.load(f) or {}
-        return d if isinstance(d, dict) else None
-    except Exception:
-        return None
-
-def consumir_lxv_consumed_ack(bot: str, expected_round: int | None = None, expected_snapshot: str | None = None) -> bool:
-    ack = leer_lxv_consumed_ack(bot)
-    if not isinstance(ack, dict):
-        return False
-    estado = str(ack.get("estado", "") or "").strip().lower()
-    round_ack = int(ack.get("round_lxv", 0) or 0)
-    snap_ack = str(ack.get("snapshot_id", "") or "").strip()
-    if estado != "consumed_real" or round_ack <= 0 or not snap_ack:
-        return False
-    if expected_round is not None and int(round_ack) != int(expected_round):
-        return False
-    if expected_snapshot is not None and str(snap_ack) != str(expected_snapshot):
-        return False
-    if str(snap_ack) == str(LAST_LXV_SYNC_SNAPSHOT_CONSUMED or "") and int(round_ack) <= int(LAST_LXV_SYNC_ROUND_CONSUMED or 0):
-        return False
-    globals()["LAST_LXV_SYNC_SNAPSHOT_ID"] = str(snap_ack)
-    globals()["LAST_LXV_SYNC_SNAPSHOT_CONSUMED"] = str(snap_ack)
-    globals()["LAST_LXV_SYNC_ROUND_CONSUMED"] = int(round_ack)
-    globals()["LAST_LXV_SYNC_SELECTED_BOT"] = str(bot or "")
-    globals()["LAST_LXV_SYNC_TS"] = float(time.time())
-    try:
-        os.remove(_lxv_consumed_ack_path(bot))
-    except Exception:
-        pass
-    agregar_evento(f"LXV_CORE_CONSUMED_ACK bot={str(bot)} round={int(round_ack)} snapshot={snap_ack}")
-    return True
-
-def _sync_round_ack_path(bot: str, round_id: int) -> str:
-    _ensure_dir(SYNC_ROUND_DIR)
-    rid = max(1, int(round_id or 1))
-    d = os.path.join(SYNC_ROUND_DIR, f"round_{rid}")
-    _ensure_dir(d)
-    return os.path.join(d, f"{bot}.json")
-
-
-def leer_barrier_state() -> dict:
-    try:
-        if not os.path.exists(BARRIER_STATE_FILE):
-            return {
-                "barrier_enabled": bool(BARRIER_ENABLED),
-                "current_round": 1,
-                "release_round": 1,
-                "all_closed": False,
-                "pending_bots": list(BOT_NAMES),
-                "last_evaluated_round": 0,
-                "selected_bot": "",
-                "lxv_ready": False,
-                "ts": float(time.time()),
-            }
-        with open(BARRIER_STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f) or {}
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def escribir_barrier_state_atomic(state: dict):
-    _ensure_dir(SYNC_ROUND_DIR)
-    _atomic_write(BARRIER_STATE_FILE, json.dumps(dict(state or {}), ensure_ascii=False))
-
-def reset_barrier_state_on_start():
-    now = float(time.time())
-    try:
-        if os.path.isdir(SYNC_ROUND_DIR):
-            for name in os.listdir(SYNC_ROUND_DIR):
-                if not str(name).startswith("round_"):
-                    continue
-                dpath = os.path.join(SYNC_ROUND_DIR, str(name))
-                if not os.path.isdir(dpath):
-                    continue
-                for fn in os.listdir(dpath):
-                    fp = os.path.join(dpath, fn)
-                    if os.path.isfile(fp):
-                        try:
-                            os.remove(fp)
-                        except Exception:
-                            pass
-                try:
-                    os.rmdir(dpath)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    out = {
-        "barrier_enabled": True,
-        "current_round": 1,
-        "release_round": 1,
-        "all_closed": False,
-        "pending_bots": list(BOT_NAMES),
-        "last_evaluated_round": 0,
-        "selected_bot": "",
-        "lxv_ready": False,
-        "round_state": "ROUND_WAIT_ACK",
-        "round_open_ts": now,
-        "ts": now,
-    }
-    escribir_barrier_state_atomic(out)
-    agregar_evento("BARRIER_RESET_ON_START current_round=1 release_round=1")
-
-
-def leer_ack_ronda_bot(bot: str, round_id: int) -> dict | None:
-    p = _sync_round_ack_path(bot, round_id)
-    try:
-        if not os.path.exists(p):
-            return None
-        with open(p, "r", encoding="utf-8") as f:
-            d = json.load(f) or {}
-        return d if isinstance(d, dict) else None
-    except Exception:
-        return None
-
-
-
-
-def _ack_resultado_es_valido(resultado_norm: str) -> bool:
-    txt = str(resultado_norm or '').strip().upper()
-    return txt in {"GANANCIA", "PERDIDA", "PÉRDIDA", "WIN", "LOSS", "G", "R", "X"}
-
-
-def validar_ack_ronda_bot(bot: str, round_id: int, ack: dict | None) -> tuple[bool, str]:
-    if not isinstance(ack, dict) or not ack:
-        return False, "missing"
-    bot_exp = str(bot or "").strip()
-    if bot_exp not in set(BOT_NAMES):
-        return False, "bot_no_esperado"
-    ack_bot = str(ack.get("bot", "") or "").strip()
-    if ack_bot and ack_bot != bot_exp:
-        return False, "bot_mismatch"
-    ack_round = int(ack.get("round_id", 0) or 0)
-    round_ok = int(round_id)
-    if ack_round != round_ok:
-        return False, ("round_vieja" if ack_round < round_ok else "round_futura")
-    ack_status = str(ack.get("status", "") or "").strip().upper()
-    if ack_status != "CERRADO":
-        return False, "status_invalido"
-    if bool(ack.get("pending_open", False)):
-        return False, "pending_open"
-    if not bool(ack.get("resultado_definido", False)):
-        return False, "resultado_indefinido"
-    res_norm = str(ack.get("resultado_norm", ack.get("resultado", "")) or "").strip().upper()
-    if not _ack_resultado_es_valido(res_norm):
-        return False, "resultado_invalido"
-    return True, "ok"
-
-
-def barrier_round_status(round_id: int) -> tuple[list[str], int]:
-    pending = []
-    valid_count = 0
-    now = float(time.time())
-    seen = set()
-    expected = set(str(b) for b in BOT_NAMES)
-    for b in BOT_NAMES:
-        b = str(b)
-        ack = leer_ack_ronda_bot(b, round_id)
-        ok, reason = validar_ack_ronda_bot(b, round_id, ack)
-        if not ok:
-            pending.append(b)
-            if reason != "missing" and _print_once(f"ack-invalid-{round_id}-{b}-{reason}", ttl=4):
-                agregar_evento(f"ROUND_ACK_INVALID round={int(round_id)} bot={b} reason={reason}")
-            continue
-        ts_close = float((ack or {}).get("ts_close", 0.0) or 0.0)
-        if ts_close > 0 and (now - ts_close) > float(BARRIER_ACK_TIMEOUT_S * 4):
-            pending.append(b)
-            if _print_once(f"ack-invalid-timeout-{round_id}-{b}", ttl=4):
-                agregar_evento(f"ROUND_ACK_INVALID round={int(round_id)} bot={b} reason=stale_close")
-            continue
-        if b in seen:
-            pending.append(b)
-            if _print_once(f"ack-dup-{round_id}-{b}", ttl=4):
-                agregar_evento(f"ROUND_ACK_DUPLICATE round={int(round_id)} bot={b}")
-            continue
-        seen.add(b)
-        valid_count += 1
-    extras = sorted(set(seen) - expected)
-    for eb in extras:
-        if _print_once(f"ack-extra-{round_id}-{eb}", ttl=6):
-            agregar_evento(f"ROUND_ACK_INVALID round={int(round_id)} bot={eb} reason=bot_no_esperado")
-    total_bots = int(len(BOT_NAMES))
-    if _print_once(f"ack-progress-{round_id}-{valid_count}-{'-'.join(sorted(pending))}", ttl=2):
-        faltan = ','.join(sorted(pending)) if pending else '--'
-        agregar_evento(f"ROUND_ACK_PROGRESS round={int(round_id)} ack={int(valid_count)}/{int(total_bots)} faltan={faltan}")
-    if valid_count == int(total_bots):
-        if _print_once(f"ack-complete-{round_id}", ttl=5):
-            agregar_evento(f"ROUND_ACK_COMPLETE round={int(round_id)} ack=6/6")
-    return pending, valid_count
-def barrier_round_pendiente(round_id: int) -> list[str]:
-    pending, _ = barrier_round_status(int(round_id))
-    return list(pending or [])
-
-
-def barrier_round_completa(round_id: int) -> tuple[bool, list[str]]:
-    pending, valid_count = barrier_round_status(int(round_id))
-    return (int(valid_count) == int(len(BOT_NAMES))), list(pending or [])
-
-
-def escribir_barrier_release(current_round: int, selected_bot: str = "", lxv_ready: bool = False):
-    st = leer_barrier_state() or {}
-    out = {
-        "barrier_enabled": bool(BARRIER_ENABLED),
-        "current_round": int(current_round),
-        "release_round": int(current_round) + 1,
-        "all_closed": True,
-        "pending_bots": [],
-        "last_evaluated_round": int(current_round),
-        "selected_bot": str(selected_bot or ""),
-        "lxv_ready": bool(lxv_ready),
-        "ts": float(time.time()),
-    }
-    out.update({k: v for k, v in st.items() if k not in out and k not in {"pending_bots"}})
-    escribir_barrier_state_atomic(out)
-
-    # Limpieza de rondas antiguas para que no crezca infinito sync_round/
-    try:
-        keep_from = max(1, int(current_round) - 2)
-        for name in os.listdir(SYNC_ROUND_DIR):
-            if not str(name).startswith("round_"):
-                continue
-            dpath = os.path.join(SYNC_ROUND_DIR, str(name))
-            if not os.path.isdir(dpath):
-                continue
-            try:
-                rid = int(str(name).split("_", 1)[1])
-            except Exception:
-                continue
-            if int(rid) >= int(keep_from):
-                continue
-            for fn in os.listdir(dpath):
-                fp = os.path.join(dpath, fn)
-                if os.path.isfile(fp):
-                    try:
-                        os.remove(fp)
-                    except Exception:
-                        pass
-            try:
-                os.rmdir(dpath)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
-def resolver_barrier_round_canonico(st_bar: dict, logica_unica_real: dict, bot_names: list[str]) -> tuple[int, bool, list[str], str]:
-    barrier_round = int((st_bar or {}).get("current_round", 0) or 0)
-
-    if barrier_round > 0:
-        ok_bar, pend_bar = barrier_round_completa(barrier_round)
-        return int(barrier_round), bool(ok_bar), list(pend_bar or []), ("ok" if ok_bar else "acks_incompletos")
-
-    return 1, False, list(bot_names or []), "acks_incompletos"
-
-
-def _lxv_core_resolver_ronda(logica_unica_real: dict, bot_names: list[str]) -> tuple[int, bool, list[str], str, str]:
-    """
-    Resuelve una ronda LXV_CORE con barrera estricta por ACK 6/6:
-    estados: ROUND_OPEN -> ROUND_WAIT_ACK -> ROUND_EVAL_LXV -> ROUND_RELEASE_NEXT.
-    """
-    st_bar = leer_barrier_state() or {}
-    now = float(time.time())
-    round_id = int(st_bar.get("current_round", 1) or 1)
-    release_round = int(st_bar.get("release_round", max(1, round_id)) or max(1, round_id))
-    round_open_ts = float(st_bar.get("round_open_ts", 0.0) or 0.0)
-    if round_open_ts <= 0.0:
-        round_open_ts = now
-        agregar_evento(f"LXV_CORE_ROUND_OPEN round={int(round_id)}")
-    pending = barrier_round_pendiente(int(round_id))
-    for b in [str(x) for x in bot_names if str(x) not in set(pending)]:
-        agregar_evento(f"LXV_CORE_ACK_OK bot={b} round={int(round_id)}")
-    if pending:
-        agregar_evento(f"LXV_CORE_ACK_MISSING round={int(round_id)} bots={pending}")
-    elapsed = max(0.0, now - round_open_ts)
-    timeout_hit = bool(pending) and elapsed >= float(LXV_CORE_ROUND_TIMEOUT_S)
-    ack_complete = (len(pending) == 0)
-    if timeout_hit:
-        agregar_evento(f"ROUND_TIMEOUT_PENDING round={int(round_id)} faltan={pending}")
-
-    gate_open = bool(ack_complete or timeout_hit)
-    state = "ROUND_EVAL_LXV" if gate_open else "ROUND_WAIT_ACK"
-    if state == "ROUND_EVAL_LXV":
-        next_round = int(round_id) + 1
-        timeout_release = bool(timeout_hit and (not ack_complete))
-        out = {
-            "barrier_enabled": bool(BARRIER_ENABLED),
-            "current_round": int(next_round),
-            "release_round": int(max(release_round, next_round)),
-            "all_closed": bool(ack_complete),
-            "pending_bots": list(pending or []),
-            "last_evaluated_round": int(round_id),
-            "selected_bot": "",
-            "lxv_ready": False,
-            "round_state": "ROUND_RELEASE_NEXT",
-            "round_open_ts": now,
-            "ts": now,
-        }
-        escribir_barrier_state_atomic(out)
-        if timeout_release:
-            agregar_evento(
-                f"ROUND_TIMEOUT_RELEASE round={int(round_id)} release_round={int(out['release_round'])} faltan={list(pending or [])}"
-            )
-        else:
-            agregar_evento(f"ROUND_RELEASE_NEXT round={int(round_id)} release_round={int(out['release_round'])}")
-    else:
-        st_bar.update({
-            "barrier_enabled": bool(BARRIER_ENABLED),
-            "current_round": int(round_id),
-            "release_round": int(round_id),
-            "pending_bots": list(pending or []),
-            "all_closed": False,
-            "round_state": "ROUND_WAIT_ACK",
-            "round_open_ts": float(round_open_ts),
-            "ts": now,
-        })
-        escribir_barrier_state_atomic(st_bar)
-    reason = "ok" if ack_complete else ("timeout_release" if timeout_hit else "wait_ack")
-    return int(round_id), bool(gate_open), list(pending or []), reason, state
-
 # === PATCH: REAL INMEDIATO EN HUD AL EMITIR ORDEN (sin esperar compra) ===
 # Objetivo:
 # - Al emitir una ORDEN manual (bot+ciclo), reservar REAL y mostrarlo YA en HUD.
 # - Evitar recursión/doble llamada.
-# - Si activar_demo_neutralizado se llama desde otro flujo (no orden_real),
+# - Si activar_real_inmediato se llama desde otro flujo (no orden_real),
 #   asegurar que el bot tenga también su orden_real.json escrita (sin recursión).
 
 _last_real_push_ts = {bot: 0.0 for bot in BOT_NAMES}
-LAST_LXV_SYNC_SNAPSHOT_ID = ""  # compat legacy: alias del snapshot consumido
-LAST_LXV_SYNC_SNAPSHOT_ARMED = ""
-LAST_LXV_SYNC_ROUND_ARMED = 0
-LAST_LXV_SYNC_SNAPSHOT_CONSUMED = ""
-LAST_LXV_SYNC_ROUND_CONSUMED = 0
-LAST_LXV_SYNC_SELECTED_BOT = ""
-LAST_LXV_SYNC_TS = 0.0
-LAST_REAL_ORDER_FAIL_REASON = ""
 
 def limpiar_orden_real(bot: str):
-    return None
+    """
+    Evita re-entradas fantasma:
+    si se liberó REAL, la orden ya no debe quedar viva.
+    """
+    try:
+        p = path_orden(bot)
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
 
 def _set_ui_token_holder(holder: str | None):
     """
@@ -3053,8 +2250,8 @@ def _set_ui_token_holder(holder: str | None):
                 estado_bots[b]["remate_start"] = None
                 estado_bots[b]["remate_reason"] = ""
 
-                # IMPORTANTE: no resetear ciclo martingala aquí.
-                # Este flujo es visual/sync de holder, no cierre legítimo de secuencia.
+                # Ciclo vuelve a default (solo al perder REAL)
+                estado_bots[b]["ciclo_actual"] = 1
 
     except Exception:
         pass
@@ -3077,46 +2274,474 @@ def _enforce_single_real_standby(owner: str | None):
     except Exception:
         pass
 
-def _escribir_orden_demo_neutralizado(bot: str, ciclo: int, extra_payload: dict | None = None):
-    return False
+def _escribir_orden_real_raw(bot: str, ciclo: int):
+    """
+    Escritura RAW de orden_real (sin activar_real_inmediato, sin recursión).
+    """
+    ciclo = max(1, min(int(ciclo), MAX_CICLOS))
+    payload = {"bot": bot, "ciclo": ciclo, "ts": time.time()}
+    try:
+        _atomic_write(path_orden(bot), json.dumps(payload, ensure_ascii=False))
+        agregar_evento(f"📝 Orden REAL escrita para {bot}: ciclo #{ciclo}")
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ Falló escritura de orden para {bot}: {e}")
+        except Exception:
+            pass
 
-def activar_demo_neutralizado(bot: str, ciclo: int, origen: str = "orden_real") -> bool:
-    return False
+def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> bool:
 
-def escribir_orden_demo_neutralizado(bot: str, ciclo: int, extra_payload: dict | None = None) -> bool:
-    globals()["LAST_REAL_ORDER_FAIL_REASON"] = "demo_only"
-    return False
+    """
+    Reserva REAL y actualiza HUD de forma INMEDIATA.
 
-_LAST_IA_ACK_HEARTBEAT_TS = now
+    Regla anti “órdenes fantasma”:
+    - SOLO si origen == "manual" se auto-escribe orden_real.json aquí.
+    - Si la orden viene por escribir_orden_real(...), ese wrapper YA escribe el JSON.
+    - Flujos de sync/UI/token jamás deben escribir orden_real.json.
+    """
+    global LIMPIEZA_PANEL_HASTA, sonido_disparado, marti_paso, REAL_OWNER_LOCK, REAL_ENTRY_BASELINE
+
+    try:
+        if bot not in BOT_NAMES:
+            return False
+
+        now = time.time()
+
+        # 🔒 No permitir reemplazar owner REAL activo por otro bot.
+        # Solo se puede activar si no hay owner o si es el mismo bot.
+        try:
+            owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+        except Exception:
+            owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+        if owner_lock in BOT_NAMES and owner_lock != bot:
+            try:
+                agregar_evento(f"🔒 REAL bloqueado: {owner_lock.upper()} sigue activo. Ignorando intento de {bot.upper()}.")
+            except Exception:
+                pass
+            try:
+                if origen == "orden_real":
+                    limpiar_orden_real(bot)
+            except Exception:
+                pass
+            return False
+
+        # Anti doble-disparo (tecla rebotona)
+        if (now - _last_real_push_ts.get(bot, 0.0)) < 0.25:
+            return False
+        _last_real_push_ts[bot] = now
+
+        ciclo_obj = max(1, min(int(ciclo), MAX_CICLOS))
+
+        # Baseline REAL: a partir de aquí recién aceptamos cierres para este turno.
+        try:
+            REAL_ENTRY_BASELINE[bot] = int(contar_filas_csv(bot) or 0)
+        except Exception:
+            REAL_ENTRY_BASELINE[bot] = 0
+
+        # Idempotencia token_sync: evita re-enganche/spam si ya está el mismo holder/ciclo.
+        if origen == "token_sync":
+            try:
+                owner_now = leer_token_actual()
+                cyc_now = int(estado_bots.get(bot, {}).get("ciclo_actual", 1) or 1)
+                if owner_now == bot and cyc_now == ciclo_obj:
+                    return True
+            except Exception:
+                pass
+
+        # ✅ Solo “manual” auto-escribe orden_real (la orden explícita)
+        if origen == "manual":
+            try:
+                _escribir_orden_real_raw(bot, ciclo_obj)
+            except Exception:
+                pass
+
+        prev_holder = None
+        try:
+            prev_holder = leer_token_actual()  # sincroniza UI
+        except Exception:
+            prev_holder = None
+
+        # Persistir primero token REAL y confirmar después memoria/UI
+        if origen in ("orden_real", "manual", "token_sync"):
+            with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
+                if not got:
+                    agregar_evento("⚠️ Token REAL no escrito: lock real.lock ocupado. Se evita activar sin exclusión.")
+                    try:
+                        if origen == "orden_real":
+                            limpiar_orden_real(bot)
+                    except Exception:
+                        pass
+                    return False
+                ok_write = bool(write_token_atomic(TOKEN_FILE, f"REAL:{bot}"))
+                if not ok_write:
+                    agregar_evento("⚠️ Token REAL no escrito: fallo de persistencia en token_actual.txt.")
+                    try:
+                        if origen == "orden_real":
+                            limpiar_orden_real(bot)
+                    except Exception:
+                        pass
+                    return False
+
+        # Confirmación en memoria SOLO tras persistencia correcta
+        REAL_OWNER_LOCK = bot
+
+        # 2) Estado interno inmediato (HUD)
+        _set_ui_token_holder(bot)
+        estado_bots[bot]["trigger_real"] = True
+        estado_bots[bot]["ciclo_actual"] = ciclo_obj
+
+        # Congelar probabilidad de señal al entrar REAL (si no estaba ya fijada)
+        # para evitar divergencia visual/ACK durante toda la operación.
+        try:
+            if not isinstance(estado_bots[bot].get("ia_prob_senal"), (int, float)):
+                p_live = estado_bots[bot].get("prob_ia", None)
+                if isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0:
+                    estado_bots[bot]["ia_prob_senal"] = float(p_live)
+        except Exception:
+            pass
+
+        # Marcas de “entrada a real”
+        first_entry = not bool(estado_bots[bot].get("modo_real_anunciado", False))
+        if first_entry or (prev_holder != bot):
+            estado_bots[bot]["modo_real_anunciado"] = True
+            estado_bots[bot]["real_activado_en"] = now
+            estado_bots[bot]["ignore_cierres_hasta"] = now + 15.0
+            estado_bots[bot]["real_timeout_first_warn"] = 0.0
+
+            # Snapshot visual/diagnóstico (independiente del baseline REAL)
+            try:
+                SNAPSHOT_FILAS[bot] = contar_filas_csv(bot)
+            except Exception:
+                SNAPSHOT_FILAS[bot] = 0
+
+            # Mantener marti_paso global coherente con el ciclo elegido
+            try:
+                marti_paso = ciclo_obj - 1
+            except Exception:
+                pass
+
+            try:
+                agregar_evento(f"🚨 REAL INMEDIATO ({origen}) → {bot.upper()} | ciclo #{ciclo_obj}")
+            except Exception:
+                pass
+
+            # Sonido de activación (solo si tu config lo permite)
+            try:
+                reproducir_evento("racha_detectada", es_demo=False, dentro_gatewin=True)
+            except Exception:
+                pass
+
+            LIMPIEZA_PANEL_HASTA = 0
+            sonido_disparado = False
+
+        # 3) Redibujar panel YA
+        try:
+            fn_panel = globals().get("mostrar_panel", None)
+            if callable(fn_panel):
+                fn_panel()
+        except Exception:
+            pass
+
+        # 4) Standby estricto del resto (evita doble-REAL visual)
+        try:
+            _enforce_single_real_standby(bot)
+        except Exception:
+            pass
+
+        return True
+
+    except Exception:
+        return False
+
+def escribir_orden_real(bot: str, ciclo: int) -> bool:
+    global REAL_OWNER_LOCK
+    """
+    Wrapper oficial:
+    - Escribe orden_real.json (RAW)
+    - Activa REAL inmediato en HUD + token file
+    """
+    ciclo = max(1, min(int(ciclo), MAX_CICLOS))
+
+    # 🔒 No crear orden si ya hay otro owner REAL activo.
+    try:
+        owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+    except Exception:
+        owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+
+    if owner_lock in BOT_NAMES and owner_lock != bot:
+        try:
+            agregar_evento(f"🔒 Orden REAL bloqueada para {bot.upper()}: {owner_lock.upper()} está activo.")
+        except Exception:
+            pass
+        return False
+
+    # ✅ Auditoría Real vs Ficticia: abrir señal SOLO si esta orden está respaldada por IA (prob >= umbral)
+    try:
+        st = estado_bots.get(str(bot), {}) if isinstance(estado_bots, dict) else {}
+        prob_sig = st.get("prob_ia_oper", st.get("prob_ia"))
+        modo_sig = str(st.get("modo_ia") or "").upper()
+        thr_sig = float(get_umbral_operativo())
+        if isinstance(prob_sig, (int, float)) and modo_sig not in ("", "OFF", "0") and float(prob_sig) >= thr_sig:
+            ep_sig = ia_audit_get_last_pre_epoch(str(bot))
+            if isinstance(ep_sig, (int, float)) and int(ep_sig) > 0:
+                log_ia_open(str(bot), int(ep_sig), float(prob_sig), float(thr_sig), str(st.get("fuente") or "ORDEN_REAL"))
+    except Exception:
+        pass
+
+    _escribir_orden_real_raw(bot, ciclo)
+    ok_activate = bool(activar_real_inmediato(bot, ciclo, origen="orden_real"))
+
+    owner_after_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+    owner_after_file = leer_token_archivo_raw()
+    ok = bool(ok_activate and owner_after_mem == bot and owner_after_file == bot)
+    if ok:
+        _marti_audit_log_orden(ciclo, bot=bot, origen="escribir_orden_real")
+        if int(ciclo) == 1:
+            agregar_evento("🟢 MARTI-AUDIT: apertura explícita en C1 (nuevo ciclo confirmado).")
+        _marcar_compuerta_real_consumida()
+        DYN_ROOF_STATE["last_real_open_ts"] = float(time.time())
+        try:
+            _REAL_SHADOW_MICRO_OPEN_TS.append(float(time.time()))
+        except Exception:
+            pass
+    return ok
+# === FIN PATCH REAL INMEDIATO ===
+# === IA ACK (handshake maestro→bot: confirma que el PRE-TRADE ya fue evaluado) ===
+IA_ACK_DIR = "ia_ack"
+_LAST_IA_ACK_HEARTBEAT_TS = 0.0
+
+def path_ia_ack(bot: str) -> str:
+    _ensure_dir(IA_ACK_DIR)
+    return os.path.join(IA_ACK_DIR, f"{bot}.json")
+
+def _prob_ia_para_ack(bot: str, st: dict | None = None):
+    """
+    Prob IA efectiva para ACK:
+    - Si el bot tiene una señal ya seleccionada (ia_prob_senal), la conservamos para
+      evitar que el ACK oscile durante reintentos/token-sync.
+    - Si no hay señal bloqueada, SOLO usamos prob_ia viva cuando el bot reporta
+      ia_ready=True y modo_ia != off.
+
+    Esto evita mostrar 0.0% fantasma cuando prob_ia quedó en default durante resets.
+    """
+    try:
+        st = st if isinstance(st, dict) else estado_bots.get(str(bot), {})
+        p_lock = st.get("ia_prob_senal", None)
+        if isinstance(p_lock, (int, float)) and 0.0 <= float(p_lock) <= 1.0:
+            return float(p_lock)
+
+        ia_ready = bool(st.get("ia_ready", False))
+        modo = str(st.get("modo_ia", "off") or "off").strip().lower()
+        p_live = st.get("prob_ia", None)
+        if ia_ready and (modo != "off") and isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0:
+            return float(p_live)
+    except Exception:
+        pass
+    return None
+
+def _resolver_prob_en_juego_ack(bot: str, st: dict | None = None):
+    """Devuelve (prob_en_juego, source) para unificar la fuente de verdad del ACK."""
+    try:
+        st = st if isinstance(st, dict) else estado_bots.get(str(bot), {})
+        p_lock = st.get("ia_prob_senal", None)
+        if isinstance(p_lock, (int, float)) and 0.0 <= float(p_lock) <= 1.0:
+            return float(p_lock), "SENAL"
+
+        ia_ready = bool(st.get("ia_ready", False))
+        modo = str(st.get("modo_ia", "off") or "off").strip().lower()
+        p_live = st.get("prob_ia", None)
+        if isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0 and (modo != "off"):
+            # MODELO: predicción lista y usable para decisión real.
+            if ia_ready:
+                return float(p_live), "MODELO"
+            # LOW_DATA/NO_READY: mostramos prob viva del maestro como referencia visual
+            # (evita ocultar 54.2% en bot cuando el HUD sí la está mostrando).
+            if float(p_live) > 0.0:
+                return float(p_live), "HUD"
+
+        if modo == "off":
+            return None, "OFF"
+        return None, "NO_READY"
+    except Exception:
+        return None, "NO_READY"
+
+def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: str, meta: dict | None):
+    """
+    Escribe un ACK por-bot para que el bot muestre la prob IA asociada a su PRE.
+    Incluye:
+      - prob: prob calibrada (0..1) o None
+      - prob_raw: prob sin calibrar (0..1), si está disponible
+      - calib_factor: factor aplicado (si aplica)
+      - auc / thr / reliable desde model_meta
+    """
+    try:
+        ack_path = path_ia_ack(bot)
+        os.makedirs(os.path.dirname(ack_path), exist_ok=True)
+
+        st = estado_bots.get(str(bot), {}) if isinstance(estado_bots, dict) else {}
+
+        p_hud = _prob_ia_para_ack(bot, st)
+        p_play, p_source = _resolver_prob_en_juego_ack(bot, st)
+        decision_id = st.get("ia_decision_id")
+        if not decision_id:
+            ep = int(epoch) if epoch is not None else 0
+            decision_id = f"{bot}|{ep}"
+        payload = {
+            "bot": str(bot),
+            "epoch": int(epoch) if epoch is not None else 0,
+            "prob": float(prob) if isinstance(prob, (int, float)) else None,
+            # prob_hud/modo_hud = valor vigente que pinta el HUD del maestro (fuente visual principal)
+            "prob_hud": p_hud,
+            "has_prob_hud": isinstance(p_hud, (int, float)),
+            "ia_ready": bool(st.get("ia_ready", False)),
+            "modo_hud": str(st.get("modo_ia", "off") or "off").upper(),
+            "prob_en_juego": p_play,
+            "has_prob_en_juego": isinstance(p_play, (int, float)),
+            "prob_source": str(p_source),
+            "decision_id": str(decision_id),
+            "ack_ts": time.time(),
+            "prob_raw": float(st.get("prob_ia_raw")) if isinstance(st.get("prob_ia_raw"), (int, float)) else None,
+            "calib_factor": float(st.get("cal_factor")) if isinstance(st.get("cal_factor"), (int, float)) else None,
+            "auc": float((meta or {}).get("auc", 0.0) or 0.0),
+            "thr": float((meta or {}).get("threshold", 0.0) or 0.0),
+            "real_thr": float(get_umbral_real_calibrado()),
+            "real_thr_cap": float(AUTO_REAL_THR),
+            "reliable": bool((meta or {}).get("reliable", True)),
+            "modo": str(modo_ia).upper() if modo_ia else "OFF",
+            "model_version": str((meta or {}).get("trained_at", "")),
+            "ts": time.time()
+        }
+
+        with open(ack_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def refrescar_ia_ack_desde_hud(intervalo_s: float = 1.0):
+    """
+    Heartbeat de ACK: mantiene `ia_ack/<bot>.json` sincronizado con el HUD.
+    Objetivo: que los bots vean la prob IA vigente del maestro durante GateWin,
+    incluso si no entraron filas nuevas de CSV en ese instante.
+    """
+    global _LAST_IA_ACK_HEARTBEAT_TS
+    now = time.time()
+    if (now - float(_LAST_IA_ACK_HEARTBEAT_TS or 0.0)) < float(intervalo_s):
+        return
+
+    meta = leer_model_meta() or {}
+    for bot in BOT_NAMES:
+        try:
+            st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
+            ep = st.get("ultimo_epoch_pretrade", 0)
+            if ep is None:
+                ep = 0
+            ep = int(float(ep)) if str(ep).strip() != "" else 0
+            if ep <= 0:
+                continue
+
+            p_eff = _prob_ia_para_ack(bot, st)
+            modo = str(st.get("modo_ia", "off") or "off").upper()
+            escribir_ia_ack(bot, ep, p_eff if isinstance(p_eff, (int, float)) else None, modo, meta)
+        except Exception:
+            continue
+
+    _LAST_IA_ACK_HEARTBEAT_TS = now
 # Leer token actual
 def leer_token_actual():
-    """Modo DEMO-only: token neutralizado en REAL:none y HUD en DEMO."""
-    global REAL_OWNER_LOCK
-    REAL_OWNER_LOCK = None
+    """
+    Lee token_actual.txt y además sincroniza el HUD (estado_bots[*]["token"])
+    para que REAL/DEMO se refleje sin esperar compra del bot.
+    Prioriza lock en memoria para evitar parpadeos DEMO durante REAL en curso.
+    """
+    holder = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+
+    # Si ya hay owner REAL en memoria, mantenemos sincronía visual inmediata.
+    if holder in BOT_NAMES:
+        _set_ui_token_holder(holder)
+        _enforce_single_real_standby(holder)
+        return holder
+
+    if not os.path.exists(TOKEN_FILE):
+        _set_ui_token_holder(None)
+        return None
     try:
-        raw = ""
-        if os.path.exists(TOKEN_FILE):
-            with open(TOKEN_FILE, encoding="utf-8", errors="replace") as f:
-                raw = (f.read() or "").strip()
-        if raw != "REAL:none":
-            write_token_atomic(TOKEN_FILE, "REAL:none")
-    except Exception:
-        pass
-    _set_ui_token_holder(None)
-    return None
+        with open(TOKEN_FILE, encoding="utf-8", errors="replace") as f:
+            linea = (f.read() or "").strip()
+        if linea.startswith("REAL:"):
+            bot_name = linea.split(":", 1)[1].strip()
+            if bot_name in BOT_NAMES:
+                holder = bot_name
+            elif bot_name == "none":
+                holder = None
+        _set_ui_token_holder(holder)
+        if holder in BOT_NAMES:
+            _enforce_single_real_standby(holder)
+        return holder
+    except Exception as e:
+        try:
+            print(f"⚠️ Error leyendo token: {e}")
+        except Exception:
+            pass
+        fallback = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+        _set_ui_token_holder(fallback)
+        if fallback in BOT_NAMES:
+            _enforce_single_real_standby(fallback)
+        return fallback
+
 
 def leer_token_archivo_raw():
-    return None
-
-# Escribir token actual# Escribir token actual
-async def escribir_token_actual(bot):
+    """
+    Lee token_actual.txt SIN priorizar REAL_OWNER_LOCK (para reconciliar desincronías).
+    Retorna bot owner REAL o None.
+    """
+    if not os.path.exists(TOKEN_FILE):
+        return None
     try:
-        write_token_atomic(TOKEN_FILE, "REAL:none")
-        _set_ui_token_holder(None)
+        with open(TOKEN_FILE, encoding="utf-8", errors="replace") as f:
+            linea = (f.read() or "").strip()
+        if not linea.startswith("REAL:"):
+            return None
+        bot_name = linea.split(":", 1)[1].strip()
+        if bot_name in BOT_NAMES:
+            return bot_name
+        return None
+    except Exception:
+        return None
+
+# Escribir token actual
+async def escribir_token_actual(bot):
+    """
+    Sync UI/token: refleja REAL en HUD y token file.
+    ⚠️ Regla: este flujo NO debe generar orden_real.json.
+    """
+    try:
+        try:
+            _ = leer_token_actual()  # sincroniza UI
+        except Exception:
+            pass
+
+        ciclo_objetivo = estado_bots.get(bot, {}).get("ciclo_actual", 1)
+        try:
+            ciclo_objetivo = int(ciclo_objetivo)
+        except Exception:
+            ciclo_objetivo = 1
+
+        # ✅ origen "sync_ui": NO debe escribir orden_real.json
+        activar_real_inmediato(bot, ciclo_objetivo, origen="token_sync")
+
+        # No bloqueamos: saldo en background
+        try:
+            asyncio.create_task(obtener_saldo_real())
+        except Exception:
+            try:
+                asyncio.create_task(refresh_saldo_real(forzado=True))
+            except Exception:
+                pass
+
     except Exception:
         pass
 
-# Activar remate# Activar remate
+# Activar remate
 def activar_remate(bot: str, reason: str):
     if not estado_bots[bot]["remate_active"]:
         estado_bots[bot]["remate_active"] = True
@@ -3125,7 +2750,7 @@ def activar_remate(bot: str, reason: str):
 
 # Cerrar por WIN
 def cerrar_por_win(bot: str, reason: str):
-    global REAL_OWNER_LOCK, REAL_COOLDOWN_UNTIL_TS, marti_ciclos_perdidos, marti_paso
+    global REAL_OWNER_LOCK, REAL_COOLDOWN_UNTIL_TS
 
     # Liberar token REAL en archivo primero (commit de salida)
     liberado = False
@@ -3146,8 +2771,6 @@ def cerrar_por_win(bot: str, reason: str):
     # Liberación consolidada: recién aquí memoria/UI pasan a DEMO
     REAL_OWNER_LOCK = None
     REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
-    marti_ciclos_perdidos = 0
-    marti_paso = 0
 
     # Limpieza total de “estado REAL” para evitar REAL fantasma
     try:
@@ -3198,7 +2821,6 @@ def cerrar_por_win(bot: str, reason: str):
 
     try:
         agregar_evento(f"✅ WIN: REAL liberado para {bot.upper()} ({reason})")
-        agregar_evento(f"MARTI_MAESTRO: bot={bot} vuelve a DEMO tras cierre REAL")
     except Exception:
         pass
 
@@ -3271,53 +2893,6 @@ def normalizar_trade_status(ts):
         return s
     except Exception:
         return ""
-
-
-def _resultado_cierre_desde_fila(fila_dict: dict) -> str:
-    """Obtiene resultado canónico de una fila cerrada sin depender de una sola columna."""
-    try:
-        res = normalizar_resultado((fila_dict or {}).get("resultado", ""))
-        if res in ("GANANCIA", "PÉRDIDA"):
-            return res
-
-        for k in ("result_bin", "resultado_bin", "y", "label", "result"):
-            v = (fila_dict or {}).get(k, None)
-            if v in (None, "", "nan", "NaN"):
-                continue
-            try:
-                iv = int(float(v))
-                if iv == 1:
-                    return "GANANCIA"
-                if iv == 0:
-                    return "PÉRDIDA"
-            except Exception:
-                continue
-
-        gp = (fila_dict or {}).get("ganancia_perdida", None)
-        if gp not in (None, "", "nan", "NaN"):
-            try:
-                fv = float(gp)
-                if fv > 0:
-                    return "GANANCIA"
-                if fv < 0:
-                    return "PÉRDIDA"
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return "INDEFINIDO"
-
-
-def _hud_log_once(bot: str, key: str, msg: str, cooldown_s: float = 20.0):
-    try:
-        now = float(time.time())
-        map_key = f"{bot}|{key}"
-        last = float(HUD_CLOSE_LOG_TS.get(map_key, 0.0) or 0.0)
-        if (now - last) >= float(max(1.0, cooldown_s)):
-            HUD_CLOSE_LOG_TS[map_key] = now
-            agregar_evento(msg)
-    except Exception:
-        pass
 
 def canonicalizar_campos_bot_maestro(row_dict: dict | None):
     """
@@ -3772,13 +3347,6 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
         else:
             out["micro_trend_persist"] = float(np.clip(racha / 10.0, -1.0, 1.0))
             proxy_used.add("micro_trend_persist")
-
-    # MRV defaults seguros para compatibilidad de incremental/modelos nuevos-viejos.
-    mrv_def = _mrv_default_payload(reason="row_enrich_default")
-    for mk in MRV_FEATURE_NAMES:
-        if _missing(mk):
-            out[mk] = float(mrv_def.get(mk, 0.0) or 0.0)
-            proxy_used.add(mk)
 
     core_scalping_ready = _core_scalping_ready_from_row(out)
     if len(close_vals) < 20 and (not core_scalping_ready):
@@ -7223,14 +6791,6 @@ def _add_derived_for_model(d: dict):
         rsi_rev = 0.0
     d["rev_x_breakout"] = rsi_rev * brk
 
-    # Compatibilidad MRV: garantizar presencia estable si el modelo/feature-set lo espera.
-    mrv_def = _mrv_default_payload(reason="derived_default")
-    for mk in MRV_FEATURE_NAMES:
-        try:
-            d[mk] = float(d.get(mk, mrv_def.get(mk, 0.0)) or 0.0)
-        except Exception:
-            d[mk] = float(mrv_def.get(mk, 0.0) or 0.0)
-
     return d
 
 def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
@@ -7395,12 +6955,6 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
         if pe_raw is None:
             return None
         row["puntaje_estrategia"] = float(max(0.0, min(float(pe_raw), 1.0)))
-
-    # MRV online por bot (sin fuga temporal: solo borde derecho + histórico cerrado).
-    try:
-        row.update(_mrv_update_bot_state(bot, row=row))
-    except Exception:
-        row.update(_mrv_default_payload(reason="pred_row_mrv_fail"))
 
     # Derived extras (por si el modelo los espera)
     row = _add_derived_for_model(row)
@@ -8219,10 +7773,10 @@ def ia_prob_valida(bot: str, max_age_s: float = 10.0) -> bool:
     except Exception:
         return False
                                               
-_AUTO_REAL_DISABLED_CACHE = {"ts": 0.0, "thr": float(IA_ACTIVACION_REAL_THR), "n": 0, "max": 0.0}
+_AUTO_REAL_CACHE = {"ts": 0.0, "thr": float(IA_ACTIVACION_REAL_THR), "n": 0, "max": 0.0}
 
 
-def _leer_probs_historicas_ia(max_rows: int = AUTO_REAL_DISABLED_LOG_MAX_ROWS) -> list[float]:
+def _leer_probs_historicas_ia(max_rows: int = AUTO_REAL_LOG_MAX_ROWS) -> list[float]:
     """Lee probs históricas del log de señales IA cerradas para calibrar umbral REAL."""
     path = IA_SIGNALS_LOG
     if not os.path.exists(path):
@@ -8252,28 +7806,28 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
     Reglas:
     - Histórico: cuantíl alto de ia_signals_log.prob (estabilidad).
     - Vivo: mejor prob IA actual de bots (sensibilidad al régimen actual).
-    - Resultado: min(thr_hist, thr_live) acotado en [AUTO_REAL_DISABLED_THR_MIN .. AUTO_REAL_DISABLED_THR].
+    - Resultado: min(thr_hist, thr_live) acotado en [AUTO_REAL_THR_MIN .. AUTO_REAL_THR].
     """
     now = time.time()
     try:
         # En modo clásico, el umbral REAL debe mantenerse fijo al operativo (85%).
         if bool(REAL_CLASSIC_GATE):
             thr_fixed = float(IA_ACTIVACION_REAL_THR)
-            _AUTO_REAL_DISABLED_CACHE["ts"] = now
-            _AUTO_REAL_DISABLED_CACHE["thr"] = thr_fixed
+            _AUTO_REAL_CACHE["ts"] = now
+            _AUTO_REAL_CACHE["thr"] = thr_fixed
             return thr_fixed
 
-        if (not force) and ((now - float(_AUTO_REAL_DISABLED_CACHE.get("ts", 0.0) or 0.0)) < 8.0):
-            return float(_AUTO_REAL_DISABLED_CACHE.get("thr", AUTO_REAL_DISABLED_THR_MIN))
+        if (not force) and ((now - float(_AUTO_REAL_CACHE.get("ts", 0.0) or 0.0)) < 8.0):
+            return float(_AUTO_REAL_CACHE.get("thr", AUTO_REAL_THR_MIN))
 
         # 1) Histórico
-        probs = _leer_probs_historicas_ia(AUTO_REAL_DISABLED_LOG_MAX_ROWS)
+        probs = _leer_probs_historicas_ia(AUTO_REAL_LOG_MAX_ROWS)
         if len(probs) >= 12:
-            q_hist = float(np.quantile(np.array(probs, dtype=float), float(AUTO_REAL_DISABLED_TOP_Q)))
-            thr_hist = q_hist - float(AUTO_REAL_DISABLED_MARGIN)
+            q_hist = float(np.quantile(np.array(probs, dtype=float), float(AUTO_REAL_TOP_Q)))
+            thr_hist = q_hist - float(AUTO_REAL_MARGIN)
             pmax_hist = float(max(probs))
         else:
-            thr_hist = float(AUTO_REAL_DISABLED_THR_MIN)
+            thr_hist = float(AUTO_REAL_THR_MIN)
             pmax_hist = float(max(probs)) if probs else 0.0
 
         # 2) Vivo (último tick): si el mercado/modelo se aplana, el gate también baja
@@ -8288,23 +7842,23 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
             except Exception:
                 continue
 
-        if len(live_probs) >= int(AUTO_REAL_DISABLED_LIVE_MIN_BOTS):
+        if len(live_probs) >= int(AUTO_REAL_LIVE_MIN_BOTS):
             pmax_live = float(max(live_probs))
-            thr_live = pmax_live - float(AUTO_REAL_DISABLED_MARGIN)
+            thr_live = pmax_live - float(AUTO_REAL_MARGIN)
         else:
             pmax_live = 0.0
-            thr_live = float(AUTO_REAL_DISABLED_THR_MIN)
+            thr_live = float(AUTO_REAL_THR_MIN)
 
         thr_raw = min(float(thr_hist), float(thr_live))
-        thr = max(float(AUTO_REAL_DISABLED_THR_MIN), min(float(AUTO_REAL_DISABLED_THR), float(thr_raw)))
+        thr = max(float(AUTO_REAL_THR_MIN), min(float(AUTO_REAL_THR), float(thr_raw)))
 
-        _AUTO_REAL_DISABLED_CACHE["ts"] = now
-        _AUTO_REAL_DISABLED_CACHE["thr"] = float(thr)
-        _AUTO_REAL_DISABLED_CACHE["n"] = int(len(probs))
-        _AUTO_REAL_DISABLED_CACHE["max"] = float(max(pmax_hist, pmax_live))
+        _AUTO_REAL_CACHE["ts"] = now
+        _AUTO_REAL_CACHE["thr"] = float(thr)
+        _AUTO_REAL_CACHE["n"] = int(len(probs))
+        _AUTO_REAL_CACHE["max"] = float(max(pmax_hist, pmax_live))
         return float(thr)
     except Exception:
-        return float(AUTO_REAL_DISABLED_THR_MIN)
+        return float(AUTO_REAL_THR_MIN)
 
 
 def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_real_token=False, expected_ciclo=None):
@@ -8318,19 +7872,6 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
     - expected_ciclo: si existe columna de ciclo, exige coincidencia con ese ciclo.
     """
     path = f"registro_enriquecido_{bot}.csv"
-    diag_cache = globals().setdefault("_CLOSE_DIAG_LAST", {})
-    diag_reason = globals().setdefault("_CLOSE_DIAG_LAST_REASON", {})
-    now_diag = float(time.time())
-    def _diag(msg: str, key: str = ""):
-        try:
-            k = f"{bot}|{key or msg}"
-            prev = float(diag_cache.get(k, 0.0) or 0.0)
-            if (now_diag - prev) >= 20.0:
-                diag_cache[k] = now_diag
-                diag_reason[str(bot)] = str(msg)
-                agregar_evento(f"🔎 CIERRE REAL {bot}: {msg}")
-        except Exception:
-            pass
     if not os.path.exists(path):
         return None
 
@@ -8381,15 +7922,6 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
 
     if i_res is None:
         return None
-    if require_closed and i_status is None:
-        _diag("fila cierre descartada: falta trade_status", key="missing_trade_status")
-        return None
-    if require_real_token and i_token is None:
-        _diag("fila cierre descartada: falta token/cuenta REAL", key="missing_real_token")
-        return None
-    if (expected_ciclo is not None) and (i_ciclo is None):
-        _diag("fila cierre descartada: falta ciclo_actual/ciclo_martingala", key="missing_ciclo")
-        return None
 
     # Recorremos desde el final (último evento primero)
     for ridx in range(len(rows) - 1, 0, -1):
@@ -8407,25 +7939,20 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
                 pass
 
         # trade_status si aplica
-        if require_closed and (i_status is not None):
-            st = str(row[i_status]).strip().upper() if i_status < len(row) else ""
-            if not st:
-                _diag(f"fila {fila_num} descartada: trade_status vacío", key="empty_trade_status")
-                continue
+        if require_closed and (i_status is not None) and (i_status < len(row)):
+            st = str(row[i_status]).strip().upper()
             if st not in ("CERRADO", "CLOSED"):
                 continue
 
         # Si el CSV informa token/cuenta, en REAL ignoramos cierres explícitos de DEMO.
-        if require_real_token and (i_token is not None):
-            tok_raw = str(row[i_token] or "").strip().upper() if i_token < len(row) else ""
-            if not tok_raw:
-                _diag(f"fila {fila_num} descartada: token/cuenta vacío", key="empty_real_token")
-                continue
-            # Heurística robusta: DEMO en Deriv suele venir como VRTC*
-            es_demo = ("DEMO" in tok_raw) or tok_raw.startswith("VRTC")
-            es_real = ("REAL" in tok_raw) or tok_raw.startswith("CR")
-            if es_demo and not es_real:
-                continue
+        if require_real_token and (i_token is not None) and (i_token < len(row)):
+            tok_raw = str(row[i_token] or "").strip().upper()
+            if tok_raw:
+                # Heurística robusta: DEMO en Deriv suele venir como VRTC*
+                es_demo = ("DEMO" in tok_raw) or tok_raw.startswith("VRTC")
+                es_real = ("REAL" in tok_raw) or tok_raw.startswith("CR")
+                if es_demo and not es_real:
+                    continue
 
         # resultado
         try:
@@ -8466,13 +7993,10 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
         if expected_ciclo is not None:
             try:
                 if ciclo is None:
-                    _diag(f"fila {fila_num} descartada: ciclo vacío y expected={expected_ciclo}", key="empty_expected_ciclo")
                     continue
                 if int(ciclo) != int(expected_ciclo):
-                    _diag(f"fila {fila_num} descartada: ciclo={ciclo} distinto a expected={expected_ciclo}", key="mismatch_expected_ciclo")
                     continue
             except Exception:
-                _diag(f"fila {fila_num} descartada: ciclo inválido y expected={expected_ciclo}", key="invalid_expected_ciclo")
                 continue
 
         # payout_total: preferimos extractor (maneja legacy y ratio)
@@ -8719,10 +8243,9 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
 
     # Limpieza total de “estado REAL” para evitar HUD/estado fantasma
     try:
-        ciclo_mirror = _marti_ciclo_operativo_actual()
         estado_bots[bot]["token"] = "DEMO"
         estado_bots[bot]["trigger_real"] = False
-        estado_bots[bot]["ciclo_actual"] = ciclo_mirror
+        estado_bots[bot]["ciclo_actual"] = 1
         estado_bots[bot]["modo_real_anunciado"] = False
         estado_bots[bot]["fuente"] = None
 
@@ -8776,7 +8299,6 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     # Log visual
     try:
         agregar_evento(f"🔓 Cuenta REAL liberada para {bot.upper()} ({reason})")
-        agregar_evento(f"MARTI_MAESTRO: bot={bot} vuelve a DEMO tras cierre REAL")
     except Exception:
         pass
 
@@ -8837,14 +8359,6 @@ def marti_audit_resumen_linea() -> str:
         return "Audit run#? desvíos=? último=--"
 
 
-def _marti_ciclo_tag(ciclo: int | None) -> str:
-    try:
-        c = max(1, min(int(MAX_CICLOS), int(ciclo or 1)))
-    except Exception:
-        c = 1
-    return f"C{int(c)}"
-
-
 def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_operado: int | None = None):
     """
     Actualiza el contador global de ciclos martingala para el HUD y la próxima
@@ -8861,64 +8375,61 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
     if bot in BOT_NAMES:
         ultimo_bot_real = bot
 
-    ciclo_real = max(1, min(int(MAX_CICLOS), int(ciclo_operado or _marti_ciclo_operativo_actual())))
-
     if res == "GANANCIA":
         marti_ciclos_perdidos = 0
         marti_paso = 0
         bots_usados_en_esta_marti = []
-        if bot in BOT_NAMES:
-            estado_bots[bot]["ciclo_actual"] = 1
         _marti_audit_record("cierre_ganancia", ciclo=ciclo_operado, bot=bot, detalle="reinicio_a_C1")
         marti_audit_run_id = int(marti_audit_run_id) + 1
         marti_audit_ultimo_ciclo_ordenado = None
-        agregar_evento(
-            f"MARTI_MAESTRO: WIN bot={str(bot or '--')} ciclo={_marti_ciclo_tag(ciclo_real)} -> reset a C1 y vuelve a DEMO"
-        )
+        agregar_evento(f"✅ Martingala reiniciada en C1 por GANANCIA ({marti_audit_resumen_linea()}).")
     elif res == "PÉRDIDA":
         # Registrar el bot operado en la corrida activa para forzar rotación C2..C{MAX_CICLOS}.
         if bot in BOT_NAMES and bot not in bots_usados_en_esta_marti:
             bots_usados_en_esta_marti.append(bot)
 
-        marti_ciclos_perdidos = min(MAX_CICLOS, int(marti_ciclos_perdidos) + 1)
+        # Robustez anti-desincronización:
+        # si conocemos el ciclo realmente operado, el próximo estado de pérdidas
+        # debe ser al menos ese ciclo (p.ej. perder en C2 => pérdidas=2 => próximo C3).
+        try:
+            ciclo_ref = int(ciclo_operado) if ciclo_operado is not None else 0
+        except Exception:
+            ciclo_ref = 0
+        marti_ciclos_perdidos = min(
+            MAX_CICLOS,
+            max(int(marti_ciclos_perdidos) + 1, max(0, ciclo_ref))
+        )
         # Si ya culminó C{MAX_CICLOS}, reinicia a C1 para el siguiente turno.
         if int(marti_ciclos_perdidos) >= int(MAX_CICLOS):
             marti_ciclos_perdidos = 0
             marti_paso = 0
             bots_usados_en_esta_marti = []
-            if bot in BOT_NAMES:
-                estado_bots[bot]["ciclo_actual"] = 1
             _marti_audit_record("cierre_tope", ciclo=ciclo_operado, bot=bot, detalle=f"tope=C{int(MAX_CICLOS)}")
             marti_audit_run_id = int(marti_audit_run_id) + 1
             marti_audit_ultimo_ciclo_ordenado = None
-            agregar_evento(
-                f"MARTI_MAESTRO: LOSS bot={str(bot or '--')} ciclo={_marti_ciclo_tag(ciclo_real)} -> reset a C1 y vuelve a DEMO"
-            )
+            try:
+                agregar_evento(
+                    f"🧯 Martingala C{int(MAX_CICLOS)}/C{int(MAX_CICLOS)} completada: reinicio automático a C1 ({marti_audit_resumen_linea()})."
+                )
+            except Exception:
+                pass
         else:
             marti_paso = min(MAX_CICLOS - 1, int(marti_ciclos_perdidos))
-            prox_ciclo = _marti_ciclo_operativo_actual()
-            if bot in BOT_NAMES:
-                estado_bots[bot]["ciclo_actual"] = prox_ciclo
-            agregar_evento(
-                f"MARTI_MAESTRO: LOSS bot={str(bot or '--')} ciclo={_marti_ciclo_tag(ciclo_real)} -> siguiente ciclo {_marti_ciclo_tag(prox_ciclo)} y vuelve a DEMO"
-            )
     else:
         return
+
+    ciclo_sig = int(marti_paso) + 1
+    bot_msg = f" [{bot}]" if bot else ""
+    if res == "PÉRDIDA" and bots_usados_en_esta_marti:
+        try:
+            usados = ",".join(bots_usados_en_esta_marti)
+            agregar_evento(f"🔁 Rotación martingala activa: usados={usados} | próximo ciclo=C{ciclo_sig}")
+        except Exception:
+            pass
+    agregar_evento(
+        f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo={ciclo_sig}"
+    )
     agregar_evento(f"🧾 MARTI-AUDIT: {marti_audit_resumen_linea()}")
-
-def _marti_ciclo_operativo_actual() -> int:
-    """Fuente única de verdad del ciclo operativo REAL: pérdidas + 1."""
-    try:
-        return max(1, min(int(MAX_CICLOS), int(marti_ciclos_perdidos) + 1))
-    except Exception:
-        return 1
-
-def _marti_monto_por_ciclo(ciclo: int) -> float:
-    try:
-        idx = max(0, min(len(MARTI_ESCALADO) - 1, int(ciclo) - 1))
-        return float(MARTI_ESCALADO[idx])
-    except Exception:
-        return float(MARTI_ESCALADO[0])
 
 def ciclo_martingala_siguiente() -> int:
     """
@@ -8926,7 +8437,7 @@ def ciclo_martingala_siguiente() -> int:
     - ciclo = pérdidas_consecutivas + 1, con límites [1..MAX_CICLOS]
     """
     try:
-        return _marti_ciclo_operativo_actual()
+        return max(1, min(int(MAX_CICLOS), int(marti_ciclos_perdidos) + 1))
     except Exception:
         return 1
 
@@ -8965,8 +8476,9 @@ def reset_martingala_por_saldo(ciclo_objetivo: int, saldo_actual: float | None) 
     falta_msg = "saldo no disponible"
     if saldo is not None:
         falta_msg = f"faltan {(monto_necesario - saldo):.2f} USD"
-    agregar_evento(f"MARTI_MAESTRO: saldo insuficiente para C{ciclo} -> reset a C1")
-    agregar_evento(f"🧯 Saldo insuficiente para C{ciclo} ({monto_necesario:.2f} USD): {falta_msg}. Reinicio automático a C1.")
+    agregar_evento(
+        f"🧯 Saldo insuficiente para C{ciclo} ({monto_necesario:.2f} USD): {falta_msg}. Reinicio automático a C1."
+    )
     return True
 def elegir_candidato_rotacion_marti(
     candidatos: list,
@@ -12363,6 +11875,172 @@ def aplicar_ajuste_patron_score(pattern_eval: dict) -> tuple[float, float, float
         penal += float(PATTERN_COL_PENAL_LATE_CHASE)
     return float(bonus), float(penal), float(bonus - penal)
 
+def _resultado_to_mark(x):
+    raw = str(x or "").strip().upper()
+    if raw in {"GANANCIA", "G", "WIN", "W", "✓", "✔", "✅", "🟢"}:
+        return "G"
+    if raw in {"PÉRDIDA", "PERDIDA", "P", "LOSS", "L", "X", "✗", "❌", "🔴"}:
+        return "R"
+    return None
+
+def _construir_matriz_resultados_columnas(estado: dict, bots: list[str], window: int = 40) -> list[dict]:
+    """
+    Construye matriz por columnas cerradas:
+      - filas: bots
+      - columnas: de más reciente [0] a más antigua [window-1]
+    Cada columna incluye `cells` (bot->G/R/None) y métricas base.
+    """
+    cols = []
+    w = max(1, int(window))
+    for off in range(w):
+        cells = {}
+        validos = verdes = rojos = 0
+        for b in list(bots or []):
+            rr = list((estado.get(b, {}) or {}).get("resultados", []) or [])
+            val = rr[-1 - off] if off < len(rr) else None
+            mark = _resultado_to_mark(val)
+            cells[b] = mark
+            if mark == "G":
+                validos += 1
+                verdes += 1
+            elif mark == "R":
+                validos += 1
+                rojos += 1
+        ratio = (float(verdes) / float(validos)) if validos > 0 else None
+        cols.append({
+            "offset": int(off),
+            "cells": cells,
+            "total_validos": int(validos),
+            "total_verdes": int(verdes),
+            "total_rojos": int(rojos),
+            "green_ratio": ratio,
+        })
+    return cols
+
+def evaluar_patron_columna_verde(col_data: dict, thr80: float = 0.80, thr90: float = 0.90) -> dict:
+    validos = int((col_data or {}).get("total_validos", 0) or 0)
+    verdes = int((col_data or {}).get("total_verdes", 0) or 0)
+    rojos = int((col_data or {}).get("total_rojos", 0) or 0)
+    ratio = (float(verdes) / float(validos)) if validos > 0 else None
+    es80 = bool((ratio is not None) and (float(ratio) >= float(thr80)))
+    es90 = bool((ratio is not None) and (float(ratio) >= float(thr90)))
+    return {
+        "total_validos": validos,
+        "total_verdes": verdes,
+        "total_rojos": rojos,
+        "green_ratio": ratio,
+        "es_col80": es80,
+        "es_col90": es90,
+    }
+
+def calcular_rebote_x_to_check_historico(columnas: list[dict], lookback: int = 12) -> dict:
+    """
+    Convención temporal de matriz:
+      - offset 0 = columna operativa actual (más reciente cerrada)
+      - offset creciente = columnas más antiguas
+    Antifuga estricta:
+      - NO se usa ningún par que toque offset 0
+      - SOLO se usan pares históricos completos j -> j-1 con j >= 2
+    """
+    hist = []
+    cols = list(columnas or [])
+    max_j = min(len(cols) - 1, max(2, int(lookback)))
+    for j in range(2, max_j + 1):
+        col_j = cols[j] if j < len(cols) else {}
+        col_next = cols[j - 1] if (j - 1) < len(cols) else {}
+        cells_j = dict((col_j or {}).get("cells", {}) or {})
+        cells_next = dict((col_next or {}).get("cells", {}) or {})
+        x_total = 0
+        x_rebota = 0
+        for bot, mark in cells_j.items():
+            if mark != "R":
+                continue
+            mark_next = cells_next.get(bot, None)
+            if mark_next is None:
+                continue
+            x_total += 1
+            if mark_next == "G":
+                x_rebota += 1
+        rate = (float(x_rebota) / float(x_total)) if x_total > 0 else None
+        hist.append({"j": int(j), "x_totales": int(x_total), "x_rebotan": int(x_rebota), "rebote_rate_j": rate})
+    total_x_hist = sum(int(h.get("x_totales", 0) or 0) for h in hist)
+    total_x_rebote_hist = sum(int(h.get("x_rebotan", 0) or 0) for h in hist)
+    rate_hist = (float(total_x_rebote_hist) / float(total_x_hist)) if total_x_hist > 0 else None
+    rates_simple = [float(h["rebote_rate_j"]) for h in hist if h.get("rebote_rate_j") is not None]
+    rate_simple = (sum(rates_simple) / float(len(rates_simple))) if rates_simple else None
+    return {
+        "pairs": hist,
+        "rebote_rate_hist": rate_hist,
+        "rebote_rate_hist_simple": rate_simple,  # solo debug
+        "rebote_samples_hist": int(total_x_hist),
+        "total_x_hist": int(total_x_hist),
+        "total_x_rebote_hist": int(total_x_rebote_hist),
+    }
+
+def calcular_strong_streak(columnas_stats: list[dict], thr: float = 0.80) -> int:
+    streak = 0
+    for c in list(columnas_stats or []):
+        ratio = c.get("green_ratio", None)
+        if (ratio is None) or (float(ratio) < float(thr)):
+            break
+        streak += 1
+    return int(streak)
+
+def clasificar_estado_patron(col_actual: dict, col_anterior: dict, rebote_rate_hist: float | None, rebote_samples_hist: int) -> dict:
+    ratio = col_actual.get("green_ratio", None)
+    col80 = bool(col_actual.get("es_col80", False))
+    col90 = bool(col_actual.get("es_col90", False))
+    prev90 = bool((col_anterior or {}).get("es_col90", False))
+    strong_streak_80 = int(col_actual.get("strong_streak_80", 0) or 0)
+    strong_streak_90 = int(col_actual.get("strong_streak_90", 0) or 0)
+    late_chase = bool(
+        (strong_streak_80 >= int(PATTERN_STRONG_STREAK_BLOCK))
+        or (strong_streak_90 >= 1)
+    )
+    sat_activa = bool(col90 or late_chase)
+    rebote_ok = bool(
+        col80
+        and (not sat_activa)
+        and (rebote_rate_hist is not None)
+        and (float(rebote_rate_hist) >= float(PATTERN_REBOTE_MIN))
+        and (int(rebote_samples_hist) >= int(PATTERN_REBOTE_MIN_SAMPLES))
+    )
+    continuidad_ok = bool(col80 and (not col90) and (not prev90) and (not late_chase))
+
+    if sat_activa:
+        state = "SATURACION"
+    elif rebote_ok:
+        state = "REBOTE"
+    elif continuidad_ok:
+        state = "CONTINUIDAD"
+    else:
+        state = "BLOQUEADO"
+    return {
+        "pattern_state": state,
+        "late_chase": late_chase,
+        "saturacion_activa": sat_activa,
+        "continuidad_ok": continuidad_ok,
+        "rebote_ok": rebote_ok,
+        "green_ratio_col_actual": ratio,
+        "strong_streak_80": strong_streak_80,
+        "strong_streak_90": strong_streak_90,
+    }
+
+def aplicar_ajuste_patron_score(pattern_eval: dict) -> tuple[float, float, float]:
+    state = str((pattern_eval or {}).get("pattern_state", "BLOQUEADO"))
+    late_chase = bool((pattern_eval or {}).get("late_chase", False))
+    bonus = 0.0
+    penal = 0.0
+    if state == "CONTINUIDAD":
+        bonus += float(PATTERN_COL_BONUS_CONTINUIDAD)
+    elif state == "REBOTE":
+        bonus += float(PATTERN_COL_BONUS_REBOTE)
+    elif state == "SATURACION":
+        penal += float(PATTERN_COL_PENAL_SATURACION)
+    if late_chase:
+        penal += float(PATTERN_COL_PENAL_LATE_CHASE)
+    return float(bonus), float(penal), float(bonus - penal)
+
 def _racha_actual_color(resultados):
     r = list(resultados or [])
     largo = 0
@@ -12476,7 +12154,7 @@ def _fmt_prob_pct(p):
         return "--"
 
 # Mostrar panel
-def mostrar_panel(force: bool = False):
+def mostrar_panel():
     # === IA: actualizar Prob IA antes de render (NO afecta lógica de trading) ===
     try:
         actualizar_prob_ia_todos()
@@ -12486,18 +12164,10 @@ def mostrar_panel(force: bool = False):
     """
     HUD principal: muestra estado de los bots, saldos, IA y eventos recientes.
     """
-    global meta_mostrada, HUD_LAST_RENDER_TS, HUD_LAST_RENDER_SIG
-
-    now_render = float(time.time())
-    render_sig = f"{ETAPA_ACTUAL}|{ETAPA_DETALLE}|{int(meta_mostrada)}|{int(pausado)}"
-    # Evitar redraw duplicado/seguido del mismo estado dentro del mismo tick.
-    if (not force) and (now_render - float(HUD_LAST_RENDER_TS)) < float(HUD_RENDER_MIN_INTERVAL_S) and render_sig == str(HUD_LAST_RENDER_SIG):
-        return
-    HUD_LAST_RENDER_TS = now_render
-    HUD_LAST_RENDER_SIG = render_sig
+    global meta_mostrada
 
     # Respetar ventana de limpieza (para mensajes especiales)
-    if now_render < LIMPIEZA_PANEL_HASTA:
+    if time.time() < LIMPIEZA_PANEL_HASTA:
         limpiar_consola()
         return
 
@@ -12524,31 +12194,21 @@ def mostrar_panel(force: bool = False):
     except Exception:
         pass
 
-    # Saldo actual (estado estructurado)
+    # Saldo actual (archivo Deriv o saldo_real en memoria)
     try:
         valor = obtener_valor_saldo()
-        status_now = str(SALDO_STATUS).upper()
-        tiene_cache = globals().get("SALDO_LAST_VALID_VALUE", None) is not None
-        if valor is not None:
-            saldo_str = f"{float(valor):.2f}"
-            if status_now == "KNOWN":
-                saldo_line = f"💰 SALDO EN CUENTA REAL DERIV: {saldo_str}"
-            elif status_now in ("STALE", "UNKNOWN") and tiene_cache:
-                age_s = max(0, int(time.time() - float(globals().get("SALDO_LAST_VALID_TS", 0.0) or 0.0)))
-                saldo_line = f"💰 SALDO EN CUENTA REAL DERIV: {saldo_str} [STALE {age_s}s]"
-            else:
-                saldo_line = f"💰 SALDO EN CUENTA REAL DERIV: {saldo_str}"
-        else:
-            saldo_line = "💰 SALDO EN CUENTA REAL DERIV: -- [SALDO NO DISPONIBLE]"
+        if valor is None:
+            valor = float(saldo_real)
+        saldo_str = f"{float(valor):.2f}"
     except Exception:
         valor = None
-        saldo_line = "💰 SALDO EN CUENTA REAL DERIV: -- [SALDO NO DISPONIBLE]"
+        saldo_str = "--"
 
-    print(padding + Fore.GREEN + saldo_line)
+    print(padding + Fore.GREEN + f"💰 SALDO EN CUENTA REAL DERIV: {saldo_str}")
 
     # Saldo inicial y meta
     try:
-        if SALDO_INICIAL is None and isinstance(valor, (int, float)) and str(SALDO_STATUS).upper() == "KNOWN":
+        if SALDO_INICIAL is None and isinstance(valor, (int, float)):
             inicializar_saldo_real(float(valor))
         inicial_str = f"{float(SALDO_INICIAL):.2f}" if SALDO_INICIAL is not None else "--"
     except Exception:
@@ -12613,9 +12273,9 @@ def mostrar_panel(force: bool = False):
             best_prob = float(mejor[1]) if isinstance(mejor, tuple) and len(mejor) >= 2 else 0.0
             unrel_thr_live = float(_umbral_unrel_operativo(mejor[0] if isinstance(mejor, tuple) else None, best_prob))
             auto_adapt_ok = bool(
-                AUTO_REAL_DISABLED_ALLOW_UNRELIABLE_POST_N15
+                AUTO_REAL_ALLOW_UNRELIABLE_POST_N15
                 and post_n15
-                and (n_samples_live >= int(AUTO_REAL_DISABLED_UNRELIABLE_MIN_N))
+                and (n_samples_live >= int(AUTO_REAL_UNRELIABLE_MIN_N))
                 and (best_prob >= float(unrel_thr_live))
             )
             auto_state = "OK" if reliable else ("ADAPT" if auto_adapt_ok else "BLOCK")
@@ -12629,12 +12289,12 @@ def mostrar_panel(force: bool = False):
             if warmup_live:
                 why_reasons.append("warmup")
             if (not reliable) and (not canary_live) and (not auto_adapt_ok):
-                if not bool(AUTO_REAL_DISABLED_ALLOW_UNRELIABLE_POST_N15):
+                if not bool(AUTO_REAL_ALLOW_UNRELIABLE_POST_N15):
                     why_reasons.append("adapt_off")
                 if not post_n15:
                     why_reasons.append("n15_pending")
-                if n_samples_live < int(AUTO_REAL_DISABLED_UNRELIABLE_MIN_N):
-                    why_reasons.append(f"n<{int(AUTO_REAL_DISABLED_UNRELIABLE_MIN_N)}")
+                if n_samples_live < int(AUTO_REAL_UNRELIABLE_MIN_N):
+                    why_reasons.append(f"n<{int(AUTO_REAL_UNRELIABLE_MIN_N)}")
                 if best_prob < float(unrel_thr_live):
                     why_reasons.append(f"p_best<{float(unrel_thr_live)*100:.1f}%")
             if confirm_h < confirm_need_h:
@@ -12711,7 +12371,7 @@ def mostrar_panel(force: bool = False):
             trig_ok = bool(trigger_ok_h)
             rel_ok = bool(reliable)
             can_ok = bool(canary_live)
-            classic_ok = bool(best_prob >= float(AUTO_REAL_DISABLED_THR_MIN))
+            classic_ok = bool(best_prob >= float(AUTO_REAL_THR_MIN))
 
             p_diag = float(best_prob)
             p_model = float(best_prob)
@@ -12726,7 +12386,7 @@ def mostrar_panel(force: bool = False):
                 ("TRIG", trig_ok),
                 ("REL", rel_ok),
                 ("CAN", can_ok),
-                (f"CLASS{int(round(AUTO_REAL_DISABLED_THR_MIN*100))}", classic_ok),
+                (f"CLASS{int(round(AUTO_REAL_THR_MIN*100))}", classic_ok),
             ]
             funnel_txt = " | ".join([f"{k}{'✅' if v else '❌'}" for k, v in funnel_checks])
 
@@ -12737,7 +12397,7 @@ def mostrar_panel(force: bool = False):
                 ("TRIGGER", trig_ok, 0.0, ""),
                 ("RELIABLE", rel_ok, 0.0, ""),
                 ("CANARY", can_ok, 0.0, ""),
-                (f"CLASS{int(round(AUTO_REAL_DISABLED_THR_MIN*100))}", classic_ok, max(0.0, float(AUTO_REAL_DISABLED_THR_MIN) - best_prob), "%"),
+                (f"CLASS{int(round(AUTO_REAL_THR_MIN*100))}", classic_ok, max(0.0, float(AUTO_REAL_THR_MIN) - best_prob), "%"),
             ]
             principal = next((b for b in bloqueos if not b[1]), None)
             if principal is None:
@@ -12777,9 +12437,9 @@ def mostrar_panel(force: bool = False):
             print(padding + Fore.CYAN + decision_line)
             _runtime_audit_append(decision_line)
             if bool(HUD_COMPACT_MODE):
-                print(padding + Fore.CYAN + f"📏 Umbrales: UNREL={unrel_thr_live*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | CLASSIC={AUTO_REAL_DISABLED_THR_MIN*100:.0f}%")
+                print(padding + Fore.CYAN + f"📏 Umbrales: UNREL={unrel_thr_live*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | CLASSIC={AUTO_REAL_THR_MIN*100:.0f}%")
             else:
-                print(padding + Fore.CYAN + f"📏 Umbrales activos: OBS={umbral_obs*100:.0f}% | UNREL={unrel_thr_live*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | B-GATE={floor_gate_h*100:.1f}% | LIVE_MAX={live_peak_h*100:.1f}% (n={live_peak_n_h}) | CLASSIC={AUTO_REAL_DISABLED_THR_MIN*100:.0f}%")
+                print(padding + Fore.CYAN + f"📏 Umbrales activos: OBS={umbral_obs*100:.0f}% | UNREL={unrel_thr_live*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | B-GATE={floor_gate_h*100:.1f}% | LIVE_MAX={live_peak_h*100:.1f}% (n={live_peak_n_h}) | CLASSIC={AUTO_REAL_THR_MIN*100:.0f}%")
             bloqueos_line = f"📉 Bloqueo dominante ({len(HUD_BLOQUEOS_RECIENTES)} ticks): {top_txt}"
             print(padding + Fore.CYAN + bloqueos_line)
             _runtime_audit_append(bloqueos_line)
@@ -12888,13 +12548,14 @@ def mostrar_panel(force: bool = False):
             except Exception:
                 pass
 
-            dec_uni = _resolver_logica_unica_real([], estado_bots, BOT_NAMES, emitir_log=False)
+            emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
             print(
                 padding + Fore.CYAN +
-                f"🧪 LOGICA_UNICA_REAL: triggered={int(bool(dec_uni.get('triggered', False)))} "
-                f"bot={dec_uni.get('selected_bot') or '--'} caso={dec_uni.get('selected_case') or '--'} "
-                f"reason={dec_uni.get('reason') or '--'} valids={int(dec_uni.get('valids', 0) or 0)} "
-                f"greens={int(dec_uni.get('greens', 0) or 0)} reds={int(dec_uni.get('reds', 0) or 0)}"
+                f"🧪 Embudo: final={emb.get('decision_final','--')} risk={emb.get('risk_mode','--')} gate={emb.get('gate_quality','--')} "
+                f"top1={emb.get('top1_bot') or '--'}({float(emb.get('top1_prob',0.0) or 0.0)*100:.1f}%) "
+                f"top2={emb.get('top2_bot') or '--'} gap={float(emb.get('gap_value',0.0) or 0.0)*100:.1f}pp "
+                f"why={emb.get('decision_reason','--')} wait={emb.get('soft_wait_reason','') or '--'} "
+                f"hard={emb.get('hard_block_reason','') or '--'} deg={emb.get('degrade_from','--')}"
             )
 
             ref_racha = ultimo_bot_real if ultimo_bot_real in BOT_NAMES else "--"
@@ -13200,7 +12861,7 @@ def mostrar_panel(force: bool = False):
             modo_base = modo_map.get(modo, (modo.upper() if modo != "off" else "OFF"))
 
             if modo != "off":
-                if confianza >= AUTO_REAL_DISABLED_THR_MIN:
+                if confianza >= AUTO_REAL_THR_MIN:
                     modo_color = Fore.GREEN
                 elif confianza >= 0.55:
                     modo_color = Fore.YELLOW
@@ -13632,7 +13293,9 @@ def mostrar_advertencia_meta():
                         fut.result(timeout=15)
                     valor = obtener_valor_saldo()
                     if valor is not None:
-                        inicializar_saldo_real(float(valor))
+                        SALDO_INICIAL = round(valor, 2)
+                        META = round(SALDO_INICIAL * 1.20, 2)
+                        inicializar_saldo_real(SALDO_INICIAL)
                 except Exception as e:
                     print(f"⚠️ Error reiniciando meta: {e}")
                 pausado = False
@@ -13721,10 +13384,16 @@ PENDIENTE_FORZAR_EXPIRA = 0.0
 FORZAR_LOCK = threading.Lock()
 
 def condiciones_seguras_para(bot: str) -> bool:
-    decision = _resolver_logica_unica_real([], estado_bots, BOT_NAMES, emitir_log=False)
-    if not bool(decision.get("triggered", False)):
+    # Fuente operativa única: prob_ia_oper + estado final del embudo
+    thr = float(get_umbral_operativo())
+    prob = float(_prob_ia_operativa_bot(bot, default=0.0) or 0.0)
+    n = int(estado_bots.get(bot, {}).get("tamano_muestra", 0) or 0)
+    emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+    dec = str(emb.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
+    top1 = str(emb.get("top1_bot") or "")
+    if top1 and bot != top1:
         return False
-    return str(decision.get("selected_bot") or "") == str(bot or "")
+    return (n >= ORACULO_N_MIN) and (prob >= thr) and (dec in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO))
 
 # forzar_real_manual
 def forzar_real_manual(bot: str, ciclo: int):
@@ -13783,16 +13452,7 @@ def forzar_real_manual(bot: str, ciclo: int):
                 pass
 
 
-        requerido = float(MARTI_ESCALADO[ciclo - 1])
-        val = obtener_valor_saldo()
-        if val is None:
-            agregar_evento(f"⛔ Forzar REAL bloqueado en {bot}: saldo no disponible para ciclo #{ciclo}.")
-            return
-        if float(val) < float(requerido):
-            agregar_evento(f"⛔ Forzar REAL bloqueado en {bot}: saldo insuficiente {float(val):.2f} < {float(requerido):.2f} para ciclo #{ciclo}.")
-            return
-
-        if not escribir_orden_demo_neutralizado(bot, ciclo):
+        if not escribir_orden_real(bot, ciclo):
             agregar_evento(f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL.")
             return
 
@@ -13802,7 +13462,12 @@ def forzar_real_manual(bot: str, ciclo: int):
         marti_paso = ciclo - 1
         estado_bots[bot]["fuente"] = "MANUAL"
 
-        # escribir_orden_demo_neutralizado(...) ya dejó token+HUD sincronizados; evitamos doble token_sync.
+        requerido = float(MARTI_ESCALADO[ciclo - 1])
+        val = obtener_valor_saldo()
+        if val is None or val < requerido:
+            agregar_evento(f"⚠️ Saldo < requerido para ciclo #{ciclo} en {bot} (pide {requerido}). Intentando igual.")
+
+        # escribir_orden_real(...) ya dejó token+HUD sincronizados; evitamos doble token_sync.
         agregar_evento(f"⚡ Forzar REAL: {bot} → ciclo #{ciclo} (fuente=MANUAL)")
         with RENDER_LOCK:
             mostrar_panel()
@@ -13812,31 +13477,43 @@ def forzar_real_manual(bot: str, ciclo: int):
         FORZAR_LOCK.release()
 
 def evaluar_semaforo():
-    dec = _resolver_logica_unica_real([], estado_bots, BOT_NAMES, emitir_log=False)
-    reason = str(dec.get("reason") or "estructura_insuficiente")
-    top1 = str(dec.get("selected_bot") or "")
-    selected_case = str(dec.get("selected_case") or "--")
-    n = int(dec.get("valids", 0) or 0)
+    thr = float(get_umbral_operativo())
+    emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+    dec = str(emb.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
+    reason = str(emb.get("decision_reason", "--"))
+    top1 = str(emb.get("top1_bot") or "")
+    prob = float(emb.get("top1_prob", 0.0) or 0.0)
+    n = int(estado_bots.get(top1, {}).get("tamano_muestra", 0) or 0) if top1 else 0
 
     owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-    saldo_val = obtener_valor_saldo()
+    try:
+        saldo_val = float(obtener_valor_saldo() or 0.0)
+    except Exception:
+        saldo_val = 0.0
     costo = float(sum(MARTI_ESCALADO[:max(1, int(MAX_CICLOS))]))
     costo_c1 = float(MARTI_ESCALADO[0]) if MARTI_ESCALADO else 0.0
 
     if owner and owner not in (None, "none"):
         return "🟡", "AVISO", f"Token en uso por {owner}."
-    if saldo_val is None:
-        reason_txt = _saldo_status_text(SALDO_STATUS_REASON)
-        return "🟡", "SALDO DESCONOCIDO", f"{reason_txt}."
     if saldo_val < costo_c1:
         falta = costo_c1 - saldo_val
         return "🟡", "AVISO", f"Saldo < C1 ({costo_c1:.2f}). Faltan {falta:.2f} USD."
     if saldo_val < costo:
         return "🟡", "AVISO", f"Saldo parcial: cubre C1 pero no C1..C{int(MAX_CICLOS)} ({costo:.2f})."
 
-    if not bool(dec.get("triggered", False)):
-        return "🟡", "EN ESPERA", f"{reason}"
-    return "🟢", "SEÑAL LISTA", f"{top1} • caso={selected_case} • valids={n}"
+    if dec == EMBUDO_FINAL_BLOCK_HARD:
+        return "🔴", "BLOQUEO", f"{emb.get('hard_block_reason') or reason}"
+    if dec == EMBUDO_FINAL_WAIT_SOFT:
+        return "🟡", "EN ESPERA", f"{emb.get('soft_wait_reason') or reason}"
+    if dec == EMBUDO_FINAL_SHADOW_OK:
+        return "🔵", "SHADOW", f"{reason} (no ejecuta REAL)"
+    if dec in (EMBUDO_FINAL_REAL_MICRO, EMBUDO_FINAL_REAL_NORMAL):
+        if (not top1) or (prob < thr):
+            return "🟡", "EN ESPERA", f"Top1 no operativo ({top1 or '--'} p={prob:.0%}<{int(thr*100)}%)."
+        modo = "MICRO" if dec == EMBUDO_FINAL_REAL_MICRO else "NORMAL"
+        return "🟢", "SEÑAL LISTA", f"{top1} • ProbOper={prob:.0%} • n={n} • modo={modo}"
+
+    return "🟡", "EN ESPERA", f"Sin decisión embudo ({reason})."
 
 # NUEVAS FUNCIONES PARA RESET
 RESET_ON_START = False  # Cambiado a False para mantener historial entre sesiones
@@ -14207,7 +13884,7 @@ def set_etapa(codigo, detalle_extra=None, anunciar=False):
 # Nueva constante para watchdog de REAL - Bajado para más reactividad
 REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme
 REAL_STUCK_FORCE_RELEASE_S = 90  # segundos extra tras aviso para liberar REAL si no hay cierre
-REAL_TRIGGER_MIN = AUTO_REAL_DISABLED_THR_MIN  # alineado al piso base de 70% para arranque REAL
+REAL_TRIGGER_MIN = AUTO_REAL_THR_MIN  # alineado al piso base de 70% para arranque REAL
 
 # =========================================================
 # TECHO DINÁMICO + COMPUERTA REAL (anti-bug de activación baja)
@@ -14220,7 +13897,7 @@ DYN_ROOF_HOLD_TICKS = DYN_ROOF_BATCH_TICKS * DYN_ROOF_HOLD_BATCHES
 # Derretido lento del techo: -0.5pp por lote tras la paciencia
 DYN_ROOF_STEP = 0.010
 # Piso duro para REAL
-DYN_ROOF_FLOOR = AUTO_REAL_DISABLED_THR_MIN
+DYN_ROOF_FLOOR = AUTO_REAL_THR_MIN
 # Ventaja mínima del mejor vs segundo mejor
 DYN_ROOF_GAP = 0.02
 # Confirmación mínima (ticks consecutivos del MISMO bot)
@@ -14250,8 +13927,6 @@ DYN_ROOF_TIE_KEEP_CONFIRM_TOL = 0.003
 DYN_ROOF_GATE_REARM_HYST = 0.02
 DYN_ROOF_GATE_REARM_TICKS = 2
 DYN_ROOF_LOW_BAL_WARN_COOLDOWN_S = 60
-DYN_ROOF_GUARDRAIL_MIN_GAP_RELAXED = 0.01
-DYN_ROOF_GUARDRAIL_STRICT = False  # False = guardrail moderado, no cerebro principal.
 DYN_ROOF_STALL_TO_MODE_C_S = 2 * 60 * 60
 DYN_ROOF_MODE_C_FLOOR = 0.60
 DYN_ROOF_MODE_C_CONFIRM_TICKS = 2
@@ -14339,10 +14014,10 @@ def _todos_bots_con_n_minimo_real(min_n: int | None = None) -> bool:
 def _umbral_real_operativo_actual() -> float:
     """
     Umbral REAL dinámico con piso inteligente:
-    - En modo confiable: mantiene piso AUTO_REAL_DISABLED_THR_MIN.
+    - En modo confiable: mantiene piso AUTO_REAL_THR_MIN.
     - En unreliable con n mínimo por bot: habilita piso moderado temporal.
     """
-    piso_conf = float(AUTO_REAL_DISABLED_THR_MIN)
+    piso_conf = float(AUTO_REAL_THR_MIN)
     try:
         if _todos_bots_con_n_minimo_real():
             meta = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
@@ -14351,7 +14026,7 @@ def _umbral_real_operativo_actual() -> float:
             reliable = bool(meta.get("reliable", False)) and (not warmup)
 
             if (not reliable):
-                piso_unrel = float(max(0.50, float(AUTO_REAL_DISABLED_UNRELIABLE_FLOOR)))
+                piso_unrel = float(max(0.50, float(AUTO_REAL_UNRELIABLE_FLOOR)))
                 if n_samples >= int(IA_ACTIVACION_REAL_THR_POST_N15_UNREL_MIN_SAMPLES):
                     return float(max(piso_unrel, float(IA_ACTIVACION_REAL_THR_POST_N15_UNREL)))
                 return float(max(piso_unrel, float(IA_ACTIVACION_REAL_THR)))
@@ -14448,7 +14123,7 @@ def _calcular_micro_relax_unrel(force: bool = False) -> dict:
     global _UNREL_MICRO_RELAX_CACHE, _UNREL_MICRO_RELAX_LOG_TS
     out = {"delta": 0.0, "n": 0, "wr": 0.0, "active": False, "why": "off"}
     try:
-        if not bool(AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_ENABLE):
+        if not bool(AUTO_REAL_UNREL_MICRO_RELAX_ENABLE):
             return out
 
         now = time.time()
@@ -14496,28 +14171,28 @@ def _calcular_micro_relax_unrel(force: bool = False) -> dict:
                 continue
 
         n = len(closed)
-        if n < int(AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MIN_CLOSED):
+        if n < int(AUTO_REAL_UNREL_MICRO_RELAX_MIN_CLOSED):
             out.update({"n": n, "why": "n_low"})
             _UNREL_MICRO_RELAX_CACHE = {"ts": now, **out}
             return out
 
         wins = sum(y for y, _thr in closed)
         wr = float(wins / max(1, n))
-        if wr < float(AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MIN_WINRATE):
+        if wr < float(AUTO_REAL_UNREL_MICRO_RELAX_MIN_WINRATE):
             out.update({"n": n, "wr": wr, "why": "wr_low"})
             _UNREL_MICRO_RELAX_CACHE = {"ts": now, **out}
             return out
 
         # Delta gradual por muestra + calidad, acotado por MAX_DELTA.
-        wr_excess = max(0.0, wr - float(AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MIN_WINRATE))
+        wr_excess = max(0.0, wr - float(AUTO_REAL_UNREL_MICRO_RELAX_MIN_WINRATE))
         wr_gain = min(1.0, wr_excess / 0.20)
         n_gain = min(1.0, float(n) / 80.0)
-        delta = float(min(float(AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MAX_DELTA), float(AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_MAX_DELTA) * wr_gain * n_gain))
+        delta = float(min(float(AUTO_REAL_UNREL_MICRO_RELAX_MAX_DELTA), float(AUTO_REAL_UNREL_MICRO_RELAX_MAX_DELTA) * wr_gain * n_gain))
 
         out.update({"delta": delta, "n": n, "wr": wr, "active": bool(delta > 0.0), "why": "ok" if delta > 0.0 else "flat"})
         _UNREL_MICRO_RELAX_CACHE = {"ts": now, **out}
 
-        if out["active"] and ((now - float(_UNREL_MICRO_RELAX_LOG_TS or 0.0)) >= float(AUTO_REAL_DISABLED_UNREL_MICRO_RELAX_LOG_COOLDOWN_S)):
+        if out["active"] and ((now - float(_UNREL_MICRO_RELAX_LOG_TS or 0.0)) >= float(AUTO_REAL_UNREL_MICRO_RELAX_LOG_COOLDOWN_S)):
             _UNREL_MICRO_RELAX_LOG_TS = now
             try:
                 agregar_evento(f"🧪 UNREL micro-relax activo: -{delta*100:.1f}pp (n={n}, wr={wr*100:.1f}%).")
@@ -14532,17 +14207,17 @@ def _calcular_micro_relax_unrel(force: bool = False) -> dict:
 def _umbral_unrel_operativo(best_bot: str | None, best_prob: float | None = None) -> float:
     """
     Umbral UNREL operativo con 2 capas:
-    - base conservadora (AUTO_REAL_DISABLED_UNRELIABLE_MIN_PROB).
+    - base conservadora (AUTO_REAL_UNRELIABLE_MIN_PROB).
     - ajuste por lateral + percentil de prob reciente del bot (anti-congelamiento).
 
     Objetivo: no exigir 63% fijo cuando el modelo está bien discriminado en un rango
     más bajo (ej. 55-60%), evitando inflar artificialmente la probabilidad.
     """
     try:
-        base = float(AUTO_REAL_DISABLED_UNRELIABLE_MIN_PROB)
+        base = float(AUTO_REAL_UNRELIABLE_MIN_PROB)
         mr = _calcular_micro_relax_unrel(force=False)
         base = float(max(0.50, base - float(mr.get("delta", 0.0) or 0.0)))
-        if not bool(AUTO_REAL_DISABLED_UNREL_LATERAL_ADAPT_ENABLE):
+        if not bool(AUTO_REAL_UNREL_LATERAL_ADAPT_ENABLE):
             return base
         if not isinstance(best_bot, str) or (best_bot not in BOT_NAMES):
             return base
@@ -14554,12 +14229,12 @@ def _umbral_unrel_operativo(best_bot: str | None, best_prob: float | None = None
 
         # Capa 1: lateral clásico
         lateral_ok = bool(
-            (n_bot >= int(AUTO_REAL_DISABLED_UNREL_LATERAL_MIN_N))
-            and (wr_bot >= float(AUTO_REAL_DISABLED_UNREL_LATERAL_MIN_WR))
-            and (p_best >= float(AUTO_REAL_DISABLED_UNREL_LATERAL_MIN_PROB))
+            (n_bot >= int(AUTO_REAL_UNREL_LATERAL_MIN_N))
+            and (wr_bot >= float(AUTO_REAL_UNREL_LATERAL_MIN_WR))
+            and (p_best >= float(AUTO_REAL_UNREL_LATERAL_MIN_PROB))
         )
         if lateral_ok:
-            return float(max(float(AUTO_REAL_DISABLED_UNREL_LATERAL_MIN_PROB), min(base, p_best)))
+            return float(max(float(AUTO_REAL_UNREL_LATERAL_MIN_PROB), min(base, p_best)))
 
         # Capa 2: adaptación por distribución viva del bot (percentil robusto)
         hist = st.get("ia_prob_hist_raw", [])
@@ -14583,7 +14258,7 @@ def _umbral_unrel_operativo(best_bot: str | None, best_prob: float | None = None
 
         return base
     except Exception:
-        return float(AUTO_REAL_DISABLED_UNRELIABLE_MIN_PROB)
+        return float(AUTO_REAL_UNRELIABLE_MIN_PROB)
 
 
 def _actualizar_compuerta_techo_dinamico() -> dict:
@@ -14852,10 +14527,54 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             and (float(p_best) >= float(floor_eff - DYN_ROOF_TRIGGER_FORCE_MARGIN))
         )
 
-        # CUARENTENA FUNCIONAL: desactivar disparadores heredados de patrón/micro-soft.
         trigger_pattern = False
         trigger_soft = False
         trigger_ok_micro_soft = False
+        if modo_relajado_n15 and (not reliable_mode):
+            try:
+                ctx_best = _ultimo_contexto_operativo_bot(str(best_bot))
+                ok_pat, _why_pat = _micro_pattern_gate_ok(str(best_bot), ctx_best)
+                trigger_pattern = bool(ok_pat and (float(p_best) >= float(floor_eff)))
+
+                if bool(DYN_ROOF_UNRELIABLE_TRIGGER_SOFT_ENABLE):
+                    q3p, q2p = _pattern_v1_thresholds_proxy()
+                    _ps, _pb, _pp, _pt = pattern_score_operativo_v1(ctx_best or {}, q3p, q2p)
+                    suceso_idx_best = float(estado_bots.get(str(best_bot), {}).get("ia_suceso_idx", 0.0) or 0.0)
+                    near_roof_soft = bool(float(p_best) >= float(max(float(floor_eff), float(roof_eff - DYN_ROOF_UNRELIABLE_TRIGGER_SOFT_MARGIN))))
+                    confirm_soft = bool(int(confirm_streak) >= max(1, int(confirm_need) - 1))
+                    trigger_soft = bool(
+                        near_roof_soft
+                        and confirm_soft
+                        and ((suceso_idx_best >= float(DYN_ROOF_UNRELIABLE_TRIGGER_SOFT_MIN_SUCESO)) or (float(_pt) >= float(DYN_ROOF_UNRELIABLE_TRIGGER_SOFT_MIN_PATTERN)))
+                    )
+            except Exception:
+                trigger_pattern = False
+                trigger_soft = False
+        if modo_relajado_n15 and reliable_mode and bool(DYN_ROOF_RELIABLE_TRIGGER_SOFT_ENABLE):
+            try:
+                ctx_best_rel = _ultimo_contexto_operativo_bot(str(best_bot))
+                q3p_rel, q2p_rel = _pattern_v1_thresholds_proxy()
+                _ps_rel, _pb_rel, _pp_rel, _pt_rel = pattern_score_operativo_v1(ctx_best_rel or {}, q3p_rel, q2p_rel)
+                suceso_idx_best_rel = float(estado_bots.get(str(best_bot), {}).get("ia_suceso_idx", 0.0) or 0.0)
+                pat_state_rel = str(estado_bots.get(str(best_bot), {}).get("ia_pattern_col_state", "BLOQUEADO") or "BLOQUEADO")
+                near_roof_soft_rel = bool(
+                    float(p_best) >= float(max(float(floor_eff), float(roof_eff - DYN_ROOF_RELIABLE_TRIGGER_SOFT_MARGIN)))
+                )
+                confirm_soft_rel = bool(int(confirm_streak) >= max(1, int(confirm_need) - 1))
+                context_soft_rel = bool(
+                    (suceso_idx_best_rel >= float(DYN_ROOF_RELIABLE_TRIGGER_SOFT_MIN_SUCESO))
+                    or (float(_pt_rel) >= float(DYN_ROOF_RELIABLE_TRIGGER_SOFT_MIN_PATTERN))
+                    or (pat_state_rel == "CONTINUIDAD")
+                )
+                trigger_ok_micro_soft = bool(
+                    (n_samples_meta >= 300)
+                    and near_roof_soft_rel
+                    and confirm_soft_rel
+                    and bool(gap_ok)
+                    and context_soft_rel
+                )
+            except Exception:
+                trigger_ok_micro_soft = False
 
         if mode_c_active:
             trigger_ok = bool(suceso_ok)
@@ -14865,7 +14584,7 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             trigger_ok = bool(crossed_up)
         if warmup_mode and (not mode_c_active):
             # Modo precisión conservador: bloquear REAL en warmup.
-            if bool(AUTO_REAL_DISABLED_BLOCK_WHEN_WARMUP):
+            if bool(AUTO_REAL_BLOCK_WHEN_WARMUP):
                 trigger_ok = False
             else:
                 if not modo_relajado_n15:
@@ -14934,622 +14653,336 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         return out
 
 
-def _perfil_comun_flex_eval(bot: str) -> dict:
-    """Perfil flexible por similitud (familias de matriz), sin plantilla rígida."""
-    out = {
-        "ok": False,
-        "score": 0.0,
-        "score_family": 0.0,
-        "family_label": "INVALIDA",
-        "valid_40": 0,
-        "green_40": 0,
-        "green_16": 0,
-        "green_8": 0,
-        "indef_40": 0,
-        "end_red_streak": 0,
-        "red_clusters_ge3": 0,
-        "hard_block": False,
+def _registrar_estado_embudo(data: dict | None = None) -> dict:
+    """Persistencia del estado unificado del embudo para HUD/eventos."""
+    global EMBUDO_DECISION_STATE
+    base = {
+        "decision_final": EMBUDO_FINAL_WAIT_SOFT,
+        "decision_reason": "init",
+        "gate_quality": "weak",
+        "risk_mode": "WAIT_SOFT",
+        "hard_block_reason": "",
+        "soft_wait_reason": "",
+        "top1_bot": None,
+        "top2_bot": None,
+        "gap_value": 0.0,
+        "top1_prob": 0.0,
+        "top2_prob": 0.0,
+        "degrade_from": "none",
+        "ia_real_backed": 0,
+        "real_source": "IA",
+        "ia_model_mature": 0,
     }
     try:
-        st = estado_bots.get(str(bot), {}) if isinstance(estado_bots, dict) else {}
-        rr = list(st.get("resultados", []) or [])
-        if not rr:
-            return out
-        w = int(max(8, PERFIL_COMUN_FLEX_WINDOW))
-        tail = rr[-w:]
-        marks = [_resultado_to_mark(x) for x in tail]
-        valid = [m for m in marks if m in ("G", "R")]
-        valid_40 = int(len(valid))
-        green_40 = int(sum(1 for m in valid if m == "G"))
-        green_16 = int(sum(1 for m in marks[-16:] if m == "G"))
-        green_8 = int(sum(1 for m in marks[-8:] if m == "G"))
-        indef_40 = int(sum(1 for m in marks if m not in ("G", "R")))
-
-        end_red = 0
-        for m in reversed(marks):
-            if m == "R":
-                end_red += 1
-            elif m in ("G", None):
-                break
-
-        clusters_ge3 = 0
-        run_r = 0
-        for m in marks:
-            if m == "R":
-                run_r += 1
-            else:
-                if run_r >= 3:
-                    clusters_ge3 += 1
-                run_r = 0
-        if run_r >= 3:
-            clusters_ge3 += 1
-
-        cols = _construir_matriz_resultados_columnas(estado_bots, BOT_NAMES, window=w)
-        fam_tail = list(cols[:8] or [])
-        fam_ok = [c for c in fam_tail if c.get("green_ratio") is not None]
-        fam_ratio = float(sum(1 for c in fam_ok if float(c.get("green_ratio", 0.0) or 0.0) >= 0.50)) / float(max(1, len(fam_ok)))
-
-        g40_min = float(PERFIL_COMUN_FLEX_GREEN40_SOFT_MIN)
-        g40_max = float(PERFIL_COMUN_FLEX_GREEN40_SOFT_MAX)
-        g40_mid = (g40_min + g40_max) / 2.0
-        g40_half = max(1.0, (g40_max - g40_min) / 2.0)
-        score_g40 = float(max(0.0, 1.0 - (abs(float(green_40) - g40_mid) / g40_half)))
-        score_g8 = float(min(1.0, float(green_8) / float(max(1, PERFIL_COMUN_FLEX_GREEN8_SOFT_MIN))))
-        score_g16 = float(min(1.0, float(green_16) / float(max(1, PERFIL_COMUN_FLEX_GREEN16_SOFT_MIN))))
-        score_indef = float(max(0.0, 1.0 - (float(indef_40) / float(max(1, PERFIL_COMUN_FLEX_MAX_INDEF_40_SOFT)))))
-        score_red_end = float(max(0.0, 1.0 - (float(end_red) / float(max(1, PERFIL_COMUN_FLEX_MAX_END_RED_STREAK_HARD)))))
-        score_red_cluster = float(max(0.0, 1.0 - (float(clusters_ge3) / float(max(1, PERFIL_COMUN_FLEX_MAX_RED_CLUSTERS_GE3_HARD)))))
-        score_struct = float(max(0.0, min(1.0, 0.45 * score_indef + 0.30 * score_red_end + 0.25 * score_red_cluster)))
-        score_family = float(max(0.0, min(1.0, 0.70 * fam_ratio + 0.30 * score_struct)))
-        score = float(max(0.0, min(1.0, 0.35 * score_g40 + 0.20 * score_g8 + 0.20 * score_g16 + 0.25 * score_family)))
-        prev_8 = [m for m in marks[-16:-8] if m in ("G", "R")]
-        prev_8_green = int(sum(1 for m in prev_8 if m == "G"))
-        prev_8_rate = (float(prev_8_green) / float(max(1, len(prev_8)))) if prev_8 else 0.0
-        now_8_rate = float(green_8) / 8.0
-
-        hard_block = bool(
-            (end_red > int(PERFIL_COMUN_FLEX_MAX_END_RED_STREAK_HARD))
-            or (clusters_ge3 > int(PERFIL_COMUN_FLEX_MAX_RED_CLUSTERS_GE3_HARD))
-        )
-        ok = bool(
-            (valid_40 >= int(PERFIL_COMUN_FLEX_MIN_VALID))
-            and (not hard_block)
-            and (score >= float(PERFIL_COMUN_FLEX_SCORE_MIN))
-        )
-        continuity_ok = bool(
-            (green_40 >= int(PERFIL_COMUN_FLEX_GREEN40_SOFT_MIN))
-            and (green_40 <= int(PERFIL_COMUN_FLEX_GREEN40_SOFT_MAX))
-            and (green_8 >= int(PERFIL_COMUN_FLEX_GREEN8_SOFT_MIN))
-            and (end_red <= 1)
-            and (clusters_ge3 <= 1)
-        )
-        rebound_ok = bool(
-            (not hard_block)
-            and (green_8 >= int(PERFIL_COMUN_FLEX_GREEN8_SOFT_MIN))
-            and ((now_8_rate - prev_8_rate) >= 0.15)
-            and (end_red <= int(PERFIL_COMUN_FLEX_MAX_END_RED_STREAK_HARD))
-        )
-        family_label = "INVALIDA"
-        if ok:
-            if rebound_ok:
-                family_label = "REBOTE"
-            elif continuity_ok:
-                family_label = "CONTINUIDAD"
-            else:
-                family_label = "MIXTA"
-        out.update({
-            "ok": ok,
-            "score": score,
-            "score_family": score_family,
-            "family_label": str(family_label),
-            "valid_40": valid_40,
-            "green_40": green_40,
-            "green_16": green_16,
-            "green_8": green_8,
-            "indef_40": indef_40,
-            "end_red_streak": int(end_red),
-            "red_clusters_ge3": int(clusters_ge3),
-            "hard_block": hard_block,
-        })
-        return out
+        if isinstance(EMBUDO_DECISION_STATE, dict):
+            base.update(EMBUDO_DECISION_STATE)
     except Exception:
+        pass
+    if isinstance(data, dict):
+        base.update(data)
+    EMBUDO_DECISION_STATE = base
+    return EMBUDO_DECISION_STATE
+
+
+def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real: str, meta_live: dict | None) -> dict:
+    """Embudo unificado: selección -> calidad blanda -> modulación -> estado final."""
+    out = _registrar_estado_embudo({
+        "decision_final": EMBUDO_FINAL_WAIT_SOFT,
+        "decision_reason": "sin_candidatos",
+        "gate_quality": "weak",
+        "risk_mode": "WAIT_SOFT",
+        "soft_wait_reason": "sin_candidatos",
+        "hard_block_reason": "",
+        "top1_bot": None,
+        "top2_bot": None,
+        "gap_value": 0.0,
+        "top1_prob": 0.0,
+        "top2_prob": 0.0,
+        "degrade_from": "none",
+        "ia_real_backed": 0,
+        "real_source": "IA",
+        "ia_model_mature": 0,
+    })
+    if not candidatos:
         return out
-
-
-def _rankear_x_localmente(red_bots: list[str], cols: list[dict], estado: dict | None = None) -> list[dict]:
-    """Ranking local para caso 2X: estructura + ponderación operativa disponible."""
-    out = []
-    columnas = list(cols or [])
-    estado_bots = estado if isinstance(estado, dict) else {}
-    for bot in list(red_bots or []):
-        b = str(bot)
-        marks = [str((col or {}).get("cells", {}).get(b) or "") for col in columnas[:6]]
-        while len(marks) < 6:
-            marks.append("")
-        prev_1 = marks[1]
-        prev_2 = marks[2]
-        verdes_recientes = sum(1 for m in marks[1:6] if m == "G")
-        rojas_recientes = sum(1 for m in marks[1:6] if m == "R")
-        racha_roja_previa = 0
-        for m in marks[1:6]:
-            if m == "R":
-                racha_roja_previa += 1
-            else:
-                break
-        score_local = (
-            (100 if prev_1 == "G" else 0)
-            + (20 * int(verdes_recientes))
-            + (5 if prev_2 == "G" else 0)
-            - (12 * int(racha_roja_previa))
-            - (3 * int(rojas_recientes))
-        )
-        st = estado_bots.get(b, {}) if isinstance(estado_bots.get(b, {}), dict) else {}
-        prob_ia_oper = float(st.get("prob_ia_oper", st.get("prob_ia", 0.0)) or 0.0)
-        ia_score_hibrido = float(st.get("ia_score_hibrido", 0.0) or 0.0)
-        ia_evidence_wr = float(st.get("ia_evidence_wr", 0.0) or 0.0)
-        ia_evidence_n = float(st.get("ia_evidence_n", 0.0) or 0.0)
-        payout = float(st.get("payout", 0.0) or 0.0)
-        score_operativo = (
-            (35.0 * prob_ia_oper)
-            + (25.0 * ia_score_hibrido)
-            + (15.0 * ia_evidence_wr)
-            + (0.6 * min(20.0, max(0.0, ia_evidence_n)))
-            + (8.0 * payout)
-        )
-        score_final_hibrido = float(score_local) + float(score_operativo)
-        out.append({
-            "bot": b,
-            "score_local": float(score_local),
-            "score_operativo": float(score_operativo),
-            "score_final_hibrido": float(score_final_hibrido),
-            "prev_1": prev_1,
-            "prev_2": prev_2,
-            "verdes_recientes": int(verdes_recientes),
-            "rojas_recientes": int(rojas_recientes),
-            "racha_roja_previa": int(racha_roja_previa),
-            "prob_ia_oper": float(prob_ia_oper),
-            "ia_score_hibrido": float(ia_score_hibrido),
-            "ia_evidence_wr": float(ia_evidence_wr),
-            "ia_evidence_n": float(ia_evidence_n),
-            "payout": float(payout),
-        })
-    out.sort(key=lambda r: (-float(r.get("score_final_hibrido", 0.0) or 0.0), str(r.get("bot", ""))))
-    return out
-
-
-
-
-def _trade_key_lxv_sync(row: dict) -> str:
-    rid = str((row or {}).get("ia_decision_id", "") or "").strip()
-    if rid:
-        return rid
-    parts = [
-        str((row or {}).get("activo", "") or "").strip().upper(),
-        str((row or {}).get("direction", row.get("direccion", "")) or "").strip().upper(),
-        str((row or {}).get("epoch", "") or "").strip(),
-        str((row or {}).get("ciclo_martingala", row.get("ciclo", "")) or "").strip(),
-    ]
-    return "|".join(parts)
-
-
-def _extraer_rondas_cerradas_bot(bot: str, max_rounds: int = 120) -> dict:
-    """Extrae rondas ordinales cerradas (fuente de verdad LXV_SYNC) desde CSV enriquecido."""
-    out = {"bot": str(bot), "rounds": [], "pending_open": False, "total_closed": 0}
-    ruta = f"registro_enriquecido_{bot}.csv"
-    if not os.path.exists(ruta):
-        return out
-    rec = {}
-    seq = []
     try:
-        with open(ruta, "r", encoding="utf-8", newline="") as fh:
-            reader = csv.DictReader(fh)
-            for raw in reader:
-                row = canonicalizar_campos_bot_maestro(dict(raw or {}))
-                key = _trade_key_lxv_sync(row)
-                if not key:
-                    continue
-                cur = rec.get(key, {"has_pre": False, "close": None})
-                tsn = normalizar_trade_status(row.get("trade_status_norm", None) or row.get("trade_status", None))
-                if tsn in ("PRE_TRADE", "PENDIENTE", "OPEN", "ABIERTO"):
-                    cur["has_pre"] = True
-                if tsn == "CERRADO":
-                    res = _resultado_cierre_desde_fila(row)
-                    if res in ("GANANCIA", "PÉRDIDA"):
-                        close = dict(row)
-                        close["resultado_norm"] = res
-                        cur["close"] = close
-                        if key not in seq:
-                            seq.append(key)
-                rec[key] = cur
-    except Exception:
-        return out
+        ordered = sorted(candidatos, key=lambda x: float(x[2] if len(x) > 2 else 0.0), reverse=True)
+        top1 = ordered[0]
+        top2 = ordered[1] if len(ordered) > 1 else None
+        top1_bot = str(top1[1])
+        top1_prob = float(top1[2] or 0.0)
+        top2_bot = str(top2[1]) if top2 else None
+        top2_prob = float(top2[2] or 0.0) if top2 else 0.0
+        gap_value = float(top1_prob - top2_prob)
 
-    pending = False
-    rounds = []
-    for key in seq:
-        cur = rec.get(key, {})
-        close = cur.get("close")
-        if not close:
-            continue
-        res = str(close.get("resultado_norm") or "")
-        mark = _resultado_to_mark(res)
-        if mark not in ("G", "R"):
-            continue
-        rounds.append({
-            "round": len(rounds) + 1,
-            "key": key,
-            "mark": mark,
-            "resultado": res,
-            "epoch": _to_epoch_ctt(close.get("epoch")) or _to_epoch_ctt(close.get("ts")) or 0.0,
-        })
-    for cur in rec.values():
-        if bool(cur.get("has_pre")) and not bool(cur.get("close")):
-            pending = True
-            break
+        dgate = dyn_gate if isinstance(dyn_gate, dict) else {}
+        allow_real = bool(dgate.get("allow_real", False))
+        trigger_ok = bool(dgate.get("trigger_ok", False))
+        gap_ok = bool(dgate.get("gap_ok", False))
+        floor_eff = float(dgate.get("floor_eff", 0.0) or 0.0)
+        confirm_need = int(dgate.get("confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
+        confirm_streak = int(dgate.get("confirm_streak", 0) or 0)
+        confirm_ok = bool(confirm_streak >= confirm_need)
 
-    if max_rounds > 0 and len(rounds) > max_rounds:
-        rounds = rounds[-int(max_rounds):]
-        base = len(rounds)
-        for i, r in enumerate(rounds, start=1):
-            r["round"] = i
-    out["rounds"] = rounds
-    out["pending_open"] = bool(pending)
-    out["total_closed"] = int(len(rounds))
-    return out
-
-
-def _construir_columna_lxv_sincronizada(estado: dict, bots: list[str], max_rounds: int = 120) -> dict:
-    """Construye columna LXV estrictamente sincronizada por round_id (ACK)."""
-    bot_list = [str(b) for b in list(bots or []) if str(b).strip()]
-    if not bot_list:
-        return {"ready": False, "reason": "sin_bots", "round": 0, "cells": {}, "missing_bots": []}
-
-    # 1) Fuente primaria: ACK de barrera por round_id (misma foto lógica para todos).
-    try:
-        st_bar = leer_barrier_state() or {}
-        round_id = int(st_bar.get("current_round", 0) or 0)
-    except Exception:
-        st_bar, round_id = {}, 0
-
-    if round_id > 0:
-        cells = {}
-        valids = greens = reds = 0
-        red_bots = []
-        missing_bots = []
-        pending_bots = []
-        for b in bot_list:
-            ack = leer_ack_ronda_bot(str(b), round_id) or {}
-            ack_round = int(ack.get("round_id", 0) or 0)
-            ack_status = str(ack.get("status", "")).strip().upper()
-            ack_pending = bool(ack.get("pending_open", False))
-            ack_defined = bool(ack.get("resultado_definido", False))
-            res_norm = str(ack.get("resultado_norm", ack.get("resultado", "")) or "").strip().upper()
-            mark = None
-            if ack_round == round_id and ack_status == "CERRADO" and (not ack_pending) and ack_defined:
-                if res_norm in ("GANANCIA", "WIN", "G"):
-                    mark = "G"
-                elif res_norm in ("PERDIDA", "PÉRDIDA", "LOSS", "R", "X"):
-                    mark = "R"
-            cells[b] = mark
-            if ack_pending:
-                pending_bots.append(str(b))
-            if mark is None:
-                missing_bots.append(str(b))
-            elif mark == "G":
-                greens += 1
-                valids += 1
-            elif mark == "R":
-                reds += 1
-                valids += 1
-                red_bots.append(str(b))
-
-        if valids > 0:
-            return {
-                "ready": bool(valids == len(bot_list)),
-                "reason": "ok" if valids == len(bot_list) else "round_incompleta",
-                "round": int(round_id),
-                "cells": cells,
-                "total_validos": int(valids),
-                "total_verdes": int(greens),
-                "total_rojos": int(reds),
-                "red_bots": red_bots,
-                "missing_bots": missing_bots,
-                "pending_bots": pending_bots,
-                "data": {},
-            }
-
-    if bool(LXV_CORE_ENABLE):
-        return {
-            "ready": False,
-            "reason": "round_incompleta",
-            "round": int(round_id if round_id > 0 else 1),
-            "cells": {},
-            "total_validos": 0,
-            "total_verdes": 0,
-            "total_rojos": 0,
-            "red_bots": [],
-            "missing_bots": bot_list,
-            "pending_bots": [],
-            "data": {},
-        }
-
-    # 2) Fallback legado: columna ordinal cerrada común (solo cuando LXV_CORE está desactivado).
-    data = {b: _extraer_rondas_cerradas_bot(b, max_rounds=max_rounds) for b in bot_list}
-    pending_bots = [b for b, d in data.items() if bool(d.get("pending_open", False))]
-    if pending_bots:
-        return {"ready": False, "reason": "pendiente_abierta", "round": 0, "cells": {}, "pending_bots": pending_bots, "data": data}
-
-    counts = {b: int(len((d or {}).get("rounds", []) or [])) for b, d in data.items()}
-    common_round = min(counts.values()) if counts else 0
-    missing = [b for b, c in counts.items() if int(c) < int(common_round)]
-    if common_round <= 0:
-        missing = [b for b, c in counts.items() if int(c) <= 0]
-        return {"ready": False, "reason": "round_incompleta", "round": 1, "cells": {}, "missing_bots": missing, "data": data}
-
-    cells = {}
-    valids = greens = reds = 0
-    red_bots = []
-    for b in bot_list:
-        rounds = list((data.get(b) or {}).get("rounds", []) or [])
-        ent = rounds[common_round - 1] if len(rounds) >= common_round else None
-        mark = ent.get("mark") if isinstance(ent, dict) else None
-        cells[b] = mark
-        if mark == "G":
-            greens += 1; valids += 1
-        elif mark == "R":
-            reds += 1; valids += 1; red_bots.append(b)
-
-    return {
-        "ready": bool(valids == len(bot_list)),
-        "reason": "ok" if valids == len(bot_list) else "round_incompleta",
-        "round": int(common_round),
-        "cells": cells,
-        "total_validos": int(valids),
-        "total_verdes": int(greens),
-        "total_rojos": int(reds),
-        "red_bots": red_bots,
-        "missing_bots": missing,
-        "pending_bots": [],
-        "data": data,
-    }
-
-
-def _peso_probabilistico_bot(bot: str, estado: dict | None = None) -> float:
-    st = (estado or {}).get(str(bot), {}) if isinstance(estado, dict) else {}
-    prob_ia_oper = float(st.get("prob_ia_oper", st.get("prob_ia", 0.0)) or 0.0)
-    ia_score_hibrido = float(st.get("ia_score_hibrido", 0.0) or 0.0)
-    ia_evidence_wr = float(st.get("ia_evidence_wr", 0.0) or 0.0)
-    ia_evidence_n = float(st.get("ia_evidence_n", 0.0) or 0.0)
-    payout = float(st.get("payout", 0.0) or 0.0)
-    return float((35.0 * prob_ia_oper) + (25.0 * ia_score_hibrido) + (15.0 * ia_evidence_wr) + (0.6 * min(20.0, max(0.0, ia_evidence_n))) + (8.0 * payout))
-
-
-def _resolver_lxv_sincronizado(candidatos: list, estado: dict, bot_names: list[str], emitir_log: bool = True) -> dict:
-    out = {
-        "triggered": False, "selected_bot": None, "selected_case": None, "selected_score": 0.0,
-        "reason": "estructura_insuficiente", "valids": 0, "greens": 0, "reds": 0,
-        "red_bots": [], "round": 0, "missing_bots": [], "pending_bots": [], "cells": {},
-    }
-    try:
-        bots = [str(b) for b in list(bot_names or []) if str(b).strip()]
-        sync = _construir_columna_lxv_sincronizada(estado if isinstance(estado, dict) else {}, bots, max_rounds=120)
-        out["round"] = int(sync.get("round", 0) or 0)
-        out["cells"] = dict(sync.get("cells", {}) or {})
-        out["missing_bots"] = list(sync.get("missing_bots", []) or [])
-        out["pending_bots"] = list(sync.get("pending_bots", []) or [])
-        if sync.get("reason") == "pendiente_abierta":
-            out["reason"] = "pendiente_abierta"
-            if emitir_log:
-                agregar_evento(f"LXV_SYNC_SKIP: ronda={int(out['round'] or 0)} | motivo=pendiente_abierta")
-            return out
-        if not bool(sync.get("ready", False)):
-            out["reason"] = "round_incompleta"
-            if emitir_log:
-                agregar_evento(f"LXV_SYNC_WAIT: ronda={int((out['round'] or 0) + 1)} | faltan_bots={','.join(out['missing_bots']) or '-'}")
-            return out
-
-        valids = int(sync.get("total_validos", 0) or 0)
-        greens = int(sync.get("total_verdes", 0) or 0)
-        reds = int(sync.get("total_rojos", 0) or 0)
-        red_bots = list(sync.get("red_bots", []) or [])
-        n_bots = len(bots)
-        min_greens = 3 if n_bots == 5 else max(3, n_bots - 2)
-
-        out.update({"valids": valids, "greens": greens, "reds": reds, "red_bots": red_bots})
-        if emitir_log:
-            agregar_evento(f"LXV_SYNC_READY: ronda={int(out['round'])} | greens={greens} | reds={reds}")
-
-        if valids != n_bots:
-            out["reason"] = "validos_incompletos"
-        elif greens < min_greens:
-            out["reason"] = "menos_de_3_verdes"
-        elif reds not in (1, 2):
-            out["reason"] = "x_fuera_de_rango"
+        quality = "weak"
+        if allow_real and trigger_ok and confirm_ok:
+            quality = "strong"
+        elif (allow_real and trigger_ok) or (allow_real and confirm_ok):
+            quality = "medium"
+        elif allow_real or trigger_ok or confirm_streak > 0:
+            quality = "weak"
         else:
-            if reds == 1:
-                sel = str(red_bots[0])
-                out.update({"triggered": True, "selected_bot": sel, "selected_case": "1X", "selected_score": 120.0, "reason": "3verdes_1X_sync"})
-            else:
-                ranking = []
-                for b in red_bots:
-                    ranking.append({"bot": str(b), "score": _peso_probabilistico_bot(str(b), estado)})
-                ranking.sort(key=lambda x: (-float(x.get("score", 0.0)), str(x.get("bot", ""))))
-                if ranking:
-                    out.update({"triggered": True, "selected_bot": str(ranking[0]["bot"]), "selected_case": "2X", "selected_score": float(ranking[0]["score"]), "reason": "3verdes_2X_peso_sync"})
-                else:
-                    out["reason"] = "sin_candidato_local"
+            quality = "wait"
 
-        if emitir_log:
-            if out.get("triggered"):
-                agregar_evento(
-                    f"LXV_SYNC_CANDIDATE: SI | ronda={int(out['round'])} | bot={out.get('selected_bot')} | case={out.get('selected_case')}"
-                )
+        decision = EMBUDO_FINAL_WAIT_SOFT
+        reason = f"gate:{quality}"
+        risk_mode = "WAIT_SOFT"
+        soft_wait_reason = ""
+
+        if quality == "strong":
+            decision = EMBUDO_FINAL_REAL_NORMAL
+            risk_mode = "REAL_NORMAL"
+        elif quality == "medium":
+            decision = EMBUDO_FINAL_REAL_MICRO
+            risk_mode = "REAL_MICRO"
+        elif quality == "weak":
+            decision = EMBUDO_FINAL_SHADOW_OK
+            risk_mode = "SHADOW_OK"
+        else:
+            soft_wait_reason = "gate_wait"
+
+        meta = meta_live if isinstance(meta_live, dict) else {}
+        n_samples = int(meta.get("n_samples", meta.get("n", 0)) or 0)
+        reliable = bool(meta.get("reliable", False))
+        canary = bool(meta.get("canary_mode", False))
+        auc = float(meta.get("auc", 0.0) or 0.0)
+        warmup_mode = bool(meta.get("warmup_mode", n_samples < int(TRAIN_WARMUP_MIN_ROWS)))
+        model_family = str(meta.get("model_family", "") or "").strip().lower()
+        ia_model_mature = bool((not warmup_mode) and reliable and (model_family != "sklearn_logreg_fallback"))
+        degrade_from = "none"
+
+        if canary and decision == EMBUDO_FINAL_REAL_NORMAL:
+            decision = EMBUDO_FINAL_REAL_MICRO
+            risk_mode = "REAL_MICRO"
+            degrade_from = "canary"
+            reason = "canary->micro"
+
+        if bool(AUTO_REAL_BLOCK_WHEN_WARMUP) and warmup_mode and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            decision = EMBUDO_FINAL_SHADOW_OK
+            risk_mode = "SHADOW_OK"
+            degrade_from = "warmup"
+            reason = "warmup->shadow"
+        if not reliable:
+            if decision == EMBUDO_FINAL_REAL_NORMAL:
+                decision = EMBUDO_FINAL_REAL_MICRO
+                risk_mode = "REAL_MICRO"
+                degrade_from = "unreliable"
+                reason = "unreliable->micro"
+            elif decision == EMBUDO_FINAL_REAL_MICRO:
+                decision = EMBUDO_FINAL_SHADOW_OK
+                risk_mode = "SHADOW_OK"
+                degrade_from = "unreliable"
+                reason = "unreliable->shadow"
+
+        if (not ia_model_mature) and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            decision = EMBUDO_FINAL_SHADOW_OK
+            risk_mode = "SHADOW_OK"
+            if warmup_mode:
+                degrade_from = "ia_immature_warmup"
+                reason = "ia_immature_warmup->shadow"
+            elif model_family == "sklearn_logreg_fallback":
+                degrade_from = "ia_immature_fallback"
+                reason = "ia_fallback->shadow"
             else:
-                agregar_evento(f"LXV_SYNC_CANDIDATE: NO | ronda={int(out['round'])} | motivo={out.get('reason')}")
-        return out
+                degrade_from = "ia_immature_unreliable"
+                reason = "ia_unreliable->shadow"
+
+        if (not ia_model_mature) and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            decision = EMBUDO_FINAL_SHADOW_OK
+            risk_mode = "SHADOW_OK"
+            if warmup_mode:
+                degrade_from = "ia_immature_warmup"
+                reason = "ia_immature_warmup->shadow"
+            elif model_family == "sklearn_logreg_fallback":
+                degrade_from = "ia_immature_fallback"
+                reason = "ia_fallback->shadow"
+            else:
+                degrade_from = "ia_immature_unreliable"
+                reason = "ia_unreliable->shadow"
+
+        if (not ia_model_mature) and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            decision = EMBUDO_FINAL_SHADOW_OK
+            risk_mode = "SHADOW_OK"
+            if warmup_mode:
+                degrade_from = "ia_immature_warmup"
+                reason = "ia_immature_warmup->shadow"
+            elif model_family == "sklearn_logreg_fallback":
+                degrade_from = "ia_immature_fallback"
+                reason = "ia_fallback->shadow"
+            else:
+                degrade_from = "ia_immature_unreliable"
+                reason = "ia_unreliable->shadow"
+
+        if (not ia_model_mature) and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            decision = EMBUDO_FINAL_SHADOW_OK
+            risk_mode = "SHADOW_OK"
+            if warmup_mode:
+                degrade_from = "ia_immature_warmup"
+                reason = "ia_immature_warmup->shadow"
+            elif model_family == "sklearn_logreg_fallback":
+                degrade_from = "ia_immature_fallback"
+                reason = "ia_fallback->shadow"
+            else:
+                degrade_from = "ia_immature_unreliable"
+                reason = "ia_unreliable->shadow"
+
+        # Prudencia extra en Martingala avanzada C2..C{MAX_CICLOS}: exigir contexto vivo.
+        try:
+            ciclo_adv = int(ciclo_martingala_siguiente())
+        except Exception:
+            ciclo_adv = 1
+        if ciclo_adv > 1 and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            confirm_bot = str(dgate.get("confirm_bot", DYN_ROOF_STATE.get("confirm_bot", "")) or "")
+            confirm_streak_adv = int(dgate.get("confirm_streak", DYN_ROOF_STATE.get("confirm_streak", 0)) or 0)
+            trigger_adv = bool(dgate.get("trigger_ok", False))
+            allow_adv = bool(dgate.get("allow_real", False))
+            if (not allow_adv) or (not trigger_adv) or (confirm_streak_adv < max(1, confirm_need)) or (confirm_bot and confirm_bot != top1_bot):
+                decision = EMBUDO_FINAL_WAIT_SOFT
+                risk_mode = "WAIT_SOFT"
+                soft_wait_reason = "marti_contexto_degradado"
+                degrade_from = "marti_context"
+                reason = f"marti_C{ciclo_adv}_contexto"
+
+        # Consistencia explícita: no permitir doble ganador entre dyn_gate y embudo.
+        best_dyn = str(dgate.get("best_bot", "") or "").strip()
+        if best_dyn and (best_dyn != top1_bot):
+            decision = EMBUDO_FINAL_WAIT_SOFT
+            risk_mode = "WAIT_SOFT"
+            soft_wait_reason = "best_bot_mismatch"
+            reason = f"best_bot_mismatch:{best_dyn}!={top1_bot}"
+
+        # Modulador Pattern V1: aporta contexto/calidad, no veto principal.
+        try:
+            ctx_top = _ultimo_contexto_operativo_bot(top1_bot)
+            ok_pat, why_pat = _micro_pattern_gate_ok(top1_bot, ctx_top)
+            if not ok_pat and decision == EMBUDO_FINAL_REAL_NORMAL:
+                decision = EMBUDO_FINAL_REAL_MICRO
+                risk_mode = "REAL_MICRO"
+                degrade_from = "pattern_v1"
+                reason = f"pattern->{why_pat}"
+            elif (not ok_pat) and decision == EMBUDO_FINAL_REAL_MICRO:
+                decision = EMBUDO_FINAL_SHADOW_OK
+                risk_mode = "SHADOW_OK"
+                degrade_from = "pattern_v1"
+                reason = f"pattern_shadow:{why_pat}"
+        except Exception:
+            pass
+
+        # CTT (fase previa): completamente neutralizado en decisión operativa.
+        hard_guard_state = _estado_guardrail_ia_fuerte(force=False)
+        hard_guard_hard_block = bool(hard_guard_state.get("hard_block", False))
+        cooldown_active = bool(time.time() < float(REAL_COOLDOWN_UNTIL_TS))
+
+        if hard_guard_hard_block and (not reliable) and (auc < 0.50) and (n_samples < int(TRAIN_WARMUP_MIN_ROWS)):
+            decision = EMBUDO_FINAL_BLOCK_HARD
+            risk_mode = "BLOCK_HARD"
+            reason = "guardrail_hard"
+            out_hard = "guardrail_hard"
+        else:
+            out_hard = ""
+
+        if cooldown_active and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            decision = EMBUDO_FINAL_WAIT_SOFT
+            risk_mode = "WAIT_SOFT"
+            soft_wait_reason = "cooldown"
+            reason = "cooldown"
+
+        confirm_deficit = int(max(0, int(confirm_need) - int(confirm_streak)))
+        near_prob_floor = float(max(float(floor_eff), float(AUTO_REAL_UNRELIABLE_GATE_MIN_PROB) - float(AUTO_REAL_MICRO_EARLY_CONFIRM_MARGIN)))
+        denied_by_early_confirm_only = bool(
+            decision in (EMBUDO_FINAL_WAIT_SOFT, EMBUDO_FINAL_SHADOW_OK)
+            and (not allow_real)
+            and trigger_ok
+            and gap_ok
+            and (confirm_streak < confirm_need)
+            and (soft_wait_reason not in ("marti_contexto_degradado", "best_bot_mismatch", "cooldown"))
+        )
+        if (
+            bool(AUTO_REAL_MICRO_EARLY_CONFIRM_ENABLE)
+            and (estado_real in ("SHADOW", "MICRO"))
+            and bool(top1_bot)
+            and denied_by_early_confirm_only
+            and (confirm_deficit <= int(AUTO_REAL_MICRO_EARLY_CONFIRM_DEFICIT_MAX))
+            and (int(confirm_streak) >= max(0, int(confirm_need) - 1))
+            and (top1_prob >= near_prob_floor)
+            and (not cooldown_active)
+            and (not hard_guard_hard_block)
+        ):
+            decision = EMBUDO_FINAL_REAL_MICRO
+            risk_mode = "REAL_MICRO"
+            reason = "oper_override_micro_early_confirm"
+            soft_wait_reason = ""
+            degrade_from = "oper_override_micro_early_confirm"
+
+        trigger_ok_micro_soft = bool(
+            bool(dgate.get("trigger_ok_micro_soft", False))
+            and (decision in (EMBUDO_FINAL_WAIT_SOFT, EMBUDO_FINAL_SHADOW_OK))
+            and (estado_real in ("MICRO", "SHADOW"))
+            and (not cooldown_active)
+            and (not hard_guard_hard_block)
+            and (soft_wait_reason not in ("marti_contexto_degradado", "best_bot_mismatch", "cooldown"))
+        )
+        if trigger_ok_micro_soft:
+            decision = EMBUDO_FINAL_REAL_MICRO
+            risk_mode = "REAL_MICRO"
+            reason = "micro_soft_context_ok"
+            soft_wait_reason = ""
+            if degrade_from == "none":
+                degrade_from = "micro_soft_context_ok"
+
+        if estado_real == "SHADOW" and decision in (EMBUDO_FINAL_WAIT_SOFT, EMBUDO_FINAL_SHADOW_OK):
+            ok_shadow_micro, why_shadow_micro = _shadow_micro_gate_ok(candidatos, dgate)
+            if ok_shadow_micro:
+                decision = EMBUDO_FINAL_REAL_MICRO
+                risk_mode = "REAL_MICRO"
+                reason = "shadow_micro_gate"
+                soft_wait_reason = ""
+                if degrade_from == "none":
+                    degrade_from = "shadow_micro_gate"
+
+        if estado_real == "SHADOW" and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            decision = EMBUDO_FINAL_REAL_MICRO if decision == EMBUDO_FINAL_REAL_NORMAL else decision
+            risk_mode = "REAL_MICRO"
+            if degrade_from == "none":
+                degrade_from = "shadow_mode"
+        if estado_real == "MICRO" and decision == EMBUDO_FINAL_REAL_NORMAL:
+            decision = EMBUDO_FINAL_REAL_MICRO
+            risk_mode = "REAL_MICRO"
+            if degrade_from == "none":
+                degrade_from = "micro_mode"
+
+        ia_real_backed = int(decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO) and ia_model_mature)
+        real_source = "IA" if ia_real_backed else "OPERATIVO_NO_IA"
+
+        return _registrar_estado_embudo({
+            "decision_final": decision,
+            "decision_reason": reason,
+            "gate_quality": quality,
+            "risk_mode": risk_mode,
+            "hard_block_reason": out_hard,
+            "soft_wait_reason": soft_wait_reason,
+            "top1_bot": top1_bot,
+            "top2_bot": top2_bot,
+            "gap_value": gap_value,
+            "top1_prob": top1_prob,
+            "top2_prob": top2_prob,
+            "degrade_from": degrade_from,
+            "ia_real_backed": int(ia_real_backed),
+            "real_source": str(real_source),
+            "ia_model_mature": int(ia_model_mature),
+        })
     except Exception:
-        out["reason"] = "estructura_insuficiente"
-        if emitir_log:
-            agregar_evento(f"LXV_SYNC_CANDIDATE: NO | ronda={int(out.get('round', 0) or 0)} | motivo=estructura_insuficiente")
-        return out
-
-
-def _build_lxv_sync_snapshot_id(round_lxv: int, cells: dict, selected_bot: str, selected_case: str) -> tuple[str, str]:
-    cells_norm = {str(k): str(v) for k, v in sorted((cells or {}).items(), key=lambda kv: str(kv[0]))}
-    raw = json.dumps(
-        {
-            "round_lxv": int(round_lxv or 0),
-            "cells": cells_norm,
-            "selected_bot": str(selected_bot or ""),
-            "selected_case": str(selected_case or ""),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
-    return f"lxv-{int(round_lxv or 0)}-{digest[:16]}", digest
-
-
-
-
-# Compat temporal (naming previo LXB)
-def _trade_key_lxb_sync(row: dict) -> str:
-    return _trade_key_lxv_sync(row)
-
-
-def _construir_columna_lxb_sincronizada(estado: dict, bots: list[str], max_rounds: int = 120) -> dict:
-    return _construir_columna_lxv_sincronizada(estado, bots, max_rounds=max_rounds)
-
-
-def _resolver_lxb_sincronizado(candidatos: list, estado: dict, bot_names: list[str], emitir_log: bool = True) -> dict:
-    return _resolver_lxv_sincronizado(candidatos, estado, bot_names, emitir_log=emitir_log)
-
-def _resolver_logica_unica_real(candidatos: list, estado: dict, bot_names: list[str], emitir_log: bool = True) -> dict:
-    """LOGICA_VERDE_X_PONDERADA: promover a REAL con mínimo 4 verdes + 1/2 X."""
-    out = {
-        "triggered": False,
-        "selected_bot": None,
-        "selected_case": None,
-        "selected_offset": None,
-        "selected_score": 0.0,
-        "reason": "estructura_insuficiente",
-        "valids": 0,
-        "greens": 0,
-        "reds": 0,
-        "red_bots": [],
-        "ranking_debug": [],
-        "reasons_by_offset": {},
-        "candidates_considered": [],
-    }
-    try:
-        bots = list(bot_names or [])
-        cols = _construir_matriz_resultados_columnas(estado if isinstance(estado, dict) else {}, bots, window=40)
-        if not cols:
-            out["reason"] = "sin_columnas"
-            return out
-        reasons_by_offset = {}
-        candidates_ok = []
-        max_offsets = min(4, len(cols))
-        for offset in range(max_offsets):
-            col = dict(cols[offset] or {})
-            valids = int(col.get("total_validos", 0) or 0)
-            greens = int(col.get("total_verdes", 0) or 0)
-            reds = int(col.get("total_rojos", 0) or 0)
-            cells = dict(col.get("cells", {}) or {})
-            red_bots = [str(b) for b, m in cells.items() if str(b) in bots and m == "R"]
-            motivo = "ok"
-            if valids < 4:
-                motivo = "validos_insuficientes"
-            elif greens < 4:
-                motivo = "menos_de_4_verdes"
-            elif reds == 0:
-                motivo = "sin_rojos"
-            elif reds > 2:
-                motivo = "mas_de_2_X"
-            elif reds not in (1, 2):
-                motivo = "estructura_insuficiente"
-            elif len(red_bots) != reds:
-                motivo = "inconsistencia_rojos"
-            if motivo != "ok":
-                reasons_by_offset[offset] = motivo
-                continue
-
-            offset_score = 100.0 - (float(offset) * 12.0)
-            if reds == 1:
-                selected_bot = str(red_bots[0]) if red_bots else ""
-                selected_case = "1X"
-                ranking = []
-                base_score = 120.0
-                motivo = "ok_1x"
-            else:
-                ranking = _rankear_x_localmente(red_bots, cols[offset:], estado)
-                if not ranking:
-                    reasons_by_offset[offset] = "sin_candidato_local"
-                    continue
-                selected_bot = str(ranking[0].get("bot") or "")
-                selected_case = "2X"
-                base_score = float(ranking[0].get("score_final_hibrido", ranking[0].get("score_local", 0.0)) or 0.0)
-                motivo = "ok_2x"
-            candidate_score = float(offset_score) + float(base_score)
-            reasons_by_offset[offset] = motivo
-            candidates_ok.append({
-                "offset": int(offset),
-                "selected_bot": selected_bot,
-                "selected_case": selected_case,
-                "selected_score": float(candidate_score),
-                "reason": motivo,
-                "valids": int(valids),
-                "greens": int(greens),
-                "reds": int(reds),
-                "red_bots": list(red_bots),
-                "ranking_debug": list(ranking),
-            })
-
-        out["reasons_by_offset"] = dict(reasons_by_offset)
-        out["candidates_considered"] = list(candidates_ok)
-        if not candidates_ok:
-            out["reason"] = str(reasons_by_offset.get(0) or "estructura_insuficiente")
-            return out
-
-        candidates_ok.sort(key=lambda c: (-float(c.get("selected_score", 0.0) or 0.0), int(c.get("offset", 999))))
-        best = dict(candidates_ok[0] or {})
-        out["triggered"] = True
-        out["selected_bot"] = str(best.get("selected_bot") or "")
-        out["selected_case"] = str(best.get("selected_case") or "")
-        out["selected_offset"] = int(best.get("offset", 0) or 0)
-        out["selected_score"] = float(best.get("selected_score", 0.0) or 0.0)
-        out["reason"] = "4verdes_1X" if out["selected_case"] == "1X" else "4verdes_2X_peso_hibrido"
-        out["valids"] = int(best.get("valids", 0) or 0)
-        out["greens"] = int(best.get("greens", 0) or 0)
-        out["reds"] = int(best.get("reds", 0) or 0)
-        out["red_bots"] = list(best.get("red_bots", []) or [])
-        out["ranking_debug"] = list(best.get("ranking_debug", []) or [])
-
-        if bool(emitir_log):
-            if bool(out.get("triggered")):
-                if str(out.get("selected_case", "")) == "1X":
-                    agregar_evento(
-                        f"LOGICA_VERDE_X_PONDERADA: caso=1X bot={out.get('selected_bot')} "
-                        f"offset={int(out.get('selected_offset', 0) or 0)} score={float(out.get('selected_score', 0.0) or 0.0):.2f} "
-                        f"greens={out.get('greens')} reds={out.get('reds')}"
-                    )
-                else:
-                    agregar_evento(
-                        f"LOGICA_VERDE_X_PONDERADA: caso=2X bot={out.get('selected_bot')} "
-                        f"offset={int(out.get('selected_offset', 0) or 0)} score={float(out.get('selected_score', 0.0) or 0.0):.2f} "
-                        f"greens={out.get('greens')} reds={out.get('reds')} motivo=peso_hibrido"
-                    )
-            else:
-                agregar_evento(f"LOGICA_VERDE_X_PONDERADA: {out.get('reason', 'estructura_insuficiente')}")
-        return out
-    except Exception:
-        out["reason"] = "estructura_insuficiente"
-        if bool(emitir_log):
-            agregar_evento("LOGICA_VERDE_X_PONDERADA: estructura_insuficiente")
-        return out
-
-
+        return _registrar_estado_embudo({"decision_final": EMBUDO_FINAL_WAIT_SOFT, "decision_reason": "embudo_err", "soft_wait_reason": "embudo_err"})
 
 
 def _umbral_senal_actual_hud() -> float:
@@ -15919,11 +15352,8 @@ async def cargar_datos_bot(bot, token_actual):
             except Exception:
                 pass
 
-            trade_status = normalizar_trade_status(
-                fila_dict.get("trade_status_norm", None) or fila_dict.get("trade_status", None)
-            )
-            resultado = _resultado_cierre_desde_fila(fila_dict)
-            cierre_valido_hud = (trade_status == "CERRADO" and resultado in ("GANANCIA", "PÉRDIDA"))
+            trade_status = str(fila_dict.get("trade_status", "")).strip().upper()
+            resultado = normalizar_resultado(fila_dict.get("resultado", ""))
 
             try:
                 ep_dec = int(float(fila_dict.get("epoch", 0) or 0))
@@ -15940,21 +15370,7 @@ async def cargar_datos_bot(bot, token_actual):
             #    - Calculamos Prob IA para el HUD
             #    - NO tocamos historial, n, ni %éxito (evita los “·” intercalados)
             # =========================
-            if not cierre_valido_hud:
-                if trade_status == "CERRADO":
-                    if estado_bots[bot].get("ia_senal_pendiente"):
-                        estado_bots[bot]["ia_senal_pendiente"] = False
-                        estado_bots[bot]["ia_prob_senal"] = None
-                    _hud_log_once(
-                        bot,
-                        "close_reject",
-                        f"[HUD REJECT] {bot} cierre descartado: resultado inválido ({fila_dict.get('resultado', '')})",
-                        cooldown_s=25.0,
-                    )
-                    estado_bots[bot]["token"] = "REAL" if effective_owner == bot else "DEMO"
-                    last_update_time[bot] = time.time()
-                    continue
-
+            if resultado not in ("GANANCIA", "PÉRDIDA"):
                 # Guarda epoch PRE más reciente para heartbeat ACK (sin depender de filas nuevas constantes)
                 try:
                     ep_pre = fila_dict.get("epoch", 0)
@@ -15966,6 +15382,15 @@ async def cargar_datos_bot(bot, token_actual):
 
                 # Si el bot marcó CERRADO pero no trajo resultado válido,
                 # cerramos señal pendiente (si existía) sin contaminar historial.
+                if trade_status == "CERRADO":
+                    if estado_bots[bot].get("ia_senal_pendiente"):
+                        estado_bots[bot]["ia_senal_pendiente"] = False
+                        estado_bots[bot]["ia_prob_senal"] = None
+
+                    estado_bots[bot]["token"] = "REAL" if effective_owner == bot else "DEMO"
+                    last_update_time[bot] = time.time()
+                    continue
+
                 missing = [col for col in required_cols if pd.isna(fila_dict.get(col))]
                 if missing:
                     agregar_evento(f"⚠️ {bot}: PRE_TRADE incompleto, faltan {len(missing)} cols: {missing[:5]}")
@@ -16025,35 +15450,10 @@ async def cargar_datos_bot(bot, token_actual):
             # 2) FILAS CERRADAS (GANANCIA / PÉRDIDA)
             #    - Aquí sí actualizamos historial y estadísticas reales
             # =========================
-            close_origin = str(fila_dict.get("close_origin", "") or "").strip().upper()
-            if close_origin == "BG_FINALIZE":
-                _hud_log_once(
-                    bot,
-                    "close_bg_audit_only",
-                    f"[HUD AUDIT ONLY] {bot} BG_FINALIZE ignorado para tabla viva",
-                    cooldown_s=20.0,
-                )
-                estado_bots[bot]["token"] = "REAL" if effective_owner == bot else "DEMO"
-                last_update_time[bot] = time.time()
-                continue
-
             _registrar_cierre_ctt(bot, fila_dict, resultado)
-            if not str(fila_dict.get("ia_decision_id", "") or "").strip():
-                _hud_log_once(
-                    bot,
-                    "close_orphan_fallback",
-                    f"[HUD FALLBACK] {bot} cierre huérfano aceptado para tabla",
-                    cooldown_s=20.0,
-                )
             estado_bots[bot]["ultimo_resultado"] = resultado
             estado_bots[bot]["resultados"].append(resultado)
             estado_bots[bot]["tamano_muestra"] += 1
-            _hud_log_once(
-                bot,
-                "close_ok",
-                f"[HUD CLOSE] {bot} -> {resultado} | n={int(estado_bots[bot]['tamano_muestra'])}",
-                cooldown_s=8.0,
-            )
 
             if resultado == "GANANCIA":
                 estado_bots[bot]["ganancias"] += 1
@@ -16086,7 +15486,7 @@ async def cargar_datos_bot(bot, token_actual):
                     elif resultado == "PÉRDIDA":
                         estado_bots[bot]["ia_fallos"] += 1
 
-                if prob_senal is not None and prob_senal >= float(AUTO_REAL_DISABLED_THR_MIN):
+                if prob_senal is not None and prob_senal >= float(AUTO_REAL_THR_MIN):
                     IA90_stats[bot]["n"] += 1
                     if resultado == "GANANCIA":
                         IA90_stats[bot]["ok"] += 1
@@ -16119,1108 +15519,13 @@ async def cargar_datos_bot(bot, token_actual):
     except Exception as e:
         print(f"⚠️ Error cargando datos para {bot}: {e}")
 
-def _saldo_status_text(reason: str | None = None) -> str:
-    r = str(reason if reason is not None else SALDO_STATUS_REASON).strip().upper()
-    mapping = {
-        "OK": "SALDO DISPONIBLE",
-        "BOOTSTRAP_PENDING": "SALDO NO DISPONIBLE",
-        "TOKEN_REAL_MISSING": "TOKEN REAL AUSENTE",
-        "WEBSOCKET_UNAVAILABLE": "WEBSOCKET NO DISPONIBLE",
-        "AUTH_FAILED": "AUTH BALANCE FALLIDA",
-        "BALANCE_FAILED": "BALANCE FALLIDO",
-        "BALANCE_NOT_READ": "BALANCE NO LEÍDO",
-        "BALANCE_PARSE_FAILED": "BALANCE INVÁLIDO",
-        "EXCEPTION": "ERROR DE LECTURA DE SALDO",
-        "STALE_READ_FAILED": "SALDO DESACTUALIZADO",
-    }
-    return mapping.get(r, f"SALDO NO DISPONIBLE ({r})")
-
-
-def _set_saldo_status(status: str, reason: str, detail: str = "", announce: bool = False):
-    global SALDO_STATUS, SALDO_STATUS_REASON, SALDO_STATUS_DETAIL, SALDO_STATUS_TS, saldo_real
-    global SALDO_LAST_EVENT_KEY, SALDO_LAST_EVENT_TS
-    status = str(status).strip().upper()
-    reason = str(reason).strip().upper()
-    detail = str(detail or "").strip()
-    changed = (
-        SALDO_STATUS != status
-        or SALDO_STATUS_REASON != reason
-        or SALDO_STATUS_DETAIL != detail
-    )
-    SALDO_STATUS = status
-    SALDO_STATUS_REASON = reason
-    SALDO_STATUS_DETAIL = detail
-    SALDO_STATUS_TS = float(time.time())
-    if status == "UNKNOWN" and globals().get("SALDO_LAST_VALID_VALUE", None) is None:
-        saldo_real = "--"
-    if announce and changed:
-        msg = f"💳 {_saldo_status_text(reason)}"
-        if detail:
-            msg += f": {detail}"
-        key = f"{status}|{reason}|{detail[:180]}"
-        now = float(time.time())
-        if (key != str(SALDO_LAST_EVENT_KEY)) or ((now - float(SALDO_LAST_EVENT_TS or 0.0)) >= 25.0):
-            SALDO_LAST_EVENT_KEY = key
-            SALDO_LAST_EVENT_TS = now
-            agregar_evento(msg)
-
-
-def _persistir_saldo_series_csv(payload: dict, now_utc: datetime, event_type: str):
-    global SALDO_CSV_LOG_LAST_TS, PROTECTION_CSV_WRITE_WARN_LAST_TS
-    csv_path = SALDO_SERIES_CSV_PATH
-    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-    cols = ["ts_utc", "ts_lima", "epoch", "saldo_real", "equity", "status", "source", "event_type"]
-    saldo_val = payload.get("saldo_real", None)
-    if saldo_val is None:
-        return
-    try:
-        saldo_val = float(saldo_val)
-    except Exception:
-        return
-
-    ts_utc = str(payload.get("timestamp", "")).strip() or now_utc.isoformat()
-    try:
-        dt_utc = datetime.fromisoformat(ts_utc.replace("Z", "+00:00"))
-        if dt_utc.tzinfo is None:
-            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-        dt_utc = dt_utc.astimezone(timezone.utc)
-    except Exception:
-        dt_utc = now_utc
-    dt_lima = dt_utc.astimezone(SALDO_DISPLAY_TZ)
-
-    row = {
-        "ts_utc": dt_utc.isoformat(),
-        "ts_lima": dt_lima.isoformat(),
-        "epoch": f"{float(dt_utc.timestamp()):.6f}",
-        "saldo_real": f"{saldo_val:.10f}",
-        "equity": f"{saldo_val:.10f}",
-        "status": str(payload.get("status", "")),
-        "source": str(payload.get("source", "")),
-        "event_type": str(event_type),
-    }
-
-    backup_path = os.path.join(os.path.dirname(csv_path) or ".", "saldo_real_series_backup_mixto.csv")
-    if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
-        try:
-            with open(csv_path, "r", encoding="utf-8", errors="ignore", newline="") as f:
-                header = next(csv.reader(f), [])
-            header = [str(h).strip() for h in (header or [])]
-            if header != cols:
-                try:
-                    shutil.copy2(csv_path, backup_path)
-                except Exception:
-                    pass
-                with open(csv_path, "w", encoding="utf-8", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=cols)
-                    writer.writeheader()
-                    f.flush()
-                    try:
-                        os.fsync(f.fileno())
-                    except Exception:
-                        pass
-                try:
-                    agregar_evento("PROTECCION_SALDO: CSV mixto detectado | backup saldo_real_series_backup_mixto.csv | header oficial regenerado")
-                except Exception:
-                    pass
-        except Exception as e:
-            now_log = float(time.time())
-            if (now_log - float(PROTECTION_CSV_WRITE_WARN_LAST_TS or 0.0)) >= float(PROTECTION_DIAG_LOG_COOLDOWN_S):
-                PROTECTION_CSV_WRITE_WARN_LAST_TS = now_log
-                try:
-                    agregar_evento(f"PROTECCION_SALDO: CSV_HEADER_WARNING | read_error={type(e).__name__}")
-                except Exception:
-                    pass
-            return
-
-    last_ts = ""
-    last_saldo = None
-    if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
-        try:
-            with open(csv_path, "r", encoding="utf-8", errors="ignore", newline="") as f:
-                reader = csv.DictReader(f)
-                for r in reader:
-                    if not r:
-                        continue
-                    last_ts = str(r.get("ts_utc", "")).strip() or last_ts
-                    try:
-                        last_saldo = float(r.get("saldo_real"))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    if last_ts == row["ts_utc"] and last_saldo is not None and abs(last_saldo - saldo_val) <= 1e-12:
-        return
-
-    write_header = (not os.path.exists(csv_path)) or os.path.getsize(csv_path) <= 0
-    try:
-        with open(csv_path, "a", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=cols)
-            if write_header:
-                writer.writeheader()
-            writer.writerow(row)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
-        now_log = float(time.time())
-        if (now_log - float(SALDO_CSV_LOG_LAST_TS or 0.0)) >= 12.0:
-            SALDO_CSV_LOG_LAST_TS = now_log
-            try:
-                print(
-                    f"[SALDO CSV] append ok -> {os.path.basename(csv_path)} | "
-                    f"saldo={saldo_val:.2f} | event={event_type}"
-                )
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"[SALDO CSV][ERROR] append failed en {csv_path}: {e}")
-        try:
-            traceback.print_exc(limit=1)
-        except Exception:
-            pass
-
-
-def _persistir_saldo_live():
-    try:
-        now_utc = datetime.now(timezone.utc)
-        payload = {
-            "saldo_real": float(SALDO_LAST_VALID_VALUE) if SALDO_LAST_VALID_VALUE is not None else None,
-            "timestamp": now_utc.isoformat(),
-            "status": str(SALDO_STATUS),
-            "source": "MAESTRO_DERIV",
-            "last_valid_ts": float(SALDO_LAST_VALID_TS or 0.0),
-        }
-
-        live_target = SALDO_LIVE_SHARED_PATH
-        os.makedirs(os.path.dirname(live_target) or ".", exist_ok=True)
-        tmp = f"{live_target}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, live_target)
-
-        hist_target = SALDO_LIVE_HISTORY_SHARED_PATH
-        os.makedirs(os.path.dirname(hist_target) or ".", exist_ok=True)
-        last_obj = None
-        if os.path.exists(hist_target):
-            with open(hist_target, "r", encoding="utf-8", errors="ignore") as hf:
-                for line in hf:
-                    line = line.strip()
-                    if line:
-                        try:
-                            last_obj = json.loads(line)
-                        except Exception:
-                            pass
-        should_append = True
-        append_reason = "change"
-        if isinstance(last_obj, dict):
-            try:
-                same_balance = float(last_obj.get("saldo_real")) == float(payload.get("saldo_real"))
-            except Exception:
-                same_balance = False
-            same_status = str(last_obj.get("status", "")) == str(payload.get("status", ""))
-            same_source = str(last_obj.get("source", "")) == str(payload.get("source", ""))
-            same_signature = same_balance and same_status and same_source
-            if same_signature:
-                elapsed = None
-                try:
-                    ts_raw = str(last_obj.get("timestamp", "")).strip()
-                    if ts_raw:
-                        ts_last = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                        elapsed = (now_utc - ts_last).total_seconds()
-                except Exception:
-                    elapsed = None
-                should_append = elapsed is None or elapsed >= float(SALDO_HISTORY_HEARTBEAT_S)
-                append_reason = "heartbeat"
-            else:
-                should_append = True
-                append_reason = "change"
-        if should_append:
-            payload["event_type"] = append_reason
-            with open(hist_target, "a", encoding="utf-8") as hf:
-                hf.write(json.dumps(payload, ensure_ascii=False) + "\n")
-                hf.flush()
-                try:
-                    os.fsync(hf.fileno())
-                except Exception:
-                    pass
-            _persistir_saldo_series_csv(payload, now_utc, append_reason)
-    except Exception as e:
-        try:
-            print(f"⚠️ No se pudo persistir saldo live/hist: {e}")
-        except Exception:
-            pass
-
-
-def _load_protection_series_resampled() -> tuple[pd.DataFrame, str, str]:
-    try:
-        try:
-            df = pd.read_csv(SALDO_SERIES_CSV_PATH, encoding="utf-8", on_bad_lines="skip")
-        except TypeError:
-            df = pd.read_csv(SALDO_SERIES_CSV_PATH, encoding="utf-8")
-    except Exception as e:
-        return pd.DataFrame(columns=["ts", "saldo_real", "equity"]), "", f"READ_ERROR | {type(e).__name__}"
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["ts", "saldo_real", "equity"]), "", "CSV_EMPTY_OR_INVALID | dataframe vacio"
-
-    if "saldo_real" not in df.columns:
-        return pd.DataFrame(columns=["ts", "saldo_real", "equity"]), "", "CSV_SCHEMA_ERROR | falta saldo_real"
-
-    work = df.copy()
-    work["saldo_real"] = pd.to_numeric(work.get("saldo_real"), errors="coerce")
-    if "equity" in work.columns:
-        work["equity"] = pd.to_numeric(work.get("equity"), errors="coerce")
-    else:
-        work["equity"] = float("nan")
-    epoch_series = pd.to_numeric(work.get("epoch"), errors="coerce") if "epoch" in work.columns else pd.Series(float("nan"), index=work.index)
-    ts_epoch = pd.to_datetime(epoch_series, unit="s", errors="coerce", utc=True)
-    ts_utc = pd.to_datetime(work.get("ts_utc"), errors="coerce", utc=True) if "ts_utc" in work.columns else pd.Series(pd.NaT, index=work.index)
-    ts_lima = pd.to_datetime(work.get("ts_lima"), errors="coerce", utc=False) if "ts_lima" in work.columns else pd.Series(pd.NaT, index=work.index)
-    try:
-        ts_lima = ts_lima.dt.tz_localize("America/Lima", ambiguous="NaT", nonexistent="NaT").dt.tz_convert("UTC")
-    except Exception:
-        ts_lima = pd.Series(pd.NaT, index=work.index)
-    ts = ts_utc.where(ts_utc.notna(), ts_epoch)
-    ts = ts.where(ts.notna(), ts_lima)
-    work["ts"] = ts
-    work = work.dropna(subset=["ts", "saldo_real"]).copy()
-    if work.empty:
-        return pd.DataFrame(columns=["ts", "saldo_real", "equity"]), "", "CSV_EMPTY_OR_INVALID | sin serie numérica válida"
-    work = work.sort_values("ts")
-    work = work.drop_duplicates(subset=["ts"], keep="last")
-    work = work[(work["saldo_real"] > 0)]
-    if work.empty:
-        return pd.DataFrame(columns=["ts", "saldo_real", "equity"]), "", "CSV_EMPTY_OR_INVALID | sin serie válida tras limpieza"
-    source_col = "saldo_real"
-
-    rs = (
-        work.set_index("ts")[["saldo_real", "equity"]]
-        .resample(PROTECTION_RESAMPLE_RULE)
-        .last()
-        .ffill(limit=3)
-        .dropna(subset=["saldo_real"])
-        .reset_index()
-    )
-    if rs.empty:
-        return pd.DataFrame(columns=["ts", "saldo_real", "equity"]), source_col, "DATA_INSUFFICIENT | remuestreo vacío"
-    return rs, source_col, ""
-
-
-def _equity_protection_time_left_s(now_ts: float | None = None) -> int:
-    try:
-        now_ts = float(now_ts if now_ts is not None else time.time())
-        return max(0, int(round(float(protection_pause_until_ts or 0.0) - now_ts)))
-    except Exception:
-        return 0
-
-
-def _equity_protection_is_active(now_ts: float | None = None) -> bool:
-    return bool(protection_pause_active)
-
-
-def _equity_protection_should_pause() -> bool:
-    try:
-        return (
-            float(protection_ema_alerta) < float(protection_ema_calma)
-            and float(protection_last_drawdown_pct) <= float(DD_PROTECTION_THRESHOLD_PCT)
-        )
-    except Exception:
-        return False
-
-
-def _equity_protection_recovery_ok(structure_trigger: bool = False) -> bool:
-    try:
-        if bool(structure_trigger):
-            return False
-        dd_now = float(protection_last_drawdown_pct)
-        dd_release = float(DD_PROTECTION_THRESHOLD_PCT) + float(PROTECTION_REARM_DD_RELEASE_MARGIN_PCT)
-        ema_alerta = float(protection_ema_alerta)
-        ema_calma = float(protection_ema_calma)
-        dd_recovered = dd_now > dd_release
-        ema_recovered = ema_alerta >= ema_calma
-        return bool(dd_recovered or ema_recovered)
-    except Exception:
-        return False
-
-
-def _build_equity_protection_incident_id(reason: str = "", anchor_peak: float = 0.0, drawdown_pct: float = 0.0) -> str:
-    try:
-        r = str(reason or "").strip() or "unknown"
-        return f"{int(protection_epoch_id or 0)}|{r}|{float(anchor_peak or 0.0):.2f}|{float(drawdown_pct or 0.0):.1f}"
-    except Exception:
-        return ""
-
-
-def _equity_protection_incident_can_clear(structure_trigger: bool = False) -> bool:
-    try:
-        if _equity_protection_recovery_ok(structure_trigger=structure_trigger):
-            return True
-        if float(protection_last_peak_equity or 0.0) >= (float(protection_incident_anchor_peak or 0.0) + 0.25):
-            return True
-        return False
-    except Exception:
-        return False
-
-
-def _equity_protection_incident_is_new(candidate_id: str, structure_trigger: bool = False, now_ts: float | None = None) -> bool:
-    try:
-        now_ts = float(now_ts if now_ts is not None else time.time())
-        if not bool(protection_incident_lock_active):
-            return True
-        if _equity_protection_incident_can_clear(structure_trigger=structure_trigger):
-            return True
-        if str(candidate_id or "").strip() and str(candidate_id) != str(protection_incident_id or ""):
-            if float(protection_last_peak_equity or 0.0) >= (float(protection_incident_anchor_peak or 0.0) + 0.25):
-                return True
-            if (now_ts - float(protection_incident_anchor_ts or 0.0)) >= 600.0 and bool(structure_trigger):
-                return True
-        return False
-    except Exception:
-        return False
-
-
-def _equity_structure_break_signal(equity_series: list[float]) -> tuple[bool, str]:
-    try:
-        if not equity_series or len(equity_series) < 20:
-            return False, ""
-        lookback = int(EQUITY_BREAK_LOOKBACK)
-        n = min(len(equity_series), lookback)
-        y = [float(v) for v in equity_series[-n:]]
-        if len(y) < 20:
-            return False, ""
-
-        trend = None
-        if NUMPY_OK:
-            try:
-                x_np = np.arange(len(y), dtype=float)
-                y_np = np.asarray(y, dtype=float)
-                coef = np.polyfit(x_np, y_np, 1)
-                trend = np.polyval(coef, x_np)
-                resid = float(y_np[-1] - trend[-1])
-                std = float(np.std(y_np - trend))
-                if std > 0 and resid < (-float(EQUITY_BREAK_STD_FACTOR) * std):
-                    return True, "ruptura_tendencia_equity"
-            except Exception:
-                trend = None
-
-        if trend is None:
-            m = len(y)
-            x_vals = [float(i) for i in range(m)]
-            x_mean = sum(x_vals) / float(m)
-            y_mean = sum(y) / float(m)
-            den = sum((xi - x_mean) ** 2 for xi in x_vals)
-            slope = (sum((x_vals[i] - x_mean) * (y[i] - y_mean) for i in range(m)) / den) if den > 0 else 0.0
-            intercept = y_mean - slope * x_mean
-            trend = [slope * xi + intercept for xi in x_vals]
-            resid = float(y[-1] - trend[-1])
-            diffs = [y[i] - trend[i] for i in range(m)]
-            var = (sum((d * d) for d in diffs) / float(m)) if m > 0 else 0.0
-            std = math.sqrt(max(0.0, var))
-            if std > 0 and resid < (-float(EQUITY_BREAK_STD_FACTOR) * std):
-                return True, "ruptura_tendencia_equity"
-
-        max_val = max(y)
-        if abs(max_val) > 1e-12:
-            dd = (float(y[-1]) - float(max_val)) / float(max_val)
-            if dd <= float(EQUITY_BREAK_DRAWDOWN):
-                return True, "drawdown_equity"
-
-        if len(y) >= 4:
-            delta = float(y[-1]) - float(y[-4])
-            if delta <= float(EQUITY_BREAK_FAST_DROP):
-                return True, "caida_rapida_equity"
-    except Exception:
-        return False, ""
-    return False, ""
-
-
-def _fmt_protection_countdown(seconds_left: int) -> str:
-    try:
-        s = max(0, int(seconds_left))
-        h, rem = divmod(s, 3600)
-        m, sec = divmod(rem, 60)
-        if h > 0:
-            return f"{h:02d}:{m:02d}:{sec:02d}"
-        return f"{m:02d}:{sec:02d}"
-    except Exception:
-        return "00:00"
-
-
-def _protection_diag_event_once(diag_key: str, message: str, now_ts: float | None = None):
-    global PROTECTION_DIAG_LOG_LAST_TS
-    now_ts = float(now_ts if now_ts is not None else time.time())
-    k = str(diag_key or "").strip().upper() or "GENERIC"
-    last = float(PROTECTION_DIAG_LOG_LAST_TS.get(k, 0.0))
-    if (now_ts - last) >= float(PROTECTION_DIAG_LOG_COOLDOWN_S):
-        PROTECTION_DIAG_LOG_LAST_TS[k] = now_ts
-        try:
-            agregar_evento(message)
-        except Exception:
-            pass
-
-
-def _set_protection_diag(status: str = "ok", reason: str = "", source_column: str = "", series_len: int = 0):
-    global PROTECTION_DIAG_STATUS, PROTECTION_DIAG_REASON, PROTECTION_SOURCE_COLUMN, PROTECTION_SERIES_LEN
-    PROTECTION_DIAG_STATUS = str(status or "ok")
-    PROTECTION_DIAG_REASON = str(reason or "")
-    PROTECTION_SOURCE_COLUMN = str(source_column or "")
-    try:
-        PROTECTION_SERIES_LEN = max(0, int(series_len))
-    except Exception:
-        PROTECTION_SERIES_LEN = 0
-
-
-def _write_protection_health_state(now_ts: float | None = None):
-    global PROTECTION_LAST_JSON_WARN_TS
-    now_ts = float(now_ts if now_ts is not None else time.time())
-    active_now = bool(_equity_protection_is_active(now_ts))
-    time_left_s = _equity_protection_time_left_s(now_ts) if active_now else 0
-    resume_hhmm = "--:--"
-    hold_active = bool(now_ts < float(protection_test_reset_hold_until_ts or 0.0))
-    try:
-        if active_now and float(protection_pause_until_ts or 0.0) > 0:
-            resume_hhmm = datetime.fromtimestamp(float(protection_pause_until_ts), tz=timezone.utc).astimezone().strftime("%H:%M")
-    except Exception:
-        pass
-    payload = {
-        "active": active_now,
-        "mode": str(protection_mode or ""),
-        "reason": str(protection_pause_reason or "") if active_now else "",
-        "started_ts": float(protection_pause_started_ts or 0.0) if active_now else 0.0,
-        "until_ts": float(protection_pause_until_ts or 0.0) if active_now else 0.0,
-        "min_pause_s": float(protection_pause_min_seconds or 0.0),
-        "extended_count": int(protection_pause_extended_count or 0),
-        "time_left_s": int(time_left_s),
-        "drawdown_pct": float(protection_last_drawdown_pct or 0.0),
-        "equity_now": float(SALDO_LAST_VALID_VALUE) if SALDO_LAST_VALID_VALUE is not None else None,
-        "peak_equity": float(protection_last_peak_equity or 0.0),
-        "prot_peak_ref": float(protection_peak_ref or 0.0),
-        "prot_worst_saldo": float(protection_worst_saldo or 0.0),
-        "prot_worst_dd": float(protection_worst_dd or 0.0),
-        "release_ok_streak": int(protection_release_ok_streak or 0),
-        "release_score": int(protection_release_score or 0),
-        "release_status": str(protection_resume_status or "IDLE"),
-        "rearm_blocked": bool(protection_rearm_blocked),
-        "rearm_blocked_until_ts": float(protection_rearm_blocked_until or 0.0),
-        "no_new_lows_ok": bool(protection_no_new_lows_ok),
-        "ema_turn_ok": bool(protection_ema_turn_ok),
-        "dd_recovery_ok": bool(protection_dd_recovery_ok),
-        "calm_band_ok": bool(protection_calm_band_ok),
-        "protection_last_eval_ts": float(protection_last_eval_ts or 0.0),
-        "protection_last_new_low_ts": float(protection_last_new_low_ts or 0.0),
-        "vol_base": float(protection_vol_base or 0.0),
-        "drop_3m": float(protection_drop_3m or 0.0),
-        "pct_drop_3m": float(protection_pct_drop_3m or 0.0),
-        "ema_alerta": float(protection_ema_alerta or 0.0),
-        "ema_calma": float(protection_ema_calma or 0.0),
-        "text_banner": "Deteccion caida-Proteccion de Saldo",
-        "resume_text": "" if hold_active else f"Retoma automaticamente sus funciones en: {resume_hhmm}",
-        "updated_ts": float(now_ts),
-        "diag_status": str(PROTECTION_DIAG_STATUS or "ok"),
-        "diag_reason": str(PROTECTION_DIAG_REASON or ""),
-        "source_column": str(PROTECTION_SOURCE_COLUMN or ""),
-        "series_len": int(PROTECTION_SERIES_LEN or 0),
-        "test_hold_active": hold_active,
-        "test_hold_until_ts": float(protection_test_reset_hold_until_ts or 0.0),
-        "eval_from_ts": float(protection_eval_from_ts or 0.0),
-        "post_reset_samples": int(protection_post_reset_samples or 0),
-        "post_reset_span_s": float(protection_post_reset_span_s or 0.0),
-        "reset_baseline_equity": float(protection_reset_baseline_equity or 0.0),
-        "reset_baseline_peak": float(protection_reset_baseline_peak or 0.0),
-        "epoch_id": int(protection_epoch_id or 0),
-        "incident_lock_active": bool(protection_incident_lock_active),
-        "incident_reason": str(protection_incident_reason or ""),
-        "incident_anchor_peak": float(protection_incident_anchor_peak or 0.0),
-        "incident_anchor_ts": float(protection_incident_anchor_ts or 0.0),
-        "incident_id": str(protection_incident_id or ""),
-    }
-    try:
-        _json_dump_atomic(payload, PROTECTION_HEALTH_STATE_PATH)
-    except Exception as e:
-        if (now_ts - float(PROTECTION_LAST_JSON_WARN_TS or 0.0)) >= 30.0:
-            PROTECTION_LAST_JSON_WARN_TS = now_ts
-            try:
-                agregar_evento(f"PROTECCION_SALDO: warning write protection_health_state.json | {e}")
-            except Exception:
-                pass
-
-
-def _write_protection_reset_ack(
-    request_id: str,
-    accepted: bool,
-    now_ts: float | None = None,
-    hold_until_ts: float = 0.0,
-    status: str = "ok",
-    reason: str = "",
-    action: str = "reset_protection_test_ack",
-):
-    now_ts = float(now_ts if now_ts is not None else time.time())
-    payload = {
-        "action": str(action or "reset_protection_test_ack"),
-        "request_id": str(request_id or ""),
-        "accepted": bool(accepted),
-        "ts": float(now_ts),
-        "hold_until_ts": float(hold_until_ts or 0.0),
-        "status": str(status or ("ok" if accepted else "error")),
-        "epoch_id": int(protection_epoch_id or 0),
-    }
-    if str(reason or "").strip():
-        payload["reason"] = str(reason)
-    try:
-        _json_dump_atomic(payload, PROTECTION_RESET_ACK_PATH)
-    except Exception:
-        pass
-
-
-def _read_protection_epoch_state() -> dict:
-    try:
-        if not os.path.exists(PROTECTION_EPOCH_STATE_PATH):
-            return {"epoch_id": 0, "updated_ts": 0.0, "reason": ""}
-        with open(PROTECTION_EPOCH_STATE_PATH, "r", encoding="utf-8", errors="ignore") as f:
-            obj = json.load(f) or {}
-        return obj if isinstance(obj, dict) else {"epoch_id": 0, "updated_ts": 0.0, "reason": ""}
-    except Exception:
-        return {"epoch_id": 0, "updated_ts": 0.0, "reason": ""}
-
-
-def _write_protection_epoch_state(epoch_id: int, now_ts: float, reason: str):
-    payload = {
-        "epoch_id": int(max(0, int(epoch_id))),
-        "updated_ts": float(now_ts),
-        "reason": str(reason or ""),
-    }
-    try:
-        _json_dump_atomic(payload, PROTECTION_EPOCH_STATE_PATH)
-    except Exception:
-        pass
-
-
-def _reset_equity_protection_for_test(now_ts: float | None = None, request_id: str = "") -> bool:
-    global protection_pause_active, protection_pause_reason, protection_pause_started_ts
-    global protection_pause_until_ts, protection_pause_last_trigger_ts, protection_last_trigger_ts, protection_last_peak_equity
-    global protection_last_drawdown_pct, protection_ema_alerta, protection_ema_calma
-    global protection_rearm_blocked, protection_last_release_ts
-    global protection_test_reset_hold_until_ts, protection_last_reset_request_id, protection_last_reset_request_ts
-    global protection_eval_from_ts, protection_reset_baseline_equity, protection_reset_baseline_peak
-    global protection_post_reset_samples, protection_post_reset_span_s
-    global protection_epoch_id, protection_epoch_last_seen_ts
-    global protection_incident_id, protection_incident_reason, protection_incident_anchor_peak
-    global protection_incident_anchor_ts, protection_incident_lock_active, protection_incident_last_drawdown
-    now_ts = float(now_ts if now_ts is not None else time.time())
-    req_id = str(request_id or "").strip()
-    try:
-        prev_reason = str(protection_incident_reason or protection_pause_reason or "manual_reset")
-        prev_peak = float(protection_incident_anchor_peak or protection_last_peak_equity or 0.0)
-        prev_dd = float(protection_last_drawdown_pct or protection_incident_last_drawdown or 0.0)
-        protection_pause_active = False
-        protection_pause_reason = ""
-        protection_pause_started_ts = 0.0
-        protection_pause_until_ts = 0.0
-        protection_pause_last_trigger_ts = 0.0
-        protection_last_trigger_ts = 0.0
-        protection_last_peak_equity = 0.0
-        protection_last_drawdown_pct = 0.0
-        protection_ema_alerta = 0.0
-        protection_ema_calma = 0.0
-        protection_rearm_blocked = False
-        protection_last_release_ts = 0.0
-        protection_test_reset_hold_until_ts = now_ts + float(PROTECTION_TEST_RESET_HOLD_S)
-        protection_last_reset_request_id = req_id
-        protection_last_reset_request_ts = now_ts
-        epoch_obj = _read_protection_epoch_state()
-        current_epoch = int(epoch_obj.get("epoch_id") or 0)
-        protection_epoch_id = int(max(0, current_epoch) + 1)
-        protection_epoch_last_seen_ts = now_ts
-        _write_protection_epoch_state(protection_epoch_id, now_ts, "manual_test_reset")
-        protection_eval_from_ts = now_ts
-        try:
-            protection_reset_baseline_equity = float(SALDO_LAST_VALID_VALUE) if SALDO_LAST_VALID_VALUE is not None else 0.0
-        except Exception:
-            protection_reset_baseline_equity = 0.0
-        protection_reset_baseline_peak = float(protection_reset_baseline_equity or 0.0)
-        protection_post_reset_samples = 0
-        protection_post_reset_span_s = 0.0
-        protection_incident_reason = str(prev_reason or "manual_reset")
-        protection_incident_anchor_peak = float(prev_peak or 0.0)
-        protection_incident_anchor_ts = now_ts
-        protection_incident_last_drawdown = float(prev_dd or 0.0)
-        protection_incident_id = _build_equity_protection_incident_id(
-            reason=protection_incident_reason,
-            anchor_peak=protection_incident_anchor_peak,
-            drawdown_pct=protection_incident_last_drawdown,
-        )
-        protection_incident_lock_active = True
-        _set_protection_diag(status="ok", reason="manual_test_reset", source_column="", series_len=0)
-        csv_path = SALDO_SERIES_CSV_PATH
-        os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-        if os.path.exists(csv_path):
-            ts_tag = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-            backup = os.path.join(
-                os.path.dirname(csv_path) or ".",
-                f"saldo_real_series.pre_test_reset.{ts_tag}.csv.bak",
-            )
-            try:
-                shutil.copy2(csv_path, backup)
-            except Exception:
-                _write_protection_reset_ack(req_id, False, now_ts=now_ts, status="error", reason="backup_failed")
-                try:
-                    agregar_evento(f"PROTECCION_SALDO: RESET_TEST_MANUAL_ERROR | id={req_id or '--'} | backup_failed")
-                except Exception:
-                    pass
-                return False
-        tmp_csv = f"{csv_path}.tmp"
-        with open(tmp_csv, "w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["ts_utc", "ts_lima", "epoch", "saldo_real", "equity", "status", "source", "event_type"])
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
-        os.replace(tmp_csv, csv_path)
-        payload = {
-            "active": False,
-            "reason": "",
-            "started_ts": 0.0,
-            "until_ts": 0.0,
-            "time_left_s": 0,
-            "drawdown_pct": 0.0,
-            "equity_now": float(SALDO_LAST_VALID_VALUE) if SALDO_LAST_VALID_VALUE is not None else None,
-            "peak_equity": 0.0,
-            "ema_alerta": 0.0,
-            "ema_calma": 0.0,
-            "text_banner": "Deteccion caida-Proteccion de Saldo",
-            "resume_text": "",
-            "updated_ts": float(now_ts),
-            "diag_status": str(PROTECTION_DIAG_STATUS or "ok"),
-            "diag_reason": str(PROTECTION_DIAG_REASON or ""),
-            "source_column": str(PROTECTION_SOURCE_COLUMN or ""),
-            "series_len": int(PROTECTION_SERIES_LEN or 0),
-            "reset_request_id": str(req_id),
-            "reset_diag": "manual_test_reset_ok",
-            "eval_from_ts": float(protection_eval_from_ts or 0.0),
-            "post_reset_samples": int(protection_post_reset_samples or 0),
-            "post_reset_span_s": float(protection_post_reset_span_s or 0.0),
-            "reset_baseline_equity": float(protection_reset_baseline_equity or 0.0),
-            "reset_baseline_peak": float(protection_reset_baseline_peak or 0.0),
-            "epoch_id": int(protection_epoch_id or 0),
-        }
-        _json_dump_atomic(payload, PROTECTION_HEALTH_STATE_PATH)
-        _write_protection_reset_ack(
-            req_id,
-            True,
-            now_ts=now_ts,
-            hold_until_ts=float(protection_test_reset_hold_until_ts or 0.0),
-            status="ok",
-        )
-        try:
-            agregar_evento(f"PROTECCION_SALDO: RESET_TEST_MANUAL | id={req_id or '--'} | backup_ok | serie reiniciada")
-        except Exception:
-            pass
-        return True
-    except Exception as e:
-        _write_protection_reset_ack(req_id, False, now_ts=now_ts, status="error", reason=type(e).__name__)
-        try:
-            agregar_evento(f"PROTECCION_SALDO: RESET_TEST_MANUAL_ERROR | id={req_id or '--'} | {type(e).__name__}")
-        except Exception:
-            pass
-        return False
-
-
-def _consume_protection_reset_request(now_ts: float | None = None) -> bool:
-    global protection_last_reset_request_id, protection_last_reset_request_ts
-    global protection_last_force_resume_request_id, protection_last_force_resume_request_ts
-    global protection_pause_active, protection_pause_reason, protection_pause_started_ts, protection_pause_until_ts
-    global protection_rearm_blocked, protection_rearm_blocked_until, protection_last_release_ts, protection_resume_status
-    now_ts = float(now_ts if now_ts is not None else time.time())
-    req_path = PROTECTION_RESET_REQUEST_PATH
-    if not os.path.exists(req_path):
-        return False
-    req = {}
-    try:
-        with open(req_path, "r", encoding="utf-8", errors="ignore") as f:
-            req = json.load(f) or {}
-    except Exception:
-        req = {}
-    try:
-        os.remove(req_path)
-    except Exception:
-        pass
-    action = str(req.get("action", "")).strip()
-    if action not in ("reset_protection_test", "force_resume_protection"):
-        return False
-    req_id = str(req.get("request_id", "")).strip()
-    if action == "force_resume_protection":
-        if req_id and req_id == str(protection_last_force_resume_request_id or "").strip():
-            _write_protection_reset_ack(
-                req_id,
-                True,
-                now_ts=now_ts,
-                hold_until_ts=float(protection_rearm_blocked_until or 0.0),
-                status="ok",
-                action="force_resume_protection",
-                reason="duplicate_ignored",
-            )
-            return True
-        if not bool(protection_pause_active):
-            _write_protection_reset_ack(
-                req_id,
-                False,
-                now_ts=now_ts,
-                hold_until_ts=0.0,
-                status="error",
-                action="force_resume_protection",
-                reason="protection_not_active",
-            )
-            return True
-        try:
-            protection_pause_active = False
-            protection_pause_reason = ""
-            protection_pause_started_ts = 0.0
-            protection_pause_until_ts = 0.0
-            protection_resume_status = "MANUAL_OVERRIDE"
-            protection_rearm_blocked = True
-            protection_rearm_blocked_until = float(now_ts + float(PROTECTION_REARM_COOLDOWN_S))
-            protection_last_release_ts = float(now_ts)
-            protection_last_force_resume_request_id = req_id
-            protection_last_force_resume_request_ts = float(now_ts)
-            _write_protection_reset_ack(
-                req_id,
-                True,
-                now_ts=now_ts,
-                hold_until_ts=float(protection_rearm_blocked_until or 0.0),
-                status="ok",
-                action="force_resume_protection",
-                reason="manual_override_accepted",
-            )
-            _write_protection_health_state(now_ts)
-            try:
-                agregar_evento("PROTECCION_SALDO: REANUDACION MANUAL | override usuario")
-            except Exception:
-                pass
-            return True
-        except Exception as e:
-            _write_protection_reset_ack(
-                req_id,
-                False,
-                now_ts=now_ts,
-                hold_until_ts=0.0,
-                status="error",
-                action="force_resume_protection",
-                reason=f"exception:{type(e).__name__}",
-            )
-            return True
-
-    if req_id and req_id == str(protection_last_reset_request_id or "").strip():
-        _write_protection_reset_ack(
-            req_id,
-            True,
-            now_ts=now_ts,
-            hold_until_ts=float(protection_test_reset_hold_until_ts or 0.0),
-            status="ok",
-        )
-        _protection_diag_event_once(
-            "RESET_TEST_DUPLICATE_IGNORED",
-            f"PROTECCION_SALDO: RESET_TEST_DUPLICATE_IGNORED | id={req_id}",
-            now_ts,
-        )
-        return True
-    ok = bool(_reset_equity_protection_for_test(now_ts, request_id=req_id))
-    if ok and req_id:
-        protection_last_reset_request_id = req_id
-        protection_last_reset_request_ts = now_ts
-    return ok
-
-
-def _equity_protection_update(now_ts: float | None = None):
-    global protection_pause_active, protection_pause_reason, protection_pause_started_ts
-    global protection_pause_until_ts, protection_pause_last_trigger_ts, protection_last_trigger_ts, protection_last_peak_equity
-    global protection_last_drawdown_pct, protection_ema_alerta, protection_ema_calma
-    global protection_rearm_blocked, protection_last_release_ts
-    global protection_test_reset_hold_until_ts, protection_last_reset_request_id
-    global protection_eval_from_ts, protection_reset_baseline_equity, protection_reset_baseline_peak
-    global protection_post_reset_samples, protection_post_reset_span_s
-    global protection_epoch_id, protection_epoch_last_seen_ts
-    global protection_incident_id, protection_incident_reason, protection_incident_anchor_peak
-    global protection_incident_anchor_ts, protection_incident_lock_active, protection_incident_last_drawdown
-    global PROTECTION_LAST_ACTIVE_LOG_TS
-    global protection_mode, protection_release_ok_streak, protection_pause_min_seconds, protection_pause_extended_count
-    global protection_release_score, protection_no_new_lows_ok, protection_ema_turn_ok, protection_dd_recovery_ok
-    global protection_calm_band_ok, protection_vol_base, protection_drop_3m, protection_pct_drop_3m
-    global protection_peak_ref, protection_worst_saldo, protection_worst_dd, protection_last_eval_ts
-    global protection_last_new_low_ts, protection_resume_status, protection_rearm_blocked_until
-    now_ts = float(now_ts if now_ts is not None else time.time())
-    try:
-        epoch_obj = _read_protection_epoch_state()
-        shared_epoch = int(epoch_obj.get("epoch_id") or 0)
-    except Exception:
-        shared_epoch = int(protection_epoch_id or 0)
-    if int(shared_epoch) > int(protection_epoch_id or 0):
-        protection_epoch_id = int(shared_epoch)
-        protection_epoch_last_seen_ts = now_ts
-        protection_pause_active = False
-        protection_pause_reason = ""
-        protection_pause_started_ts = 0.0
-        protection_pause_until_ts = 0.0
-        protection_pause_last_trigger_ts = 0.0
-        protection_last_trigger_ts = 0.0
-        _protection_diag_event_once(
-            "EPOCH_ADOPT",
-            "PROTECCION_SALDO: epoch adoptado | estado viejo invalidado",
-            now_ts,
-        )
-        _write_protection_health_state(now_ts)
-    if _consume_protection_reset_request(now_ts):
-        return
-    if now_ts < float(protection_test_reset_hold_until_ts or 0.0):
-        protection_pause_active = False
-        protection_pause_reason = ""
-        protection_pause_started_ts = 0.0
-        protection_pause_until_ts = 0.0
-        protection_last_drawdown_pct = 0.0
-        protection_ema_alerta = 0.0
-        protection_ema_calma = 0.0
-        _set_protection_diag(status="ok", reason="manual_test_hold", source_column="", series_len=0)
-        _protection_diag_event_once(
-            "TEST_HOLD",
-            f"PROTECCION_SALDO: TEST_HOLD activo | id={str(protection_last_reset_request_id or '--')} | hold_until={float(protection_test_reset_hold_until_ts or 0.0):.3f}",
-            now_ts,
-        )
-        _write_protection_health_state(now_ts)
-        return
-    _set_protection_diag(status="ok", reason="", source_column="", series_len=0)
-    rs, source_col, load_err = _load_protection_series_resampled()
-    if load_err:
-        _set_protection_diag(status="warning", reason=f"DATA_INSUFFICIENT | {load_err}", source_column=source_col, series_len=0)
-        if not protection_pause_active:
-            protection_resume_status = "DATA_INSUFFICIENT"
-        _write_protection_health_state(now_ts)
-        return
-    eq = pd.to_numeric(rs["saldo_real"], errors="coerce").dropna()
-    eq_len = int(len(eq))
-    if eq_len < int(PROTECTION_MIN_POINTS):
-        _set_protection_diag(status="warning", reason=f"DATA_INSUFFICIENT | muestras={eq_len}", source_column=source_col, series_len=eq_len)
-        if not protection_pause_active:
-            protection_resume_status = "DATA_INSUFFICIENT"
-        _write_protection_health_state(now_ts)
-        return
-    _set_protection_diag(status="ok", reason="", source_column=source_col, series_len=eq_len)
-
-    now_eq = float(eq.iloc[-1])
-    ts_series = pd.to_datetime(rs["ts"], errors="coerce", utc=True)
-    ts_epoch = pd.to_numeric(ts_series.astype("int64"), errors="coerce") / 1e9
-    if float(protection_eval_from_ts or 0.0) <= 0.0:
-        protection_eval_from_ts = float(now_ts)
-        protection_reset_baseline_equity = float(now_eq)
-        protection_reset_baseline_peak = float(now_eq)
-        protection_post_reset_samples = 0
-        protection_post_reset_span_s = 0.0
-        protection_pause_active = False
-        protection_pause_reason = ""
-        protection_pause_started_ts = 0.0
-        protection_pause_until_ts = 0.0
-        protection_resume_status = "BOOT_WARMUP"
-        _set_protection_diag(status="ok", reason="BOOT_WARMUP", source_column=source_col, series_len=eq_len)
-        _write_protection_health_state(now_ts)
-        return
-    try:
-        mask_post = ts_epoch >= float(protection_eval_from_ts or 0.0)
-        eq_post = pd.to_numeric(rs.loc[mask_post.fillna(False), "saldo_real"], errors="coerce").dropna()
-        ts_post = pd.to_numeric(ts_epoch.loc[mask_post.fillna(False)], errors="coerce").dropna()
-    except Exception:
-        eq_post = pd.Series(dtype="float64")
-        ts_post = pd.Series(dtype="float64")
-    protection_post_reset_samples = int(len(eq_post))
-    if len(ts_post) >= 2:
-        protection_post_reset_span_s = float(max(0.0, float(ts_post.iloc[-1]) - float(ts_post.iloc[0])))
-    else:
-        protection_post_reset_span_s = 0.0
-    warmup_samples_ok = int(protection_post_reset_samples) >= int(PROTECTION_POST_RESET_MIN_SAMPLES)
-    warmup_time_ok = float(protection_post_reset_span_s or 0.0) >= float(PROTECTION_POST_RESET_MIN_SECONDS)
-    if not (warmup_samples_ok and warmup_time_ok):
-        protection_pause_active = False
-        protection_pause_reason = ""
-        protection_pause_started_ts = 0.0
-        protection_pause_until_ts = 0.0
-        protection_resume_status = "BOOT_WARMUP"
-        _set_protection_diag(status="ok", reason="BOOT_WARMUP", source_column=source_col, series_len=int(protection_post_reset_samples))
-        _write_protection_health_state(now_ts)
-        return
-    eq_eval = eq_post if len(eq_post) >= 2 else eq
-    now_eq = float(eq_eval.iloc[-1])
-    ema_short = eq_eval.ewm(span=int(EMA_ALERTA_SPAN), adjust=False).mean()
-    ema_long = eq_eval.ewm(span=int(EMA_CALMA_SPAN), adjust=False).mean()
-    protection_ema_alerta = float(ema_short.iloc[-1])
-    protection_ema_calma = float(ema_long.iloc[-1])
-
-    diffs = eq_eval.diff().abs().dropna()
-    vol_base = float(diffs.tail(120).median()) if not diffs.empty else 0.0
-    vol_base = max(0.01, vol_base)
-    protection_vol_base = float(vol_base)
-
-    n3 = min(len(eq_eval), 4)
-    ref_3m = float(eq_eval.iloc[-n3]) if n3 > 0 else now_eq
-    drop_3m = max(0.0, float(ref_3m - now_eq))
-    pct_drop_3m = (drop_3m / max(1e-9, ref_3m)) if ref_3m > 0 else 0.0
-    protection_drop_3m = float(drop_3m)
-    protection_pct_drop_3m = float(pct_drop_3m)
-
-    peak_ref = float(eq_eval.tail(30).max())
-    protection_peak_ref = float(peak_ref)
-    protection_last_peak_equity = float(peak_ref)
-    dd_now = ((peak_ref - now_eq) / peak_ref) if peak_ref > 1e-9 else 0.0
-    protection_last_drawdown_pct = float(-dd_now * 100.0)
-    protection_incident_last_drawdown = float(protection_last_drawdown_pct)
-
-    short_slope = float(ema_short.iloc[-1] - ema_short.iloc[max(0, len(ema_short) - 4)])
-    long_slope = float(ema_long.iloc[-1] - ema_long.iloc[max(0, len(ema_long) - 4)])
-    recent = eq_eval.tail(10)
-    new_lows_repeated = bool(len(recent) >= 6 and float(recent.iloc[-1]) <= float(recent.min()) + 1e-9)
-    shock_trigger = bool(
-        drop_3m >= max(3.0 * vol_base, 0.018 * max(now_eq, 1.0))
-        and protection_ema_alerta < protection_ema_calma
-    )
-    trend_trigger = bool(
-        dd_now >= 0.035
-        and protection_ema_alerta < protection_ema_calma
-        and long_slope < 0.0
-        and new_lows_repeated
-    )
-    trigger_mode = "shock" if shock_trigger else ("trend" if trend_trigger else "")
-    trigger_reason = ""
-    if trigger_mode == "shock":
-        trigger_reason = f"SHOCK drop_3m={drop_3m:,.2f} ({pct_drop_3m*100.0:.2f}%)"
-    elif trigger_mode == "trend":
-        trigger_reason = f"TREND dd={dd_now*100.0:.2f}% slope={long_slope:,.4f}"
-
-    if bool(protection_rearm_blocked):
-        recovery_ok = bool(protection_ema_alerta >= protection_ema_calma or dd_now < 0.02)
-        cooldown_ok = (now_ts - float(protection_last_release_ts or 0.0)) >= float(PROTECTION_REARM_COOLDOWN_S)
-        until_ok = now_ts >= float(protection_rearm_blocked_until or 0.0)
-        if recovery_ok and cooldown_ok:
-            protection_rearm_blocked = False
-            protection_rearm_blocked_until = 0.0
-            _protection_diag_event_once("REARME_HABILITADO", "PROTECCION_SALDO: REARME HABILITADO | recuperación confirmada", now_ts)
-        elif until_ok and cooldown_ok:
-            protection_rearm_blocked = False
-            protection_rearm_blocked_until = 0.0
-            _protection_diag_event_once("REARME_TIMEOUT", "PROTECCION_SALDO: REARME HABILITADO | cooldown cumplido", now_ts)
-        else:
-            trigger_mode = ""
-
-    if (not protection_pause_active) and trigger_mode:
-        protection_pause_active = True
-        protection_mode = str(trigger_mode)
-        protection_pause_reason = str(trigger_reason or trigger_mode.upper())
-        protection_pause_started_ts = now_ts
-        protection_pause_min_seconds = float(PROTECTION_SHOCK_MIN_S if trigger_mode == "shock" else PROTECTION_TREND_MIN_S)
-        protection_pause_until_ts = now_ts + float(protection_pause_min_seconds)
-        protection_pause_extended_count = 0
-        protection_pause_last_trigger_ts = now_ts
-        protection_last_trigger_ts = now_ts
-        protection_release_ok_streak = 0
-        protection_release_score = 0
-        protection_peak_ref = float(peak_ref)
-        protection_worst_saldo = float(now_eq)
-        protection_worst_dd = float(dd_now)
-        protection_last_new_low_ts = now_ts
-        protection_resume_status = "WAIT_MIN_TIME"
-        protection_incident_reason = str(protection_pause_reason)
-        protection_incident_anchor_peak = float(peak_ref)
-        protection_incident_anchor_ts = now_ts
-        protection_incident_id = _build_equity_protection_incident_id(
-            reason=protection_incident_reason,
-            anchor_peak=protection_incident_anchor_peak,
-            drawdown_pct=protection_incident_last_drawdown,
-        )
-        protection_incident_lock_active = True
-        try:
-            mins = int(round(float(protection_pause_min_seconds) / 60.0))
-            agregar_evento(f"PROTECCION_SALDO: ACTIVADA | mode={trigger_mode.upper()} | min_pause={mins}m | reason={protection_pause_reason}")
-        except Exception:
-            pass
-
-    if protection_pause_active:
-        protection_last_eval_ts = now_ts
-        protection_worst_saldo = float(min(float(protection_worst_saldo or now_eq), now_eq))
-        protection_worst_dd = float(max(float(protection_worst_dd or 0.0), dd_now))
-        if now_eq <= float(protection_worst_saldo or now_eq) + 1e-9:
-            protection_last_new_low_ts = now_ts
-            protection_release_ok_streak = 0
-        if now_ts < float(protection_pause_until_ts or 0.0):
-            protection_resume_status = "WAIT_MIN_TIME"
-        else:
-            margin_stab = max(0.3 * vol_base, 0.002 * max(now_eq, 1.0))
-            last_10 = eq_eval.tail(10)
-            min_10 = float(last_10.min()) if len(last_10) > 0 else now_eq
-            min_idx = last_10.idxmin() if len(last_10) > 0 else eq_eval.index[-1]
-            min_pos = eq_eval.index.get_loc(min_idx)
-            min_age_samples = max(0, len(eq_eval) - 1 - int(min_pos))
-            min_age_s = float(min_age_samples * 60.0)
-            no_new_lows = bool(min_age_s >= float(PROTECTION_NO_NEW_LOWS_STALE_S) and now_eq >= (float(protection_worst_saldo or min_10) + margin_stab))
-            ema_prev = float(ema_short.iloc[max(0, len(ema_short) - 4)])
-            ema_slope = float(ema_short.iloc[-1] - ema_prev)
-            ema_turn_ok = bool(ema_slope >= max(-0.05 * vol_base, -0.01 * max(vol_base, 1.0)))
-            dd_recovery_ok = bool(dd_now <= float(protection_worst_dd or dd_now) * 0.70)
-            calm_band = float(ema_long.iloc[-1] - 0.5 * vol_base)
-            calm_band_ok = bool(now_eq >= calm_band)
-            release_score = int(no_new_lows) + int(ema_turn_ok) + int(dd_recovery_ok) + int(calm_band_ok)
-            protection_no_new_lows_ok = bool(no_new_lows)
-            protection_ema_turn_ok = bool(ema_turn_ok)
-            protection_dd_recovery_ok = bool(dd_recovery_ok)
-            protection_calm_band_ok = bool(calm_band_ok)
-            protection_release_score = int(release_score)
-            protection_resume_status = "EVALUATING_RELEASE"
-            if release_score >= 3:
-                protection_release_ok_streak = int(protection_release_ok_streak or 0) + 1
-            else:
-                protection_release_ok_streak = 0
-            if int(protection_release_ok_streak) >= 3:
-                protection_pause_active = False
-                protection_pause_reason = ""
-                protection_pause_started_ts = 0.0
-                protection_pause_until_ts = 0.0
-                protection_rearm_blocked = True
-                protection_rearm_blocked_until = float(now_ts + float(PROTECTION_REARM_COOLDOWN_S))
-                protection_last_release_ts = now_ts
-                protection_resume_status = "RELEASED_CONFIRMED"
-                protection_mode = ""
-                try:
-                    agregar_evento("PROTECCION_SALDO: FINALIZADA | salida confirmada por estabilidad")
-                except Exception:
-                    pass
-            elif now_ts >= float(protection_pause_until_ts or 0.0):
-                protection_pause_until_ts = now_ts + float(PROTECTION_EXTENSION_S)
-                protection_pause_extended_count = int(protection_pause_extended_count or 0) + 1
-                protection_resume_status = "EXTENDED_WEAK_TREND"
-                _protection_diag_event_once(
-                    "PROTECTION_EXTENDED",
-                    "PROTECCION_SALDO: protección extendida 10m | tendencia sigue débil",
-                    now_ts,
-                )
-
-    if protection_pause_active and (now_ts - float(PROTECTION_LAST_ACTIVE_LOG_TS or 0.0)) >= float(PROTECTION_LOG_COOLDOWN_S):
-        PROTECTION_LAST_ACTIVE_LOG_TS = now_ts
-        mode_txt = str(protection_mode or "trend").upper()
-        try:
-            agregar_evento(
-                f"PROTECCION_SALDO: ACTIVA | {mode_txt} | left={_fmt_protection_countdown(_equity_protection_time_left_s(now_ts))} | rel={int(protection_release_ok_streak or 0)}/3"
-            )
-        except Exception:
-            pass
-
-    _write_protection_health_state(now_ts)
-
-
 # Obtener saldo real
 async def obtener_saldo_real():
-    global saldo_real, ULTIMA_ACT_SALDO, SALDO_LAST_VALID_VALUE, SALDO_LAST_VALID_TS
+    global saldo_real, ULTIMA_ACT_SALDO
     token_demo, token_real = leer_tokens_usuario()
     if not token_real:
-        _set_saldo_status("STALE" if SALDO_LAST_VALID_VALUE is not None else "UNKNOWN", "TOKEN_REAL_MISSING", announce=True)
         return
     if not WEBSOCKETS_OK:
-        _set_saldo_status("STALE" if SALDO_LAST_VALID_VALUE is not None else "UNKNOWN", "WEBSOCKET_UNAVAILABLE", announce=True)
         return
     try:
         async with websockets.connect(DERIV_WS_URL) as ws:
@@ -17228,35 +15533,19 @@ async def obtener_saldo_real():
             await ws.send(auth_msg)
             resp = json.loads(await ws.recv())
             if "error" in resp:
-                detail = str((resp.get("error") or {}).get("message") or "auth rechazado")
-                _set_saldo_status("STALE" if SALDO_LAST_VALID_VALUE is not None else "UNKNOWN", "AUTH_FAILED", detail=detail, announce=True)
+                print(f"⚠️ Error en auth: {resp['error']['message']}")
                 return
             bal_msg = json.dumps({"balance": 1, "subscribe": 1})
             await ws.send(bal_msg)
             resp = json.loads(await ws.recv())
             if "error" in resp:
-                detail = str((resp.get("error") or {}).get("message") or "balance rechazado")
-                _set_saldo_status("STALE" if SALDO_LAST_VALID_VALUE is not None else "UNKNOWN", "BALANCE_FAILED", detail=detail, announce=True)
+                print(f"⚠️ Error en balance: {resp['error']['message']}")
                 return
-            balance_obj = resp.get("balance")
-            if isinstance(balance_obj, dict) and ("balance" in balance_obj):
-                try:
-                    val = float(balance_obj.get("balance"))
-                except Exception:
-                    _set_saldo_status("UNKNOWN", "BALANCE_PARSE_FAILED", detail="valor no numérico", announce=True)
-                    return
-                saldo_real = f"{val:.2f}"
+            if "balance" in resp:
+                saldo_real = f"{resp['balance']['balance']:.2f}"
                 ULTIMA_ACT_SALDO = time.time()
-                SALDO_LAST_VALID_VALUE = float(val)
-                SALDO_LAST_VALID_TS = float(ULTIMA_ACT_SALDO)
-                _set_saldo_status("KNOWN", "OK", announce=False)
-                _persistir_saldo_live()
-                if SALDO_INICIAL is None:
-                    inicializar_saldo_real(val)
-                return
-            _set_saldo_status("STALE" if SALDO_LAST_VALID_VALUE is not None else "UNKNOWN", "BALANCE_NOT_READ", detail="respuesta sin campo balance", announce=True)
     except Exception as e:
-        _set_saldo_status("STALE" if SALDO_LAST_VALID_VALUE is not None else "UNKNOWN", "EXCEPTION", detail=str(e), announce=True)
+        print(f"⚠️ Error obteniendo saldo: {e}")
 
 async def refresh_saldo_real(forzado=False):
     global ULTIMA_ACT_SALDO
@@ -17264,26 +15553,16 @@ async def refresh_saldo_real(forzado=False):
         await obtener_saldo_real()
 
 def obtener_valor_saldo():
-    global saldo_real, SALDO_STATUS, SALDO_LAST_VALID_VALUE
+    global saldo_real
     try:
-        val = float(saldo_real)
-        if np.isfinite(val):
-            return val
+        return float(saldo_real)
     except:
-        pass
-    if SALDO_LAST_VALID_VALUE is not None:
-        try:
-            val_last = float(SALDO_LAST_VALID_VALUE)
-            if np.isfinite(val_last):
-                return val_last
-        except Exception:
-            pass
-    return None
+        return None
 
 def inicializar_saldo_real(valor):
     global SALDO_INICIAL, META
     SALDO_INICIAL = round(valor, 2)
-    META = round(SALDO_INICIAL * (1.0 + float(META_OBJETIVO_PCT)), 2)
+    META = round(SALDO_INICIAL * 1.20, 2)
 
 # Escuchar teclas
 def escuchar_teclas():
@@ -17510,10 +15789,6 @@ def _boot_health_check():
             msgs.append("⚠️ Dependencia faltante: websockets (sin WS/saldo, resto del HUD sigue).")
         if not PYGAME_OK:
             msgs.append("⚠️ Dependencia faltante: pygame (audio desactivado, ejecución continúa).")
-        if str(SALDO_STATUS).upper() != "KNOWN":
-            reason_txt = _saldo_status_text(SALDO_STATUS_REASON)
-            detail_txt = f" ({SALDO_STATUS_DETAIL})" if str(SALDO_STATUS_DETAIL or "").strip() else ""
-            msgs.append(f"⚠️ Estado de saldo al arranque: {reason_txt}{detail_txt}.")
         csv_presentes = [b for b in BOT_NAMES if os.path.exists(f"registro_enriquecido_{b}.csv")]
         if not csv_presentes:
             msgs.append("⚠️ No hay CSV enriquecidos de bots todavía; esperando generación de datos.")
@@ -17569,7 +15844,6 @@ async def main():
 
     try:
         set_etapa("BOOT_01", "Inicializando main()", anunciar=True)
-        reset_barrier_state_on_start()
         # Seguridad: NO borrar real.lock al arrancar; evita carreras entre instancias.
         set_etapa("BOOT_02", "Leyendo tokens de usuario")
         tokens = leer_tokens_usuario()
@@ -17732,19 +16006,7 @@ async def main():
                                     estado_bots[bot]["real_timeout_first_warn"] = ahora
                                     agregar_evento(f"⏱️ Seguridad: {bot} sin actividad reciente en REAL. Esperando cierre por {REAL_STUCK_FORCE_RELEASE_S}s antes de liberar.")
                                 elif (ahora - first_warn) > REAL_STUCK_FORCE_RELEASE_S:
-                                    try:
-                                        last_discard = str((globals().get("_CLOSE_DIAG_LAST_REASON", {}) or {}).get(str(bot), "")).strip()
-                                        extra = f" last_discard={last_discard}" if last_discard else ""
-                                        agregar_evento(
-                                            f"🔎 CIERRE REAL {bot}: timeout sin cierre válido "
-                                            f"(require_closed=True, require_real_token=True, expected_ciclo={estado_bots.get(bot, {}).get('ciclo_actual', None)}{extra})"
-                                        )
-                                    except Exception:
-                                        pass
                                     agregar_evento(f"🧯 Timeout REAL en {bot}: sin cierre confirmado. Liberando a DEMO sin avanzar martingala.")
-                                    agregar_evento(
-                                        f"MARTI_MAESTRO: timeout/indefinido -> conserva ciclo {_marti_ciclo_tag(_marti_ciclo_operativo_actual())} y vuelve a DEMO"
-                                    )
                                     cerrar_por_fin_de_ciclo(bot, "Timeout sin cierre")
                                     activo_real = None
                                     break
@@ -17779,16 +16041,9 @@ async def main():
                                 if res in ("GANANCIA", "PÉRDIDA"):
                                     registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
                                     if res == "GANANCIA":
-                                        cerrar_por_win(bot, "Ganancia en REAL (fin de turno)")
+                                        cerrar_por_fin_de_ciclo(bot, "Ganancia en REAL (fin de turno)")
                                     else:
-                                        cerrar_por_fin_de_ciclo(bot, "Pérdida en REAL (avance de ciclo)" if int(marti_ciclos_perdidos) > 0 else "Pérdida final en REAL (fin de secuencia)")
-                                    activo_real = None
-                                    break
-                                else:
-                                    agregar_evento(
-                                        f"MARTI_MAESTRO: timeout/indefinido -> conserva ciclo {_marti_ciclo_tag(_marti_ciclo_operativo_actual())} y vuelve a DEMO"
-                                    )
-                                    cerrar_por_fin_de_ciclo(bot, "Cierre indefinido en REAL (sin avanzar martingala)")
+                                        cerrar_por_fin_de_ciclo(bot, "Pérdida en REAL (fin de turno)")
                                     activo_real = None
                                     break
 
@@ -17806,7 +16061,7 @@ async def main():
                             _enforce_single_real_standby(activo_real)
 
                         # Umbral maestro calibrado con históricos de Prob IA (top quantil),
-                        # acotado por [AUTO_REAL_DISABLED_THR_MIN .. AUTO_REAL_DISABLED_THR] para activar REAL
+                        # acotado por [AUTO_REAL_THR_MIN .. AUTO_REAL_THR] para activar REAL
                         # usando los valores altos observados recientemente.
                         if REAL_CLASSIC_GATE:
                             umbral_ia_real = float(_umbral_real_operativo_actual())
@@ -17829,8 +16084,11 @@ async def main():
                             umbral_ia_real = max(float(REAL_TRIGGER_MIN), float(get_umbral_real_calibrado()))
                             dyn_gate = None
 
-                        # Saldo informativo: distinguir saldo desconocido de saldo insuficiente real.
-                        saldo_val = obtener_valor_saldo()
+                        # Saldo informativo: no bloquear por colchón completo, solo por ciclo ejecutable.
+                        try:
+                            saldo_val = float(obtener_valor_saldo() or 0.0)
+                        except Exception:
+                            saldo_val = 0.0
                         costo_ciclo1 = float(MARTI_ESCALADO[0])
                         costo_plan = float(sum(MARTI_ESCALADO[:max(1, int(MAX_CICLOS))]))
 
@@ -17889,7 +16147,6 @@ async def main():
                             )
                         _log_operational_degradation_runtime(ttl_s=60.0)
 
-                        lxv_sync_promo_mode = bool(LXV_PROMO_REAL_SOLO_SYNC and LXV_CORE_ENABLE and LXV_CORE_REAL_ROUTE_ENABLE)
                         for b in BOT_NAMES:
                             try:
                                 modo_b = str(estado_bots.get(b, {}).get("modo_ia", "off")).lower()
@@ -17979,6 +16236,20 @@ async def main():
                                     )
                                     continue
 
+                                # Guardas por bot (alineadas al HUD): evitar promoción cuando hay
+                                # desalineación severa entre probabilidad y performance real reciente.
+                                if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (ev_wr < float(IA_PROMO_MIN_WR_POR_BOT)):
+                                    agregar_evento(
+                                        f"🧱 Guarda WR bot: {b} bloqueado (WR={ev_wr*100:.1f}% < {IA_PROMO_MIN_WR_POR_BOT*100:.1f}%, n={ev_n})."
+                                    )
+                                    continue
+                                overconf_gap = float(p_post) - float(ev_wr)
+                                if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (overconf_gap > float(IA_PROMO_MAX_OVERCONF_GAP)):
+                                    agregar_evento(
+                                        f"🧯 Guarda calibración: {b} bloqueado (p_real-WR={overconf_gap*100:.1f}pp > {IA_PROMO_MAX_OVERCONF_GAP*100:.1f}pp)."
+                                    )
+                                    continue
+
                                 # Candado final: umbral REAL por bot/contexto con fallback global
                                 thr_post, thr_reason = _umbral_real_por_bot_contexto(b, ctx, umbral_ia_real)
                                 estado_bots[b]["ia_thr_real_bot"] = float(thr_post)
@@ -17991,8 +16262,11 @@ async def main():
                                 pat_bonus_col, pat_penal_col, pat_delta_col = aplicar_ajuste_patron_score(pat_state)
                                 k_pts_pat = float(PATTERN_V1_HYBRID_PTS_TO_PROB)
                                 thr_post_ctx = float(thr_post)
-                                if False:  # CUARENTENA FUNCIONAL pattern columns
-                                    pass
+                                if bool(PATTERN_ENABLE):
+                                    if float(pat_delta_col) < 0.0:
+                                        thr_post_ctx = min(0.99, float(thr_post_ctx) + abs(float(pat_delta_col)) * k_pts_pat)
+                                    elif float(pat_delta_col) > 0.0:
+                                        thr_post_ctx = max(0.0, float(thr_post_ctx) - min(0.02, float(pat_delta_col) * k_pts_pat))
                                 estado_bots[b]["ia_pattern_col_state"] = str(pat_state.get("pattern_state", "BLOQUEADO"))
                                 estado_bots[b]["ia_pattern_col_ratio"] = pat_state.get("green_ratio_col_actual", None)
                                 estado_bots[b]["ia_pattern_rebote_hist"] = pat_state.get("rebote_rate_hist", None)
@@ -18032,7 +16306,7 @@ async def main():
                                 pattern_bonus_b = 0.0
                                 pattern_penal_b = 0.0
                                 score_hibrido = float(score_final)
-                                if False:  # CUARENTENA FUNCIONAL pattern v1
+                                if bool(PATTERN_V1_ENABLE) and bool(PATTERN_V1_USE_HYBRID_RANKING):
                                     q3_proxy, q2_proxy = _pattern_v1_thresholds_proxy()
                                     pattern_score_b, pattern_bonus_b, pattern_penal_b, pattern_total_b = pattern_score_operativo_v1(ctx, q3_proxy, q2_proxy)
                                     # Ajuste en escala probabilística (evita mezclar puntos de pattern con prob 0..1)
@@ -18067,7 +16341,7 @@ async def main():
                                 continue
 
                             candidatos.sort(key=lambda x: x[0], reverse=True)
-                            if False and candidatos and raw_rank_scores:  # CUARENTENA FUNCIONAL pattern v1
+                            if bool(PATTERN_V1_ENABLE) and bool(PATTERN_V1_USE_HYBRID_RANKING) and candidatos and raw_rank_scores:
                                 try:
                                     raw_rank_scores.sort(key=lambda x: x[0], reverse=True)
                                     top_raw = str(raw_rank_scores[0][1])
@@ -18094,34 +16368,9 @@ async def main():
                                     )
 
                             # Selección automática: tomar la mejor señal elegible >= umbral REAL vigente.
-                        if lxv_sync_promo_mode:
-                            candidatos_lxv = []
-                            for b in BOT_NAMES:
-                                try:
-                                    modo_b = str(estado_bots.get(b, {}).get("modo_ia", "off")).lower()
-                                    if modo_b == "off":
-                                        continue
-                                    if not ia_prob_valida(b, max_age_s=12.0):
-                                        continue
-                                    p = _prob_ia_operativa_bot(b, default=None)
-                                    if not isinstance(p, (int, float)):
-                                        continue
-                                    ctx_lxv = _ultimo_contexto_operativo_bot(b)
-                                    regime_lxv = float(_score_regimen_contexto(ctx_lxv))
-                                    ev_lxv = _evidencia_bot_umbral_objetivo(b)
-                                    ev_n_lxv = int(ev_lxv.get("n", 0) or 0)
-                                    ev_wr_lxv = float(ev_lxv.get("wr", 0.0) or 0.0)
-                                    ev_lb_lxv = float(ev_lxv.get("lb", 0.0) or 0.0)
-                                    p_lxv = float(p)
-                                    candidatos_lxv.append((p_lxv, b, p_lxv, p_lxv, regime_lxv, ev_n_lxv, ev_wr_lxv, ev_lb_lxv))
-                                except Exception:
-                                    continue
-                            if candidatos_lxv:
-                                candidatos = sorted(candidatos_lxv, key=lambda x: x[0], reverse=True)
-                                agregar_evento(f"LXV_SYNC_PROMO_MODE: candidatos_lxv={len(candidatos)} (gates IA laterales en bypass)")
 
                         # Si hay señal y el saldo no cubre el plan completo, solo avisar (no bloquear).
-                        if candidatos and (saldo_val is not None) and saldo_val < costo_plan:
+                        if candidatos and saldo_val < costo_plan:
                             ahora_warn = time.time()
                             last_warn = float(DYN_ROOF_STATE.get("last_low_balance_warn_ts", 0.0) or 0.0)
                             if (ahora_warn - last_warn) >= float(DYN_ROOF_LOW_BAL_WARN_COOLDOWN_S):
@@ -18136,175 +16385,36 @@ async def main():
                                     )
                                 DYN_ROOF_STATE["last_low_balance_warn_ts"] = float(ahora_warn)
 
-                        if candidatos:
+                        # Estado operativo REAL (SOMBRA -> MICRO -> NORMAL)
+                        try:
+                            estado_real = _resolver_estado_real(None)
+                        except Exception:
+                            estado_real = "SHADOW"
+
+                        if candidatos and estado_real == "SHADOW":
                             candidatos.sort(key=lambda x: float(x[2]), reverse=True)
-                        logica_unica_real = _resolver_lxv_sincronizado(candidatos, estado_bots, BOT_NAMES, emitir_log=True)
-                        lxv_permite_real_nuevo = bool(logica_unica_real.get("triggered", False))
-                        barrier_round_id = int(logica_unica_real.get("round", 0) or 0)
-                        agregar_evento(
-                            f"LXV_CORE_COLUMN round={int(logica_unica_real.get('round', 0) or 0)} "
-                            f"verdes={int(logica_unica_real.get('greens', 0) or 0)} "
-                            f"rojos={int(logica_unica_real.get('reds', 0) or 0)} "
-                            f"validos={int(logica_unica_real.get('valids', 0) or 0)}"
-                        )
-                        barrier_ok = True
-                        barrier_pending_round = []
-                        barrier_resolution_reason = "ok"
-                        if bool(BARRIER_ENABLED):
-                            try:
-                                if bool(LXV_CORE_ENABLE):
-                                    canon_round, canon_ok, pending_round, canon_reason, round_state = _lxv_core_resolver_ronda(
-                                        logica_unica_real=logica_unica_real,
-                                        bot_names=BOT_NAMES,
-                                    )
-                                    barrier_round_id = int(canon_round)
-                                    barrier_ok = bool(canon_ok)
-                                    barrier_pending_round = list(pending_round or [])
-                                    barrier_resolution_reason = str(canon_reason or "wait_ack")
-                                else:
-                                    st_bar = leer_barrier_state() or {}
-                                    canon_round, canon_ok, pending_round, canon_reason = resolver_barrier_round_canonico(
-                                        st_bar=st_bar,
-                                        logica_unica_real=logica_unica_real,
-                                        bot_names=BOT_NAMES,
-                                    )
-                                    barrier_round_id = int(canon_round)
-                                    barrier_ok = bool(canon_ok)
-                                    barrier_pending_round = list(pending_round or [])
-                                    barrier_resolution_reason = str(canon_reason or "wait_ack")
-                            except Exception:
-                                barrier_ok = False
-                                barrier_resolution_reason = "barrier_error"
-                                agregar_evento("LXV_CORE_TIMEOUT round=0 missing_bots=[]")
-                        if (not barrier_ok) and (not barrier_pending_round) and int(barrier_round_id) > 0:
-                            try:
-                                barrier_pending_round = list(barrier_round_pendiente(int(barrier_round_id)) or [])
-                            except Exception:
-                                barrier_pending_round = list(barrier_pending_round or [])
-                        if barrier_pending_round:
-                            faltan_gate = ",".join(list(barrier_pending_round or []))
-                        else:
-                            faltan_gate = "unknown" if (not barrier_ok and int(barrier_round_id) > 0) else "--"
-                        agregar_evento(
-                            f"ROUND_GATE_DIAG common_round={int(logica_unica_real.get('round', 0) or 0)} "
-                            f"barrier_round={int(barrier_round_id)} barrier_ok={1 if bool(barrier_ok) else 0} "
-                            f"faltan={faltan_gate} reason={str(barrier_resolution_reason or '--')}"
-                        )
-                        visual_aligned = int(logica_unica_real.get("valids", 0) or 0) >= int(len(BOT_NAMES))
-                        if bool(visual_aligned) != bool(barrier_ok):
-                            agregar_evento(
-                                f"ROUND_BLOCKED_ACK_MISMATCH round={int(barrier_round_id)} "
-                                f"common_round={int(logica_unica_real.get('round', 0) or 0)} "
-                                f"barrier_round={int(barrier_round_id)} barrier_ok={1 if bool(barrier_ok) else 0} "
-                                f"visual_aligned={1 if bool(visual_aligned) else 0} faltan={faltan_gate} diag_only=1"
-                            )
-                        if not barrier_ok:
-                            lxv_permite_real_nuevo = False
-                        selected_bot_operativo = ""
-                        selected_prob_operativo = 0.0
-                        real_source_operativo = "LXV_SINCRONIZADO"
-                        if lxv_permite_real_nuevo:
-                            selected_bot = str(logica_unica_real.get("selected_bot") or "").strip()
-                            rec = next((c for c in list(candidatos or []) if str(c[1]) == selected_bot), None)
-                            selected_prob = 0.0
-                            if rec is not None and len(rec) > 2 and isinstance(rec[2], (int, float)):
-                                selected_prob = float(rec[2] or 0.0)
-                            else:
-                                selected_prob = float(_prob_ia_operativa_bot(selected_bot, default=0.0) or 0.0)
-                                st_res = estado_bots.get(selected_bot, {}) if isinstance(estado_bots, dict) else {}
-                                rec = (
-                                    float(st_res.get("ia_score_hibrido", selected_prob) or selected_prob),
-                                    str(selected_bot),
-                                    float(selected_prob),
-                                    float(selected_prob),
-                                    float(st_res.get("ia_regime_score", 0.0) or 0.0),
-                                    int(st_res.get("ia_evidence_n", 0) or 0),
-                                    float(st_res.get("ia_evidence_wr", 0.0) or 0.0),
-                                    float(st_res.get("ia_evidence_lb", 0.0) or 0.0),
-                                )
-                            candidatos = [rec]
-                            selected_bot_operativo = str(selected_bot)
-                            selected_prob_operativo = float(selected_prob)
-                            if isinstance(estado_bots, dict) and selected_bot_operativo in estado_bots:
-                                estado_bots[selected_bot_operativo]["real_source"] = str(real_source_operativo)
-                        else:
+                            candidatos = candidatos[:max(1, int(REAL_SHADOW_MICRO_TOP_K))]
+                        elif candidatos and estado_real == "MICRO":
+                            candidatos.sort(key=lambda x: float(x[2]), reverse=True)
+                            candidatos = candidatos[:max(1, int(REAL_MICRO_TOP_K))]
+
+                        embudo = _resolver_embudo_final(candidatos, dyn_gate, estado_real, resolver_canary_estado(leer_model_meta() or {}))
+                        decision_final = str(embudo.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
+                        if decision_final == EMBUDO_FINAL_BLOCK_HARD:
+                            agregar_evento(f"🛑 EMBUDO {decision_final}: {embudo.get('hard_block_reason') or embudo.get('decision_reason')}")
                             candidatos = []
-
-                        # LXV soberana para NUEVA entrada REAL:
-                        # - LXV decide activación estructural.
-                        # - vetos heredados del embudo se conservan como telemetría (no veto operativo aquí).
-                        try:
-                            meta_lxv = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
-                        except Exception:
-                            meta_lxv = {}
-                        try:
-                            rep_lxv = auditar_calibracion_seniales_reales(min_prob=float(IA_CALIB_THRESHOLD)) or {}
-                        except Exception:
-                            rep_lxv = {}
-                        try:
-                            hg_lxv = _estado_guardrail_ia_fuerte(force=False) or {}
-                        except Exception:
-                            hg_lxv = {}
-
-                        reliable_lxv = bool(meta_lxv.get("reliable", False))
-                        auc_lxv = float(meta_lxv.get("auc", 0.0) or 0.0)
-                        closed_lxv = int(rep_lxv.get("n_total_closed", rep_lxv.get("n", 0)) or 0)
-                        roof_lxv = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
-                        confirm_st_lxv = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
-                        confirm_need_lxv = int(DYN_ROOF_STATE.get("last_confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
-                        trigger_ok_lxv = bool(DYN_ROOF_STATE.get("last_trigger_ok", False))
-                        roof_ok_lxv = bool(selected_prob_operativo >= roof_lxv) if selected_bot_operativo else False
-                        confirm_ok_lxv = bool(confirm_st_lxv >= confirm_need_lxv)
-                        hard_guard_lxv = bool(hg_lxv.get("hard_block", False))
-                        veto_flags_info = []
-                        if not reliable_lxv:
-                            veto_flags_info.append("veto_modelo=informativo(reliable=false)")
-                        if not trigger_ok_lxv:
-                            veto_flags_info.append("veto_trigger=informativo(trigger_ok=no)")
-                        if not roof_ok_lxv:
-                            veto_flags_info.append("veto_roof=informativo")
-                        if not confirm_ok_lxv:
-                            veto_flags_info.append("veto_confirm=informativo")
-                        if auc_lxv < 0.53:
-                            veto_flags_info.append("veto_auc=informativo")
-                        if closed_lxv < int(REAL_GO_CLOSED_MIN):
-                            veto_flags_info.append(f"veto_closed=informativo({closed_lxv}<{int(REAL_GO_CLOSED_MIN)})")
-                        if hard_guard_lxv:
-                            veto_flags_info.append("veto_hard_guard=informativo")
-
-                        if lxv_permite_real_nuevo and selected_bot_operativo:
-                            agregar_evento(
-                                f"LXV_SYNC_CANDIDATE: SI | bot={selected_bot_operativo} | greens={int(logica_unica_real.get('greens', 0) or 0)} "
-                                f"| reds={int(logica_unica_real.get('reds', 0) or 0)} | case={str(logica_unica_real.get('selected_case') or '--')} "
-                                f"| ronda={int(logica_unica_real.get('round', 0) or 0)} | score={float(logica_unica_real.get('selected_score', 0.0) or 0.0):.2f} | source=LXV_CORE | "
-                                f"decision_final=CANDIDATO_REAL"
-                            )
-                            agregar_evento(
-                                f"LXV_SYNC_STAGE round={int(logica_unica_real.get('round', 0) or 0)} stage=candidate_ready motivo=ok"
-                            )
-                            agregar_evento(f"LXV_SYNC_CANDIDATE_READY: columna sincronizada -> candidato REAL {selected_bot_operativo}")
-                            if veto_flags_info:
-                                agregar_evento("LXV_INFO: " + " | ".join(veto_flags_info[:6]))
-                        elif not lxv_permite_real_nuevo:
-                            motivo_struct = str(logica_unica_real.get('reason') or 'estructura_insuficiente')
-                            agregar_evento(
-                                f"LXV_SYNC_CANDIDATE: NO | motivo_estructural={motivo_struct} "
-                                f"| round={int(logica_unica_real.get('round', 0) or 0)}"
-                            )
-                            agregar_evento(
-                                f"LXV_SYNC_STAGE round={int(logica_unica_real.get('round', 0) or 0)} stage=candidate_rejected motivo={motivo_struct}"
-                            )
-                        agregar_evento(
-                            f"LXV_CORE_DECISION round={int(logica_unica_real.get('round', 0) or 0)} "
-                            f"caso={str(logica_unica_real.get('selected_case') or '--')} "
-                            f"selected_bot={str(selected_bot_operativo or '--')} "
-                            f"real={'SI' if (lxv_permite_real_nuevo and barrier_ok) else 'NO'}"
-                        )
+                        elif decision_final == EMBUDO_FINAL_WAIT_SOFT:
+                            agregar_evento(f"⏳ EMBUDO WAIT: {embudo.get('soft_wait_reason') or embudo.get('decision_reason')}")
+                            candidatos = []
+                        elif decision_final == EMBUDO_FINAL_SHADOW_OK:
+                            agregar_evento(f"🕶️ EMBUDO SHADOW_OK: {embudo.get('decision_reason')}")
+                            candidatos = []
+                        elif decision_final == EMBUDO_FINAL_REAL_MICRO:
+                            candidatos = candidatos[:1]
 
                         # ==================== AUTO-PRESELECCIÓN (MODO MANUAL) ====================
                         # Si la IA detecta señal y tú estás en manual, preselecciona el mejor bot y abre la ventana
                         # para que solo elijas el ciclo (1..MAX_CICLOS) dentro del tiempo.
-                        _equity_protection_update()
                         if MODO_REAL_MANUAL:
                             ahora = time.time()
 
@@ -18320,11 +16430,12 @@ async def main():
                                 ciclo_auto = ciclo_martingala_siguiente()
                                 if reset_martingala_por_saldo(ciclo_auto, saldo_val):
                                     ciclo_auto = 1
-                                mejor_bot = str(selected_bot_operativo or "").strip()
+                                emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+                                mejor_bot = str(emb.get("top1_bot") or "").strip()
                                 mejor = next((c for c in candidatos if str(c[1]) == mejor_bot), None)
                                 if mejor is not None:
                                     score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
-                                    agregar_evento(f"🧠 LOGICA_UNICA_REAL (manual): ganador único={mejor_bot} | p_oper={prob*100:.1f}%")
+                                    agregar_evento(f"🧠 Embudo IA (manual): ganador único={mejor_bot} | p_oper={prob*100:.1f}% | risk={emb.get('risk_mode','--')}")
                                     PENDIENTE_FORZAR_BOT = mejor_bot
                                     PENDIENTE_FORZAR_INICIO = ahora
                                     PENDIENTE_FORZAR_EXPIRA = ahora + VENTANA_DECISION_IA_S
@@ -18339,307 +16450,57 @@ async def main():
                                     )
                         # ==================== /AUTO-PRESELECCIÓN ====================
 
-                        lxv_sync_order_payload = None
-                        if lxv_permite_real_nuevo and selected_bot_operativo:
-                            try:
-                                consumir_lxv_consumed_ack(str(selected_bot_operativo))
-                            except Exception:
-                                pass
-                            try:
-                                round_lxv = int(logica_unica_real.get("round", 0) or 0)
-                                cells_lxv = dict(logica_unica_real.get("cells", {}) or {})
-                                selected_case = str(logica_unica_real.get("selected_case") or "")
-                                snapshot_id, cells_hash = _build_lxv_sync_snapshot_id(
-                                    round_lxv=round_lxv,
-                                    cells=cells_lxv,
-                                    selected_bot=str(selected_bot_operativo),
-                                    selected_case=selected_case,
+                        if candidatos and not MODO_REAL_MANUAL:
+                            meta_live = resolver_canary_estado(leer_model_meta() or {})
+                            embudo_live = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+                            dec_live = str(embudo_live.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
+                            risk_live = str(embudo_live.get("risk_mode", "WAIT_SOFT"))
+                            if dec_live in (EMBUDO_FINAL_REAL_MICRO, EMBUDO_FINAL_REAL_NORMAL):
+                                agregar_evento(
+                                    f"🧭 EMBUDO listo: {dec_live} | risk={risk_live} | gate={embudo_live.get('gate_quality','--')} "
+                                    f"| top1={embudo_live.get('top1_bot') or '--'}"
                                 )
-                                is_repeated = bool(
-                                    snapshot_id
-                                    and (
-                                        str(snapshot_id) == str(LAST_LXV_SYNC_SNAPSHOT_CONSUMED or "")
-                                        or int(round_lxv) <= int(LAST_LXV_SYNC_ROUND_CONSUMED or 0)
-                                    )
-                                )
-                                if is_repeated:
-                                    lxv_permite_real_nuevo = False
-                                    logica_unica_real["triggered"] = False
-                                    logica_unica_real["reason"] = "snapshot_consumido_real"
-                                    agregar_evento(
-                                        f"LXV_SYNC_SKIP: ronda={int(round_lxv)} | snapshot={snapshot_id} | motivo=snapshot_consumido_real"
-                                    )
-                                elif round_lxv <= 0 or not cells_lxv:
-                                    lxv_permite_real_nuevo = False
-                                    logica_unica_real["triggered"] = False
-                                    logica_unica_real["reason"] = "snapshot_incompleto"
-                                    agregar_evento(
-                                        f"LXV_SYNC_SKIP: ronda={int(round_lxv)} | motivo=snapshot_incompleto"
-                                    )
-                                else:
-                                    if (
-                                        str(snapshot_id or "") == str(LAST_LXV_SYNC_SNAPSHOT_ARMED or "")
-                                        and int(round_lxv) == int(LAST_LXV_SYNC_ROUND_ARMED or 0)
-                                        and str(snapshot_id or "") != str(LAST_LXV_SYNC_SNAPSHOT_CONSUMED or "")
-                                    ):
-                                        agregar_evento(
-                                            f"LXV_CORE_SNAPSHOT_RETRY_ALLOWED round={int(round_lxv)} snapshot={snapshot_id} motivo=armed_sin_consumo_exitoso"
-                                        )
-                                    globals()["LAST_LXV_SYNC_SNAPSHOT_ARMED"] = str(snapshot_id or "")
-                                    globals()["LAST_LXV_SYNC_ROUND_ARMED"] = int(round_lxv)
-                                    agregar_evento(
-                                        f"LXV_CORE_SNAPSHOT_ARMED bot={str(selected_bot_operativo)} round={int(round_lxv)} snapshot={snapshot_id}"
-                                    )
-                                    lxv_sync_order_payload = {
-                                        "bot": str(selected_bot_operativo),
-                                        "src": "LXV_CORE",
-                                        "ciclo": int(ciclo_martingala_siguiente()),
-                                        "ts": float(time.time()),
-                                        "ttl": 120,
-                                        "round_lxv": int(round_lxv),
-                                        "snapshot_id": str(snapshot_id),
-                                        "selected_bot": str(selected_bot_operativo),
-                                        "selected_case": str(selected_case or ""),
-                                        "cells_hash": str(cells_hash),
-                                        "cells": cells_lxv,
-                                        "quiet": 1,
-                                    }
-                            except Exception as e_lxv_payload:
-                                lxv_permite_real_nuevo = False
-                                logica_unica_real["triggered"] = False
-                                logica_unica_real["reason"] = "snapshot_build_error"
-                                agregar_evento(f"LXV_SYNC_SKIP: motivo=snapshot_build_error ({type(e_lxv_payload).__name__})")
+                            else:
+                                candidatos = []
 
-                        lxv_core_route_active = bool(LXV_CORE_ENABLE and LXV_CORE_REAL_ROUTE_ENABLE)
-                        lxv_exec_handled = False
-                        if (not MODO_REAL_MANUAL) and lxv_permite_real_nuevo and ((not LXV_CORE_ENABLE) or lxv_core_route_active):
-                            lxv_exec_handled = True
+                        if candidatos and not MODO_REAL_MANUAL:
                             ciclo_auto = ciclo_martingala_siguiente()
                             if reset_martingala_por_saldo(ciclo_auto, saldo_val):
                                 ciclo_auto = 1
-                            mejor_bot = str(selected_bot_operativo or "").strip()
-                            monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
-                            ciclo_tag = _marti_ciclo_tag(ciclo_auto)
-                            snapshot_tag = str((lxv_sync_order_payload or {}).get("snapshot_id", "") or "--")
-                            round_tag = int((lxv_sync_order_payload or {}).get("round_lxv", 0) or 0)
-                            def _lxv_log_drop_prewrite(reason: str, started: bool = False):
-                                reason_txt = str(reason or "pre_write_drop")
-                                tag_bot = str(mejor_bot or '--')
-                                base = (
-                                    f"stage=pre_write reason={reason_txt} round={int(round_tag)} "
-                                    f"snapshot={snapshot_tag} bot={tag_bot}"
-                                )
-                                agregar_evento(f"LXV_PATH_DROPPED {base}")
-                                if started:
-                                    agregar_evento(f"LXV_EXEC_ABORTED {base}")
-                            if lxv_core_route_active and bool(LXV_CORE_BYPASS_GLOBAL_GATE) and veto_flags_info:
-                                agregar_evento(f"LXV_CORE_ROUTE_BYPASS gate_legacy={str(veto_flags_info[0])}")
-                            if not mejor_bot:
-                                _lxv_log_drop_prewrite("bot_invalido", started=False)
-                                if lxv_core_route_active:
-                                    agregar_evento("LXV_CORE_REAL_BLOCKED_HARD bot=-- motivo=selected_bot_invalido")
+                            emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+                            mejor_bot = str(emb.get("top1_bot") or "").strip()
+                            mejor = next((c for c in candidatos if str(c[1]) == mejor_bot), None)
+                            if mejor is not None:
+                                score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
+                                agregar_evento(f"⚙️ IA AUTO (embudo único): {mejor_bot} p_oper={prob*100:.1f}% risk={emb.get('risk_mode','--')} gate={emb.get('gate_quality','--')}")
+                                monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
+                                val = obtener_valor_saldo()
+                                if val is None or val < monto:
+                                    pass
                                 else:
-                                    agregar_evento("LXV_EXEC_BLOCKED: motivo=selected_bot_invalido")
-                            elif not isinstance(lxv_sync_order_payload, dict):
-                                _lxv_log_drop_prewrite("payload_incompleto", started=False)
-                                if lxv_core_route_active:
-                                    agregar_evento(f"LXV_CORE_REAL_BLOCKED_HARD bot={mejor_bot} motivo=payload_incompleto")
-                                else:
-                                    agregar_evento("LXV_EXEC_BLOCKED: motivo=payload_incompleto")
-                            else:
-                                agregar_evento(
-                                    f"LXV_EXEC_START: bot={mejor_bot} ciclo={ciclo_tag} round={round_tag} snapshot={snapshot_tag}"
-                                )
-                                owner_prev = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-                                owner_mem = next((b for b in BOT_NAMES if estado_bots.get(b, {}).get('token') == "REAL"), None)
-                                owner_activo = owner_prev if owner_prev in BOT_NAMES else (owner_mem if owner_mem in BOT_NAMES else None)
-                                if owner_activo and owner_activo != mejor_bot:
-                                    _lxv_log_drop_prewrite("owner_real_ocupado", started=True)
-                                    if lxv_core_route_active:
-                                        agregar_evento(f"LXV_CORE_REAL_BLOCKED_HARD bot={mejor_bot} motivo=owner_real_ocupado")
-                                    else:
-                                        agregar_evento(f"LXV_EXEC_BLOCKED: bot={mejor_bot} motivo=owner_real_ocupado")
-                                elif _equity_protection_is_active(time.time()):
-                                    _lxv_log_drop_prewrite("proteccion_saldo", started=True)
-                                    if lxv_core_route_active:
-                                        agregar_evento(f"LXV_CORE_REAL_BLOCKED_HARD bot={mejor_bot} motivo=proteccion_saldo")
-                                    else:
-                                        agregar_evento(f"LXV_EXEC_BLOCKED: bot={mejor_bot} motivo=proteccion_saldo")
-                                elif _bot_blocked_by_bg_close(mejor_bot):
-                                    _lxv_log_drop_prewrite("bg_close", started=True)
-                                    if lxv_core_route_active:
-                                        agregar_evento(f"LXV_CORE_REAL_BLOCKED_HARD bot={mejor_bot} motivo=bg_close")
-                                    else:
-                                        agregar_evento(f"LXV_EXEC_BLOCKED: bot={mejor_bot} motivo=bg_close")
-                                else:
-                                    if lxv_core_route_active:
-                                        agregar_evento(
-                                            f"LXV_CORE_REAL_ARMED bot={mejor_bot or '--'} case={str(logica_unica_real.get('selected_case') or '--')} "
-                                            f"score={float(logica_unica_real.get('selected_score', 0.0) or 0.0):.2f} round={int(round_tag)} snapshot={snapshot_tag}"
-                                        )
                                     estado_bots[mejor_bot]["ia_senal_pendiente"] = True
-                                    extra_payload = dict(lxv_sync_order_payload)
-                                    extra_payload["ciclo"] = int(ciclo_auto)
-                                    ok_real = escribir_orden_demo_neutralizado(mejor_bot, ciclo_auto, extra_payload=extra_payload)
+                                    estado_bots[mejor_bot]["ia_prob_senal"] = prob
+
+                                    # Handoff entre ciclos REAL: si quedó lock residual de otro bot,
+                                    # liberarlo antes de emitir la nueva orden para no bloquear rotación.
+                                    owner_prev = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+                                    if owner_prev and owner_prev != mejor_bot and ciclo_auto > 1:
+                                        cerrar_por_fin_de_ciclo(owner_prev, f"Handoff rotación C{ciclo_auto}→{mejor_bot}")
+
+                                    ok_real = escribir_orden_real(mejor_bot, ciclo_auto)
                                     if ok_real:
-                                        try:
-                                            globals()["LAST_LXV_SYNC_SNAPSHOT_ID"] = str(extra_payload.get("snapshot_id", "") or "")
-                                            globals()["LAST_LXV_SYNC_SELECTED_BOT"] = str(extra_payload.get("selected_bot", "") or "")
-                                            globals()["LAST_LXV_SYNC_TS"] = float(time.time())
-                                        except Exception:
-                                            pass
+                                        if estado_real == "SHADOW":
+                                            try:
+                                                _REAL_SHADOW_MICRO_OPEN_TS.append(float(time.time()))
+                                            except Exception:
+                                                pass
                                         estado_bots[mejor_bot]["fuente"] = "IA_AUTO"
                                         estado_bots[mejor_bot]["ciclo_actual"] = ciclo_auto
-                                        activo_real = mejor_bot
+                                        activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else mejor_bot
                                         marti_activa = True
-                                        agregar_evento(
-                                            f"LXV_EXEC_OK: bot={mejor_bot} ciclo={ciclo_tag} round={round_tag} snapshot={snapshot_tag}"
-                                        )
-                                        if lxv_core_route_active:
-                                            agregar_evento(f"LXV_CORE_REAL_GO bot={mejor_bot} ciclo={ciclo_tag} round={round_tag}")
-                                            agregar_evento(f"LXV_CORE_ORDER_WRITTEN bot={mejor_bot} round={int(round_tag)} snapshot={snapshot_tag} ciclo={int(ciclo_auto)}")
-                                        if bool(BARRIER_ENABLED) and int(barrier_round_id) > 0:
-                                            try:
-                                                escribir_barrier_release(int(barrier_round_id), selected_bot=str(mejor_bot), lxv_ready=True)
-                                                agregar_evento(f"BARRIER_RELEASE: next_round={int(barrier_round_id) + 1}")
-                                                if lxv_core_route_active:
-                                                    agregar_evento(f"LXV_CORE_BARRIER_READY bot={mejor_bot} round={int(barrier_round_id)} lxv_ready=1")
-                                            except Exception:
-                                                agregar_evento("BARRIER_DISABLED_FALLBACK: usando common_round")
                                     else:
                                         estado_bots[mejor_bot]["ia_senal_pendiente"] = False
-                                        motivo_fail = str(globals().get("LAST_REAL_ORDER_FAIL_REASON", "") or "order_write_fail")
-                                        motivo_drop = "order_write_fail" if motivo_fail in {"", "order_write_fail"} else str(motivo_fail)
-                                        _lxv_log_drop_prewrite(motivo_drop, started=True)
-                                        if lxv_core_route_active:
-                                            agregar_evento(f"LXV_CORE_REAL_BLOCKED_HARD bot={mejor_bot} motivo={motivo_fail}")
-                                        else:
-                                            agregar_evento(f"LXV_EXEC_BLOCKED: bot={mejor_bot} motivo={motivo_fail}")
-                        elif bool(BARRIER_ENABLED) and int(barrier_round_id) > 0 and (not lxv_permite_real_nuevo) and (not barrier_ok):
-                            try:
-                                st_prev = leer_barrier_state() or {}
-                                st_prev.update({
-                                    "barrier_enabled": bool(BARRIER_ENABLED),
-                                    "current_round": int(barrier_round_id),
-                                    "release_round": int(st_prev.get("release_round", max(1, barrier_round_id)) or max(1, barrier_round_id)),
-                                    "all_closed": False,
-                                    "pending_bots": barrier_round_pendiente(int(barrier_round_id)),
-                                    "last_evaluated_round": int(st_prev.get("last_evaluated_round", 0) or 0),
-                                    "selected_bot": "",
-                                    "lxv_ready": False,
-                                    "round_state": "ROUND_WAIT_ACK",
-                                    "ts": float(time.time()),
-                                })
-                                escribir_barrier_state_atomic(st_prev)
-                            except Exception:
-                                pass
-                        if bool(BARRIER_ENABLED) and int(barrier_round_id) > 0 and bool(barrier_ok):
-                            try:
-                                st_rel = leer_barrier_state() or {}
-                                next_round = int(barrier_round_id) + 1
-                                st_rel["release_round"] = int(next_round)
-                                st_rel["current_round"] = int(next_round)
-                                st_rel["last_evaluated_round"] = int(barrier_round_id)
-                                st_rel["all_closed"] = True
-                                st_rel["pending_bots"] = []
-                                st_rel["round_state"] = "ROUND_RELEASE_NEXT"
-                                st_rel["ts"] = float(time.time())
-                                escribir_barrier_state_atomic(st_rel)
-                                agregar_evento(f"ROUND_RELEASE_NEXT round={int(barrier_round_id)} release_round={int(next_round)}")
-                                if not lxv_permite_real_nuevo:
-                                    motivo_nr = str(logica_unica_real.get("reason") or "estructura_insuficiente")
-                                    agregar_evento(
-                                        f"ROUND_RELEASE_AFTER_NO_REAL round={int(barrier_round_id)} motivo_estructural={motivo_nr} release_round={int(next_round)}"
-                                    )
-                            except Exception:
-                                agregar_evento("BARRIER_DISABLED_FALLBACK: usando common_round")
-
-                        if candidatos and not MODO_REAL_MANUAL and (not lxv_exec_handled) and (not LXV_CORE_ENABLE):
-                            agregar_evento(
-                                f"🧭 LOGICA_UNICA_REAL lista: bot={selected_bot_operativo or '--'} p_oper={selected_prob_operativo*100:.1f}% source={real_source_operativo}"
-                            )
-
-                        if candidatos and not MODO_REAL_MANUAL and (not lxv_exec_handled) and (not LXV_CORE_ENABLE):
-                            ciclo_auto = ciclo_martingala_siguiente()
-                            if reset_martingala_por_saldo(ciclo_auto, saldo_val):
-                                ciclo_auto = 1
-                            mejor_bot = str(selected_bot_operativo or "").strip()
-                            mejor = next((c for c in candidatos if str(c[1]) == mejor_bot), None)
-                            monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
-                            ciclo_tag = _marti_ciclo_tag(ciclo_auto)
-
-                            if not mejor_bot or mejor is None:
-                                agregar_evento(
-                                    f"AUTO_REAL_DISABLED: trigger sin bot operativo válido (selected='{mejor_bot or '--'}')"
-                                )
-                            else:
-                                score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
-                                agregar_evento(f"⚙️ IA AUTO (LOGICA_UNICA_REAL): {mejor_bot} p_oper={prob*100:.1f}% source={real_source_operativo}")
-                                agregar_evento(
-                                    f"AUTO_REAL_DISABLED: trigger recibido bot={mejor_bot} ciclo={ciclo_tag} monto={float(monto):.2f}"
-                                )
-
-                                owner_prev = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-                                owner_mem = next((b for b in BOT_NAMES if estado_bots.get(b, {}).get('token') == "REAL"), None)
-                                owner_activo = owner_prev if owner_prev in BOT_NAMES else (owner_mem if owner_mem in BOT_NAMES else None)
-                                if owner_activo and owner_activo != mejor_bot:
-                                    agregar_evento(
-                                        f"AUTO_REAL_DISABLED: cancelado por owner REAL activo={owner_activo}"
-                                    )
-                                    if lxv_permite_real_nuevo:
-                                        agregar_evento(f"LXV_EXEC_BLOCKED: bot={mejor_bot} | motivo=owner_real_ocupado")
-                                else:
-                                    val = obtener_valor_saldo()
-                                    if val is None:
-                                        agregar_evento(
-                                            f"AUTO_REAL_DISABLED: cancelado por saldo no disponible bot={mejor_bot} ciclo={ciclo_tag}"
-                                        )
-                                        if lxv_permite_real_nuevo:
-                                            agregar_evento(f"LXV_EXEC_BLOCKED: bot={mejor_bot} | motivo=saldo_no_disponible")
-                                    elif float(val) < float(monto):
-                                        agregar_evento(
-                                            f"AUTO_REAL_DISABLED: cancelado por saldo insuficiente bot={mejor_bot} ciclo={ciclo_tag} saldo={float(val):.2f} monto={float(monto):.2f}"
-                                        )
-                                        if lxv_permite_real_nuevo:
-                                            agregar_evento(f"LXV_EXEC_BLOCKED: bot={mejor_bot} | motivo=saldo_insuficiente")
-                                    else:
-                                        estado_bots[mejor_bot]["ia_senal_pendiente"] = True
-                                        estado_bots[mejor_bot]["ia_prob_senal"] = prob
-
-                                        extra_payload = dict(lxv_sync_order_payload or {}) if lxv_permite_real_nuevo else None
-                                        if lxv_permite_real_nuevo and not isinstance(extra_payload, dict):
-                                            agregar_evento(f"LXV_EXEC_BLOCKED: bot={mejor_bot} | motivo=orden_lxv_no_trazable")
-                                            ok_real = False
-                                        else:
-                                            ok_real = escribir_orden_demo_neutralizado(mejor_bot, ciclo_auto, extra_payload=extra_payload)
-                                        if ok_real:
-                                            if isinstance(extra_payload, dict):
-                                                try:
-                                                    globals()["LAST_LXV_SYNC_SNAPSHOT_ID"] = str(extra_payload.get("snapshot_id", "") or "")
-                                                    globals()["LAST_LXV_SYNC_SELECTED_BOT"] = str(extra_payload.get("selected_bot", "") or "")
-                                                    globals()["LAST_LXV_SYNC_TS"] = float(time.time())
-                                                except Exception:
-                                                    pass
-                                            estado_bots[mejor_bot]["fuente"] = "IA_AUTO"
-                                            estado_bots[mejor_bot]["ciclo_actual"] = ciclo_auto
-                                            activo_real = mejor_bot
-                                            marti_activa = True
-                                            agregar_evento(
-                                                f"AUTO_REAL_DISABLED: REAL activado bot={mejor_bot} ciclo={ciclo_tag} monto={float(monto):.2f}"
-                                            )
-                                        else:
-                                            estado_bots[mejor_bot]["ia_senal_pendiente"] = False
-                                            estado_bots[mejor_bot]["ia_prob_senal"] = None
-                                            agregar_evento(
-                                                f"AUTO_REAL_DISABLED: escribir_orden_demo_neutralizado devolvió False bot={mejor_bot} ciclo={ciclo_tag}"
-                                            )
-                                            if lxv_permite_real_nuevo:
-                                                agregar_evento(f"LXV_EXEC_BLOCKED: bot={mejor_bot} | motivo=write_real_failed")
-                                                if isinstance(extra_payload, dict):
-                                                    agregar_evento(
-                                                        f"LXV_CORE_SNAPSHOT_RETRY_ALLOWED round={int(extra_payload.get('round_lxv', 0) or 0)} "
-                                                        f"snapshot={str(extra_payload.get('snapshot_id', '') or '--')} motivo=write_real_failed"
-                                                    )
+                                        estado_bots[mejor_bot]["ia_prob_senal"] = None
                         else:
                             max_prob = max((_prob_ia_operativa_bot(bot, default=0.0) for bot in BOT_NAMES if estado_bots[bot]["ia_ready"]), default=0)
                             if max_prob < umbral_ia_real:
@@ -18692,7 +16553,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # ======================
-    # MODO NORMAL (loop loop)
+    # MODO NORMAL (loop loop)
     # ======================
     while True:  
         try:
