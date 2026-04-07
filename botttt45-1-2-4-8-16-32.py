@@ -199,6 +199,7 @@ estado_bot = {
     "barra_activa": False,
     "score_senal": None,
     "ciclo_actual": 1,
+    "sync_round_id": 1,
 }  # Added modo_manual and barra_activa
 racha_actual_bot = 0  # racha del bot: >0 = racha de GANANCIAS, <0 = racha de PÉRDIDAS
 
@@ -251,6 +252,101 @@ def leer_ia_ack(bot: str):
         return None
 
 MAX_CICLOS = len(MARTINGALA_REAL)
+# === LXV_SYNC_COLUMN: sincronización por ronda/columna ===
+SYNC_ROUND_DIR = "sync_round"
+SYNC_ROUND_STATE = os.path.join(SYNC_ROUND_DIR, "state.json")
+
+try:
+    os.makedirs(SYNC_ROUND_DIR, exist_ok=True)
+except Exception:
+    pass
+
+def _sync_round_safe_read_json(path: str):
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+def _sync_round_write_json_atomic(path: str, payload: dict) -> bool:
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+def _sync_round_ack_path() -> str:
+    return os.path.join(SYNC_ROUND_DIR, f"{NOMBRE_BOT}.json")
+
+def _sync_round_resolve_start_round() -> int:
+    st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
+    try:
+        released = int(st.get("released_round", 1) or 1)
+    except Exception:
+        released = 1
+    return max(1, released)
+
+def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, asset=None, ciclo=None) -> bool:
+    res = str(resultado or "").upper().strip()
+    if res not in ("GANANCIA", "PÉRDIDA"):
+        return False
+    rid = max(1, int(round_id or 1))
+    prev = _sync_round_safe_read_json(_sync_round_ack_path()) or {}
+    try:
+        prev_round = int(prev.get("round_id", 0) or 0)
+    except Exception:
+        prev_round = 0
+    if prev_round > rid:
+        return False
+    payload = {
+        "bot": NOMBRE_BOT,
+        "round_id": rid,
+        "ts": time.time(),
+        "resultado": res,
+        "contract_id": contract_id,
+        "asset": asset,
+        "ciclo": ciclo,
+        "status": "closed",
+    }
+    ok = _sync_round_write_json_atomic(_sync_round_ack_path(), payload)
+    if ok:
+        print(Fore.YELLOW + f"🧷 LXV_SYNC_COLUMN ACK cierre | {NOMBRE_BOT} | ronda #{rid} | {res}")
+    return ok
+
+async def _sync_round_wait_release(round_id: int) -> int:
+    rid = max(1, int(round_id or 1))
+    next_round = rid + 1
+    print(Fore.YELLOW + Style.BRIGHT + f"⏸️ LXV_SYNC_COLUMN standby columna: {NOMBRE_BOT} ronda #{rid} esperando liberación #{next_round}...")
+    while not stop_event.is_set():
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
+        try:
+            released = int(st.get("released_round", 1) or 1)
+        except Exception:
+            released = 1
+        if released >= next_round:
+            print(Fore.GREEN + f"🔓 LXV_SYNC_COLUMN liberación detectada: ronda #{released} (bot {NOMBRE_BOT})")
+            print(Fore.GREEN + Style.BRIGHT + f"▶️ LXV_SYNC_COLUMN salida standby: {NOMBRE_BOT} → ronda #{next_round}")
+            return next_round
+        if _print_once(f"sync-standby-{rid}", ttl=6.0):
+            print(Fore.CYAN + f"… standby columna {NOMBRE_BOT}: ronda #{rid}, released_round={released}")
+        await asyncio.sleep(0.35)
+    return rid
+# === /LXV_SYNC_COLUMN ===
+
 # ✅ Asegura carpeta de órdenes (evita rarezas si el maestro aún no la creó)
 try:
     os.makedirs(ORDEN_DIR, exist_ok=True)
@@ -2138,6 +2234,7 @@ async def ejecutar_panel():
         current_token = leer_token_desde_archivo()
         ultimo_token = current_token  # ✅ evita reinicio fantasma del watcher al inicio
         ws = await _abrir_ws(current_token)
+        estado_bot["sync_round_id"] = _sync_round_resolve_start_round()
 
         indefinidos_consecutivos = 0  # Contador para indefinidos por ciclo
 
@@ -2554,6 +2651,11 @@ async def ejecutar_panel():
                 print(Back.BLUE + Style.BRIGHT + f"\nTotal DEMO: {resultado_global['demo']:.2f} USD | Total REAL: {resultado_global['real']:.2f} USD")
                 await mostrar_saldos()
                 sep_ciclo()
+
+                # LXV_SYNC_COLUMN: cierre definido -> ACK -> standby hasta liberación global
+                round_id_local = int(estado_bot.get("sync_round_id", 1) or 1)
+                _sync_round_emit_close_ack(round_id_local, resultado, contract_id=contract_id, asset=symbol, ciclo=ciclo)
+                estado_bot["sync_round_id"] = await _sync_round_wait_release(round_id_local)
 
                 # ========= MODO REAL =========
                 if modo_real:
