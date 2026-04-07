@@ -44,7 +44,7 @@ except Exception:
 from contextlib import contextmanager
 import sys
 import shutil
-import joblib
+import importlib
 import importlib
 import traceback
 
@@ -62,6 +62,14 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 os.environ.setdefault("PYTHONUTF8", "1")
 BOOT_SMOKE_TEST = str(os.getenv("BOOT_SMOKE_TEST", os.getenv("DRY_BOOT_ONLY", "0"))).strip() == "1"
+
+def _safe_import_module(name):
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        return None
+
+joblib = _safe_import_module("joblib")
 
 def _configure_console_output_safe():
     for _stream_name in ("stdout", "stderr"):
@@ -678,7 +686,7 @@ EMBUDO_MAIN_BLOCK_ON_MODE_C_PENDING = True
 EMBUDO_MAIN_REQUIRE_TRIGGER_OR_CONTEXT = True
 
 # === LXV_SYNC como única lógica de promoción a REAL ===
-LXV_PROMO_REAL_SOLO_SYNC = True
+LXV_PROMO_REAL_SOLO_SYNC = False
 if bool(LXV_PROMO_REAL_SOLO_SYNC):
     IA_HARD_GUARD_ENABLE = False
     ASSET_PROTECT_ENABLE = False
@@ -2825,7 +2833,7 @@ def escribir_orden_demo_neutralizado(bot: str, ciclo: int, extra_payload: dict |
     globals()["LAST_REAL_ORDER_FAIL_REASON"] = "demo_only"
     return False
 
-_LAST_IA_ACK_HEARTBEAT_TS = now
+_LAST_IA_ACK_HEARTBEAT_TS = time.time()
 # Leer token actual
 def leer_token_actual():
     """Modo DEMO-only: token neutralizado en REAL:none y HUD en DEMO."""
@@ -17304,6 +17312,8 @@ async def main():
     if BOOT_SMOKE_TEST:
         print("[BOOT OK] MAESTRO smoke test DEMO-only")
         return
+    if joblib is None:
+        raise RuntimeError("Dependencia requerida ausente: joblib")
     global salir, pausado, reinicio_manual, SALDO_INICIAL
     global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA, REAL_OWNER_LOCK
     global REAL_LOCK_MISMATCH_SINCE
@@ -18433,18 +18443,23 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # ======================
-    # MODO NORMAL (loop loop)
+    # MODO NORMAL (loop loop)
     # ======================
-    while True:  
+    while True:
         try:
             asyncio.run(main())
+            if BOOT_SMOKE_TEST:
+                break
         except KeyboardInterrupt:
             print("\n🔴 Programa terminado por el usuario.")
             break
         except Exception as e:
-            print(f"⛔ Error crítico: {str(e)}")
+            print(f"[FATAL] maestro falló al arrancar: {type(e).__name__}: {e}")
+            traceback.print_exc()
             _log_exception("Error crítico en __main__", e)
+            print("Esperando 5s antes de salir...")
             time.sleep(5)
+            break
 
 # === FIN BLOQUE 13 ===
 # === BLOQUE 99 — RESUMEN FINAL DE LO QUE SE LOGRA ===

@@ -1,15 +1,12 @@
 # -*- coding: utf-8 -*-
 import asyncio
-import websockets
+import importlib
 import json
 import csv
 import os
 import sys
 from datetime import datetime, timezone
 from statistics import mean
-from colorama import Fore, Back, Style, init
-import pygame
-import pandas as pd
 import time  # Added for timestamps in orden_real and BLOQUE 5
 import random  # Added for jitter in BLOQUE 1.3
 import itertools  # For req_counter in api_call
@@ -19,6 +16,43 @@ import traceback
 
 os.environ.setdefault("PYTHONUTF8", "1")
 BOOT_SMOKE_TEST = str(os.getenv("BOOT_SMOKE_TEST", os.getenv("DRY_BOOT_ONLY", "0"))).strip() == "1"
+
+def _safe_import_module(name):
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        return None
+
+websockets = _safe_import_module("websockets")
+
+# Fallbacks de imports opcionales para arranque/smoke
+class _DummyColor:
+    def __getattr__(self, _):
+        return ""
+
+class _DummyPygame:
+    class mixer:
+        @staticmethod
+        def get_init(): return True
+        @staticmethod
+        def init(*args, **kwargs): return None
+        @staticmethod
+        def set_num_channels(*args, **kwargs): return None
+
+_colorama = _safe_import_module("colorama")
+if _colorama is None:
+    Fore = Back = Style = _DummyColor()
+    def init(*args, **kwargs):
+        return None
+else:
+    Fore = _colorama.Fore
+    Back = _colorama.Back
+    Style = _colorama.Style
+    init = _colorama.init
+
+pygame = _safe_import_module("pygame") or _DummyPygame()
+pd = _safe_import_module("pandas")
+
 
 def _configure_console_output_safe():
     for _stream_name in ("stdout", "stderr"):
@@ -460,10 +494,10 @@ def escribir_ack_cierre_ronda(round_id: int, resultado: str, trade_uid: str = ""
         pass
 
 
-def _is_real_owner_valid_now() -> bool:
+def _is_demo_owner_valid_now() -> bool:
     return False
 
-def _lxv_post_real_confirmed() -> bool:
+def _lxv_post_demo_confirmed() -> bool:
     return False
 
 def _lxv_sync_tiene_pendiente_abierta(archivo_csv: str) -> bool:
@@ -2926,6 +2960,9 @@ async def main():
     if BOOT_SMOKE_TEST:
         print(Fore.GREEN + Style.BRIGHT + f"[BOOT OK] {NOMBRE_BOT} smoke test DEMO-only")
         return
+
+    if websockets is None:
+        raise RuntimeError("Dependencia requerida ausente: websockets")
 
     # watcher del token (CRÍTICO para GateWin)
     try:
