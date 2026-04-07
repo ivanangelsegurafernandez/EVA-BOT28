@@ -2651,6 +2651,24 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
             pass
     return ok
 # === FIN PATCH REAL INMEDIATO ===
+
+def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool:
+    """
+    Ruta única de emisión REAL cuando LXV_SYNC_REAL_ROUTE_ENABLE está activo.
+    Conserva la infraestructura existente (orden_real/token/HUD), pero restringe la decisión.
+    """
+    src = str(source or "LEGACY").strip().upper()
+    allow_src = str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper()
+    if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and src != allow_src:
+        agregar_evento(f"🧊 REAL legacy congelado: source={src} bloqueado (solo {allow_src}).")
+        return False
+    prev_src = globals().get("_REAL_ROUTE_SOURCE", None)
+    globals()["_REAL_ROUTE_SOURCE"] = src
+    try:
+        return bool(escribir_orden_real(bot, int(ciclo)))
+    finally:
+        globals()["_REAL_ROUTE_SOURCE"] = prev_src
+
 # === IA ACK (handshake maestro→bot: confirma que el PRE-TRADE ya fue evaluado) ===
 IA_ACK_DIR = "ia_ack"
 _LAST_IA_ACK_HEARTBEAT_TS = 0.0
@@ -13434,7 +13452,7 @@ def forzar_real_manual(bot: str, ciclo: int):
                 pass
 
 
-        if not escribir_orden_real(bot, ciclo):
+        if not emitir_real_autorizado(bot, ciclo, source="MANUAL"):
             agregar_evento(f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL.")
             return
 
@@ -15551,6 +15569,10 @@ async def obtener_saldo_real():
             if "balance" in resp:
                 saldo_real = f"{resp['balance']['balance']:.2f}"
                 ULTIMA_ACT_SALDO = time.time()
+                try:
+                    _update_saldo_monitor_feed(float(resp["balance"]["balance"]))
+                except Exception:
+                    pass
     except Exception as e:
         print(f"⚠️ Error obteniendo saldo: {e}")
 
@@ -16421,6 +16443,12 @@ async def main():
                         elif decision_final == EMBUDO_FINAL_REAL_MICRO:
                             candidatos = candidatos[:1]
 
+                        # LXV como ruta única de decisión REAL: el embudo legacy queda en telemetría.
+                        if bool(LXV_SYNC_REAL_ROUTE_ENABLE):
+                            if candidatos and _print_once("lxv-route-only", ttl=20.0):
+                                agregar_evento("🧊 Modo LXV_SYNC_REAL: legado REAL en telemetría (sin emisión).")
+                            candidatos = []
+
                         # ==================== AUTO-PRESELECCIÓN (MODO MANUAL) ====================
                         # Si la IA detecta señal y tú estás en manual, preselecciona el mejor bot y abre la ventana
                         # para que solo elijas el ciclo (1..MAX_CICLOS) dentro del tiempo.
@@ -16496,7 +16524,7 @@ async def main():
                                     if owner_prev and owner_prev != mejor_bot and ciclo_auto > 1:
                                         cerrar_por_fin_de_ciclo(owner_prev, f"Handoff rotación C{ciclo_auto}→{mejor_bot}")
 
-                                    ok_real = escribir_orden_real(mejor_bot, ciclo_auto)
+                                    ok_real = emitir_real_autorizado(mejor_bot, ciclo_auto, source="IA_AUTO")
                                     if ok_real:
                                         if estado_real == "SHADOW":
                                             try:
