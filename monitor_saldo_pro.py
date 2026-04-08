@@ -1313,10 +1313,23 @@ class DataEngine:
                     continue
                 ts = pd.to_datetime(obj.get("timestamp"), errors="coerce", utc=True)
                 if pd.isna(ts):
+                    ts = pd.to_datetime(pd.to_numeric(obj.get("ts"), errors="coerce"), unit="s", errors="coerce", utc=True)
+                if pd.isna(ts):
                     ts = pd.to_datetime(p.stat().st_mtime, unit="s", utc=True)
-                return self._store_cache("live", sig, ((float(v), ts.to_pydatetime()), None, p))
+                if pd.isna(ts):
+                    continue
+                cand = (float(v), ts.to_pydatetime(), p, self._path_mtime_ns(p))
+                if best_live is None:
+                    best_live = cand
+                else:
+                    _bv, bts, bp, bmt = best_live
+                    if (cand[1], cand[3], str(cand[2])) > (bts, bmt, str(bp)):
+                        best_live = cand
             except Exception as e:
                 warnings.append(f"{SALDO_LIVE_FILE} inválido en {'ruta compartida' if str(p)==SALDO_LIVE_SHARED_PATH else p}: {e}")
+        if best_live is not None:
+            v, ts, p, _mt = best_live
+            return self._store_cache("live", sig, ((float(v), ts), None, p))
 
         msg = f"{SALDO_LIVE_FILE} no encontrado en ruta compartida: {SALDO_LIVE_SHARED_PATH}"
         if found_any:
@@ -1333,6 +1346,7 @@ class DataEngine:
             return cached
 
         warnings: List[str] = []
+        best_hist: Optional[Tuple[pd.DataFrame, Path, datetime, int]] = None
         for p in paths:
             if not p.exists():
                 continue
@@ -1361,10 +1375,22 @@ class DataEngine:
                 if rows:
                     d = pd.DataFrame(rows, columns=["timestamp", "equity"]).sort_values("timestamp")
                     d = d.drop_duplicates(subset=["timestamp", "equity"], keep="last")
-                    growth_msg = self._check_history_growth(p, len(d))
-                    return self._store_cache("hist", sig, (d, None, p, growth_msg))
+                    last_ts = pd.to_datetime(d["timestamp"].iloc[-1], errors="coerce", utc=True)
+                    if pd.isna(last_ts):
+                        continue
+                    cand = (d, p, last_ts.to_pydatetime(), self._path_mtime_ns(p))
+                    if best_hist is None:
+                        best_hist = cand
+                    else:
+                        _bd, bp, bts, bmt = best_hist
+                        if (cand[2], cand[3], str(cand[1])) > (bts, bmt, str(bp)):
+                            best_hist = cand
             except Exception as e:
                 warnings.append(f"{SALDO_LIVE_HISTORY_FILE} inválido en {'ruta compartida' if str(p)==SALDO_LIVE_HISTORY_SHARED_PATH else p}: {e}")
+        if best_hist is not None:
+            d, p, _lts, _mt = best_hist
+            growth_msg = self._check_history_growth(p, len(d))
+            return self._store_cache("hist", sig, (d, None, p, growth_msg))
 
         msg = f"Sin histórico real: no se encontró {SALDO_LIVE_HISTORY_FILE} en ruta compartida: {SALDO_LIVE_HISTORY_SHARED_PATH}"
         if warnings:
@@ -1383,6 +1409,7 @@ class DataEngine:
             return cached
         warnings: List[str] = []
         found_any = False
+        best_series: Optional[Tuple[pd.DataFrame, Path, datetime, int]] = None
         for p in paths:
             if not p.exists():
                 continue
@@ -1395,10 +1422,22 @@ class DataEngine:
                 if d.empty:
                     continue
                 d = d.sort_values("timestamp").drop_duplicates(subset=["timestamp", "equity"], keep="last")
-                warn_msg = " | ".join(warnings[-3:]) if warnings else None
-                return self._store_cache("series_csv", sig, (d, warn_msg, p))
+                last_ts = pd.to_datetime(d["timestamp"].iloc[-1], errors="coerce", utc=True)
+                if pd.isna(last_ts):
+                    continue
+                cand = (d, p, last_ts.to_pydatetime(), self._path_mtime_ns(p))
+                if best_series is None:
+                    best_series = cand
+                else:
+                    _bd, bp, bts, bmt = best_series
+                    if (cand[2], cand[3], str(cand[1])) > (bts, bmt, str(bp)):
+                        best_series = cand
             except Exception as e:
                 warnings.append(f"{SALDO_SERIES_CSV_FILE} inválido en {p}: {e}")
+        if best_series is not None:
+            d, p, _lts, _mt = best_series
+            warn_msg = " | ".join(warnings[-3:]) if warnings else None
+            return self._store_cache("series_csv", sig, (d, warn_msg, p))
         if not found_any:
             primary = Path(SALDO_SERIES_CSV_PATH).expanduser()
             msg = self._ensure_series_csv_exists(primary)
