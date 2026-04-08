@@ -102,6 +102,13 @@ OBSERVED_TAIL_BYTES = int(os.getenv("OBSERVED_TAIL_BYTES", str(256 * 1024)))
 ESTIMATED_REFRESH_SECONDS = int(os.getenv("ESTIMATED_REFRESH_SECONDS", "30"))
 MASTER_LIVE_STALE_SECONDS = int(os.getenv("MASTER_LIVE_STALE_SECONDS", "90"))
 MASTER_DELTA_WARN_USD = float(os.getenv("MASTER_DELTA_WARN_USD", "1.0"))
+REAL_CANONICAL_SOURCES = {
+    "MAESTRO_5R6M",
+    "MAESTRO_LIVE",
+    "MAESTRO_HISTORY",
+    "MAESTRO_HISTORY_DEGRADED",
+    "MAESTRO_SERIES_CANONICAL",
+}
 
 def _main_window_seconds() -> int:
     """
@@ -153,6 +160,18 @@ def _fmt_local_ts(ts_obj) -> str:
     except Exception:
         return "--"
     return "--"
+
+
+def _fmt_file_mtime(path_obj: Optional[Path]) -> str:
+    if path_obj is None:
+        return "--"
+    try:
+        if not Path(path_obj).exists():
+            return "--"
+        ts = datetime.fromtimestamp(Path(path_obj).stat().st_mtime, tz=timezone.utc)
+        return _fmt_local_ts(ts)
+    except Exception:
+        return "--"
 
 
 def _sanitize_series_for_plot(s: pd.DataFrame) -> pd.DataFrame:
@@ -309,6 +328,34 @@ class DataEngine:
         self._series_lock_warn_ts: float = 0.0
         self._series_repair_sig: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
         self._series_ensure_notice_once: Optional[str] = None
+        self._last_series_filter_stats: Dict[str, int] = {"valid": 0, "discarded": 0}
+
+    @staticmethod
+    def _normalize_source_label(source: Optional[str]) -> str:
+        s = str(source or "").strip().upper()
+        if not s:
+            return ""
+        if s == "FUENTE_SALDO":
+            return ""
+        return s
+
+    def _is_canonical_real_source(self, source: Optional[str]) -> bool:
+        src = self._normalize_source_label(source)
+        return bool(src) and src in REAL_CANONICAL_SOURCES
+
+    def _source_rank(self, source: Optional[str]) -> int:
+        src = self._normalize_source_label(source)
+        if src == "MAESTRO_5R6M":
+            return 5
+        if src == "MAESTRO_LIVE":
+            return 4
+        if src == "MAESTRO_HISTORY":
+            return 3
+        if src == "MAESTRO_HISTORY_DEGRADED":
+            return 2
+        if src == "MAESTRO_SERIES_CANONICAL":
+            return 1
+        return 0
 
     @staticmethod
     def _sig(paths: List[Path]) -> Tuple:
@@ -401,21 +448,15 @@ class DataEngine:
 
     def _read_last_series_row(self, path: Path) -> Optional[Tuple[str, float, str]]:
         try:
-            if not path.exists() or path.stat().st_size <= 0:
+            d = self._normalize_saldo_series_csv(path)
+            if d.empty:
                 return None
-            lines = self._read_tail_lines(path, 32 * 1024)
-            for raw in reversed(lines):
-                row = [c.strip() for c in raw.split(",")]
-                if len(row) < 2:
-                    continue
-                if row[0].lower() in ("timestamp", "ts_utc"):
-                    continue
-                ts_iso = self._ts_utc_iso(row[0])
-                eq = self._normalize_equity_value(row[1])
-                if ts_iso is None or eq is None:
-                    continue
-                src = row[2] if len(row) >= 3 and row[2] else "MONITOR_BACKFILL"
-                return (ts_iso, eq, str(src))
+            row = d.iloc[-1]
+            ts_iso = self._ts_utc_iso(row.get("timestamp"))
+            eq = self._normalize_equity_value(row.get("equity"))
+            src = self._normalize_source_label(row.get("source")) or "MAESTRO_SERIES_CANONICAL"
+            if ts_iso is not None and eq is not None:
+                return (ts_iso, eq, src)
         except Exception:
             return None
         return None
@@ -453,26 +494,30 @@ class DataEngine:
                     os.fsync(fh.fileno())
                 return f"{SALDO_SERIES_CSV_FILE} sin contenido; cabecera restaurada en {path}"
             head = [c.strip().lower() for c in lines[0].split(",")]
-            valid_header = len(head) >= 2 and head[0] in ("timestamp", "ts_utc") and head[1] in ("equity", "saldo_real")
+            is_basic_header = len(head) >= 3 and head[0] in ("timestamp", "ts_utc") and head[1] == "equity"
+            is_extended_header = ("ts_epoch" in head and "ts_iso" in head and "saldo_real" in head and "fuente_saldo" in head)
+            valid_header = is_basic_header or is_extended_header
             if valid_header:
                 return None
-            rescued: List[Tuple[str, float, str]] = []
-            for raw in lines:
-                row = [c.strip() for c in raw.split(",")]
-                if len(row) < 2:
-                    continue
-                if row[0].lower() in ("timestamp", "ts_utc"):
-                    continue
-                ts_iso = self._ts_utc_iso(row[0])
-                eq = self._normalize_equity_value(row[1])
-                if ts_iso is None or eq is None:
-                    continue
-                src = row[2] if len(row) >= 3 and row[2] else "SERIES_RESCUE"
-                rescued.append((ts_iso, eq, src))
+            normalized = self._normalize_saldo_series_csv(path)
+            valid_n = int(len(normalized))
+            discarded_n = int(self._last_series_filter_stats.get("discarded", 0))
+            if normalized.empty:
+                return f"{SALDO_SERIES_CSV_FILE} recreado limpio tras corrupción de cabecera/contenido"
             tmp = path.with_suffix(path.suffix + ".repair.tmp")
+            bak = path.with_suffix(path.suffix + ".repair.bak")
+            try:
+                os.replace(path, bak)
+            except Exception:
+                bak = None
             with tmp.open("w", encoding="utf-8", newline="") as fh:
                 fh.write("timestamp,equity,source\n")
-                for ts_iso, eq, src in rescued:
+                for _, row in normalized.iterrows():
+                    ts_iso = self._ts_utc_iso(row.get("timestamp"))
+                    eq = self._normalize_equity_value(row.get("equity"))
+                    src = self._normalize_source_label(row.get("source")) or "MAESTRO_SERIES_CANONICAL"
+                    if ts_iso is None or eq is None:
+                        continue
                     fh.write(f"{ts_iso},{eq:.8f},{src}\n")
                 fh.flush()
                 os.fsync(fh.fileno())
@@ -482,9 +527,12 @@ class DataEngine:
                 self._series_repair_sig[key] = (int(st.st_mtime_ns), int(st.st_size))
             except Exception:
                 self._series_repair_sig[key] = (None, None)
-            if rescued:
-                return f"{SALDO_SERIES_CSV_FILE} reparado de forma conservadora (rescatadas {len(rescued)} filas)"
-            return f"{SALDO_SERIES_CSV_FILE} recreado limpio tras corrupción de cabecera/contenido"
+            if bak is not None:
+                return (
+                    f"Series CSV saneado: {valid_n} filas válidas conservadas / {discarded_n} descartadas "
+                    f"(backup: {bak})"
+                )
+            return f"Series CSV saneado: {valid_n} filas válidas conservadas / {discarded_n} descartadas"
         except Exception as e:
             return f"No se pudo reparar {SALDO_SERIES_CSV_FILE} en {path}: {e}"
         finally:
@@ -499,7 +547,9 @@ class DataEngine:
         eq = self._normalize_equity_value(equity)
         if ts_iso is None or eq is None:
             return None
-        src = str(source or "MONITOR_BACKFILL").strip() or "MONITOR_BACKFILL"
+        src = self._normalize_source_label(source)
+        if not self._is_canonical_real_source(src):
+            return f"Bloqueadas filas source={src or 'VACIO'} para saldo REAL"
         fp = (ts_iso, f"{eq:.8f}")
         if self._series_last_fingerprint == fp:
             return None
@@ -573,16 +623,11 @@ class DataEngine:
             eq = self._normalize_equity_value(row.get("equity"))
             if ts_iso and eq is not None:
                 return (ts_iso, eq, "MAESTRO_HISTORY")
-        if not series_csv.empty:
-            row = series_csv.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "SERIE_CSV_DEGRADED")
         ts_iso = self._ts_utc_iso(last_update)
         eq = self._normalize_equity_value(saldo_actual)
-        if ts_iso and eq is not None and source in ("MAESTRO_LIVE", "MAESTRO_HISTORY", "SERIE_CSV_DEGRADED"):
-            return (ts_iso, eq, source)
+        src = self._normalize_source_label(source)
+        if ts_iso and eq is not None and self._is_canonical_real_source(src):
+            return (ts_iso, eq, src)
         return None
 
     def _cached(self, key: str, sig: Tuple):
@@ -744,8 +789,14 @@ class DataEngine:
                     warnings.append(repair_msg)
                 d = self._normalize_saldo_series_csv(p)
                 if d.empty:
+                    discarded_n = int(self._last_series_filter_stats.get("discarded", 0))
+                    if discarded_n > 0:
+                        warnings.append(f"REAL filtrado: descartadas {discarded_n} filas degradadas del series_csv")
                     continue
-                d = d.sort_values("timestamp").drop_duplicates(subset=["timestamp", "equity"], keep="last")
+                d = d.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+                discarded_n = int(self._last_series_filter_stats.get("discarded", 0))
+                if discarded_n > 0:
+                    warnings.append(f"REAL filtrado: descartadas {discarded_n} filas degradadas del series_csv")
                 last_ts = pd.to_datetime(d["timestamp"].iloc[-1], errors="coerce", utc=True)
                 if pd.isna(last_ts):
                     continue
@@ -768,58 +819,190 @@ class DataEngine:
             if msg:
                 warnings.append(msg)
         err = " | ".join(warnings[-3:]) if warnings else None
-        return self._store_cache("series_csv", sig, (pd.DataFrame(columns=["timestamp", "equity"]), err, None))
+        return self._store_cache("series_csv", sig, (pd.DataFrame(columns=["timestamp", "equity", "source"]), err, None))
+
+    def _build_real_series(
+        self,
+        hist: pd.DataFrame,
+        series_csv: pd.DataFrame,
+        master: Optional[Tuple[float, datetime]],
+    ) -> pd.DataFrame:
+        frames: List[pd.DataFrame] = []
+        if not hist.empty:
+            h2 = hist[["timestamp", "equity"]].copy()
+            h2["source"] = "MAESTRO_HISTORY"
+            frames.append(h2)
+        if not series_csv.empty:
+            s2 = series_csv[["timestamp", "equity"]].copy()
+            s2["source"] = series_csv["source"] if "source" in series_csv.columns else "MAESTRO_SERIES_CANONICAL"
+            frames.append(s2)
+        if master is not None:
+            mv, mts = master
+            frames.append(pd.DataFrame([{"timestamp": mts, "equity": mv, "source": "MAESTRO_LIVE"}]))
+        if not frames:
+            return pd.DataFrame(columns=["timestamp", "equity", "source"])
+        real_series = pd.concat(frames, ignore_index=True)
+        real_series["timestamp"] = pd.to_datetime(real_series["timestamp"], errors="coerce", utc=True)
+        real_series["equity"] = pd.to_numeric(real_series["equity"], errors="coerce")
+        real_series = real_series.dropna(subset=["timestamp", "equity"])
+        if "source" not in real_series.columns:
+            real_series["source"] = "MAESTRO_SERIES_CANONICAL"
+        real_series["source"] = real_series["source"].map(self._normalize_source_label)
+        real_series["source_rank"] = real_series["source"].map(self._source_rank).fillna(0).astype(int)
+        real_series = real_series.sort_values(["timestamp", "source_rank"], ascending=[True, False]).drop_duplicates(subset=["timestamp"], keep="first")
+        return real_series.drop(columns=["source_rank"], errors="ignore").reset_index(drop=True)
+
+    def _select_real_effective_source(
+        self,
+        master: Optional[Tuple[float, datetime]],
+        hist: pd.DataFrame,
+        series_csv: pd.DataFrame,
+    ) -> Tuple[str, Optional[float], Optional[datetime], List[str]]:
+        warnings: List[str] = []
+        source = "SIN_DATOS_REALES"
+        saldo_actual: Optional[float] = None
+        last_update: Optional[datetime] = None
+
+        live_fresh = False
+        if master is not None:
+            _mv, mts_live = master
+            live_age_sec = max(0.0, (_now().astimezone(timezone.utc) - mts_live.astimezone(timezone.utc)).total_seconds())
+            live_fresh = live_age_sec <= float(MASTER_LIVE_STALE_SECONDS)
+
+        if master is not None and live_fresh:
+            mv, mts = master
+            return ("MAESTRO_LIVE", float(mv), mts, ["REAL principal = MAESTRO_LIVE"])
+
+        latest_hist = None if hist.empty else hist.iloc[-1]
+        latest_series = None if series_csv.empty else series_csv.iloc[-1]
+        hts = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True) if latest_hist is not None else pd.NaT
+        sts = pd.to_datetime(latest_series["timestamp"], errors="coerce", utc=True) if latest_series is not None else pd.NaT
+        if latest_hist is not None and (pd.isna(sts) or (not pd.isna(hts) and hts >= sts)):
+            source = "MAESTRO_HISTORY"
+            saldo_actual = float(latest_hist["equity"])
+            last_update = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True).to_pydatetime()
+            warnings.append("REAL principal = MAESTRO_HISTORY")
+        elif latest_series is not None:
+            source = self._normalize_source_label(latest_series.get("source")) or "MAESTRO_SERIES_CANONICAL"
+            saldo_actual = float(latest_series["equity"])
+            last_update = pd.to_datetime(latest_series["timestamp"], errors="coerce", utc=True).to_pydatetime()
+            warnings.append(f"REAL principal = {source}")
+        if master is not None and not live_fresh and source != "SIN_DATOS_REALES":
+            warnings.append("Live stale descartado como saldo principal")
+        if source == "SIN_DATOS_REALES":
+            warnings.append("SIN_DATOS_REALES: no hay fuente canónica de saldo real")
+        return (source, saldo_actual, last_update, warnings)
+
+    def _persist_real_if_valid(
+        self,
+        series_target_path: Path,
+        hist: pd.DataFrame,
+        master: Optional[Tuple[float, datetime]],
+        series_csv: pd.DataFrame,
+        saldo_actual: Optional[float],
+        last_update: Optional[datetime],
+        source: str,
+        observed: pd.DataFrame,
+        estimated: pd.DataFrame,
+    ) -> Optional[str]:
+        sample = self._extract_best_real_sample_for_persist(
+            hist=hist,
+            master=master,
+            series_csv=series_csv,
+            saldo_actual=saldo_actual,
+            last_update=last_update,
+            source=source,
+            observed=observed,
+            estimated=estimated,
+        )
+        if sample is None:
+            return None
+        ts_iso, eq, src = sample
+        return self._append_series_sample_if_new(series_target_path, ts_iso, eq, src)
 
     def _normalize_saldo_series_csv(self, path: Path) -> pd.DataFrame:
-        rows: List[Tuple[datetime, float]] = []
+        rows: List[Tuple[datetime, float, str]] = []
+        discarded = 0
         with path.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
             reader = csv.reader(fh)
+            headers: List[str] = []
             for raw in reader:
                 if not raw:
                     continue
                 row = [str(c).strip() for c in raw]
                 if not row:
                     continue
-                if row[0].lower() in ("ts_utc", "timestamp"):
+                low0 = row[0].lower()
+                if not headers and any(("timestamp" in c.lower() or "ts_iso" in c.lower() or "ts_epoch" in c.lower()) for c in row):
+                    headers = [c.strip().lower() for c in row]
                     continue
-                ts_utc = None
-                epoch = None
-                saldo_real = None
-                equity = None
-                if len(row) >= 8:
-                    ts_utc, _ts_lima, epoch, saldo_real, equity = row[0], row[1], row[2], row[3], row[4]
-                elif len(row) == 3:
-                    ts_utc, c1, c2 = row[0], row[1], row[2]
-                    epoch_probe = pd.to_numeric(c1, errors="coerce")
-                    if np.isfinite(epoch_probe) and float(epoch_probe) >= 1_000_000_000:
-                        # formato torcido: timestamp,epoch,equity
-                        epoch = c1
-                        equity = c2
-                        saldo_real = c2
+                if low0 in ("ts_utc", "timestamp", "ts_epoch"):
+                    continue
+                payload = {}
+                if headers and len(headers) >= len(row):
+                    payload = {headers[i]: row[i] for i in range(len(row))}
+                ts_iso_raw = payload.get("ts_iso") or payload.get("timestamp") or payload.get("ts_utc")
+                epoch_raw = payload.get("ts_epoch") or payload.get("epoch")
+                saldo_real_raw = payload.get("saldo_real")
+                saldo_total_raw = payload.get("saldo_total")
+                equity_raw = payload.get("equity")
+                source_raw = payload.get("fuente_saldo") or payload.get("source")
+
+                if not payload:
+                    if len(row) == 3:
+                        ts_iso_raw, c1, c2 = row[0], row[1], row[2]
+                        epoch_probe = pd.to_numeric(c1, errors="coerce")
+                        if np.isfinite(epoch_probe) and float(epoch_probe) >= 1_000_000_000:
+                            epoch_raw = c1
+                            equity_raw = c2
+                            saldo_real_raw = c2
+                            source_raw = "MAESTRO_HISTORY_DEGRADED"
+                        else:
+                            equity_raw = c1
+                            saldo_real_raw = c1
+                            source_raw = c2
+                    elif len(row) >= 10:
+                        epoch_raw = row[0]
+                        ts_iso_raw = row[1]
+                        saldo_real_raw = row[6] if len(row) > 6 else None
+                        saldo_total_raw = row[8] if len(row) > 8 else None
+                        source_raw = row[9] if len(row) > 9 else None
+                    elif len(row) >= 4:
+                        ts_iso_raw, epoch_raw, saldo_real_raw = row[0], row[1], row[2]
+                        equity_raw = row[3] if len(row) >= 4 else None
+                        source_raw = row[4] if len(row) >= 5 else "MAESTRO_HISTORY_DEGRADED"
                     else:
-                        # formato sano: timestamp,equity,source
-                        equity = c1
-                        saldo_real = c1
-                elif len(row) >= 4:
-                    ts_utc, epoch, saldo_real = row[0], row[1], row[2]
-                    equity = saldo_real
-                else:
-                    continue
-                ts = pd.to_datetime(ts_utc, errors="coerce", utc=True)
+                        discarded += 1
+                        continue
+
+                ts = pd.to_datetime(ts_iso_raw, errors="coerce", utc=True)
                 if pd.isna(ts):
-                    ts = pd.to_datetime(pd.to_numeric(epoch, errors="coerce"), unit="s", errors="coerce", utc=True)
+                    ts = pd.to_datetime(pd.to_numeric(epoch_raw, errors="coerce"), unit="s", errors="coerce", utc=True)
                 if pd.isna(ts):
+                    discarded += 1
                     continue
-                eq = pd.to_numeric(equity, errors="coerce")
+                eq = pd.to_numeric(saldo_real_raw, errors="coerce")
                 if not np.isfinite(eq):
-                    eq = pd.to_numeric(saldo_real, errors="coerce")
+                    eq = pd.to_numeric(equity_raw, errors="coerce")
+                if not np.isfinite(eq) and CUENTA_OBJETIVO == "REAL":
+                    eq = pd.to_numeric(saldo_total_raw, errors="coerce")
                 if not np.isfinite(eq):
+                    discarded += 1
                     continue
-                rows.append((ts.to_pydatetime(), float(eq)))
+                src = self._normalize_source_label(source_raw) or "MAESTRO_SERIES_CANONICAL"
+                if not self._is_canonical_real_source(src):
+                    discarded += 1
+                    continue
+                rows.append((ts.to_pydatetime(), float(eq), src))
         if not rows:
-            return pd.DataFrame(columns=["timestamp", "equity"])
-        out = pd.DataFrame(rows, columns=["timestamp", "equity"])
-        out = out.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+            self._last_series_filter_stats = {"valid": 0, "discarded": discarded}
+            return pd.DataFrame(columns=["timestamp", "equity", "source"])
+        out = pd.DataFrame(rows, columns=["timestamp", "equity", "source"])
+        out["source_rank"] = out["source"].map(self._source_rank).fillna(0).astype(int)
+        out = out.sort_values(["timestamp", "source_rank", "equity"], ascending=[True, False, False])
+        out = out.drop_duplicates(subset=["timestamp"], keep="first")
+        out = out.sort_values("timestamp")
+        self._last_series_filter_stats = {"valid": int(len(out)), "discarded": int(discarded)}
         return out.reset_index(drop=True)
 
     def _check_history_growth(self, path: Path, valid_rows: int) -> Optional[str]:
@@ -980,16 +1163,12 @@ class DataEngine:
             if ensure_msg and ensure_msg != self._series_ensure_notice_once:
                 warnings.append(ensure_msg)
                 self._series_ensure_notice_once = ensure_msg
-            repair_msg = self._repair_series_csv_if_needed(series_target_path)
-            if repair_msg:
-                warnings.append(repair_msg)
 
         master, master_msg, live_path_used = self._read_master_live() if view == "REAL" else (None, None, None)
         hist, hist_msg, hist_path_used, hist_growth_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None, None)
         series_csv, series_msg, series_path_used = self._read_saldo_series_csv() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None)
-        real_primary_ok = view == "REAL" and (master is not None or not hist.empty or not series_csv.empty)
-        observed = self._parse_observed(view) if (view != "REAL" or not real_primary_ok) else pd.DataFrame(columns=["timestamp", "equity"])
-        estimated = self._build_estimated(view) if (view != "REAL" or not real_primary_ok) else self._est_last_value.get(view, pd.DataFrame(columns=["timestamp", "equity"]))
+        observed = self._parse_observed(view) if view != "REAL" else pd.DataFrame(columns=["timestamp", "equity"])
+        estimated = self._build_estimated(view) if view != "REAL" else self._est_last_value.get(view, pd.DataFrame(columns=["timestamp", "equity"]))
 
         if master_msg and view == "REAL":
             warnings.append(master_msg)
@@ -1000,6 +1179,17 @@ class DataEngine:
             warnings.append(f"Monitor {MONITOR_VERSION} · id={MONITOR_BUILD_ID}")
             warnings.append(f"Ruta live usada: {live_path_used if live_path_used else SALDO_LIVE_SHARED_PATH}")
             warnings.append(f"Ruta history usada: {hist_path_used if hist_path_used else SALDO_LIVE_HISTORY_SHARED_PATH}")
+            live_exists = bool(live_path_used and Path(live_path_used).exists())
+            live_mtime = _fmt_file_mtime(Path(live_path_used) if live_path_used else None)
+            hist_mtime = _fmt_file_mtime(Path(hist_path_used) if hist_path_used else None)
+            series_mtime = _fmt_file_mtime(Path(series_path_used) if series_path_used else series_target_path)
+            live_ts = _fmt_local_ts(master[1]) if master is not None else "--"
+            live_saldo = _fmt_money(float(master[0])) if master is not None else "--"
+            warnings.append(
+                f"Diag live: exists={'yes' if live_exists else 'no'} mtime={live_mtime} "
+                f"saldo={live_saldo} ts={live_ts}"
+            )
+            warnings.append(f"Diag mtime history={hist_mtime} series={series_mtime}")
             if series_msg:
                 warnings.append(series_msg)
             warnings.append(f"Ruta series usada: {series_path_used if series_path_used else series_target_path}")
@@ -1014,8 +1204,6 @@ class DataEngine:
             )
             if hist_growth_msg:
                 warnings.append(hist_growth_msg)
-            if real_primary_ok:
-                warnings.append("Modo FAST-PATH REAL: fuentes auxiliares en lazy")
             if master is not None:
                 mv_live, mts_live = master
                 live_age_sec = max(0.0, (_now().astimezone(timezone.utc) - mts_live.astimezone(timezone.utc)).total_seconds())
@@ -1046,48 +1234,13 @@ class DataEngine:
         real_series = pd.DataFrame(columns=["timestamp", "equity"])
 
         if view == "REAL":
-            frames = []
-            if not hist.empty:
-                frames.append(hist[["timestamp", "equity"]].copy())
-            if not series_csv.empty:
-                frames.append(series_csv[["timestamp", "equity"]].copy())
-            if master is not None:
-                mv, mts = master
-                frames.append(pd.DataFrame([{"timestamp": mts, "equity": mv}]))
-            if frames:
-                real_series = pd.concat(frames, ignore_index=True)
-                real_series["timestamp"] = pd.to_datetime(real_series["timestamp"], errors="coerce", utc=True)
-                real_series["equity"] = pd.to_numeric(real_series["equity"], errors="coerce")
-                real_series = real_series.dropna(subset=["timestamp", "equity"])
-                real_series = real_series.sort_values("timestamp").drop_duplicates(subset=["timestamp", "equity"], keep="last")
-                real_series = real_series.reset_index(drop=True)
-
-            live_fresh = False
-            if master is not None:
-                _mv, mts_live = master
-                live_age_sec = max(0.0, (_now().astimezone(timezone.utc) - mts_live.astimezone(timezone.utc)).total_seconds())
-                live_fresh = live_age_sec <= float(MASTER_LIVE_STALE_SECONDS)
-
-            if master is not None and live_fresh:
-                mv, mts = master
-                source = "MAESTRO_LIVE"
-                saldo_actual = mv
-                last_update = mts
-            else:
-                latest_hist = None if hist.empty else hist.iloc[-1]
-                latest_series = None if series_csv.empty else series_csv.iloc[-1]
-                hts = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True) if latest_hist is not None else pd.NaT
-                sts = pd.to_datetime(latest_series["timestamp"], errors="coerce", utc=True) if latest_series is not None else pd.NaT
-                if latest_hist is not None and (pd.isna(sts) or (not pd.isna(hts) and hts >= sts)):
-                    source = "MAESTRO_HISTORY"
-                    saldo_actual = float(latest_hist["equity"])
-                    last_update = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True).to_pydatetime()
-                elif latest_series is not None:
-                    source = "SERIE_CSV_DEGRADED"
-                    saldo_actual = float(latest_series["equity"])
-                    last_update = pd.to_datetime(latest_series["timestamp"], errors="coerce", utc=True).to_pydatetime()
-                if master is not None and not live_fresh and source != "SIN DATOS REALES":
-                    warnings.append("Live stale descartado como saldo principal")
+            real_series = self._build_real_series(hist=hist, series_csv=series_csv, master=master)
+            source, saldo_actual, last_update, select_warnings = self._select_real_effective_source(
+                master=master,
+                hist=hist,
+                series_csv=series_csv,
+            )
+            warnings.extend(select_warnings)
         elif not observed.empty:
             source = "OBSERVADO_FALLBACK"
             saldo_actual = float(observed["equity"].iloc[-1])
@@ -1104,12 +1257,12 @@ class DataEngine:
                 warnings.append("DEGRADED: observado de emergencia")
             else:
                 warnings.append("saldo real del maestro no disponible")
-        if source == "SIN DATOS REALES" and not observed.empty:
+        if source == "SIN_DATOS_REALES" and view != "REAL" and not observed.empty:
             source = "OBSERVADO_FALLBACK"
             saldo_actual = float(observed["equity"].iloc[-1])
             last_update = observed["timestamp"].iloc[-1]
             real_series = observed
-        if source == "SIN DATOS REALES" and not estimated.empty:
+        if source == "SIN_DATOS_REALES" and view != "REAL" and not estimated.empty:
             source = "ESTIMADO_EMERGENCIA"
             saldo_actual = float(estimated["equity"].iloc[-1])
             last_update = estimated["timestamp"].iloc[-1]
@@ -1117,6 +1270,8 @@ class DataEngine:
             warnings.append("Usando estimado en emergencia")
         if view == "REAL":
             warnings.append(f"Fuente real efectiva usada: {source}")
+            if source != "MAESTRO_LIVE" and master is not None:
+                warnings.append("Diag: live descartado por stale/prioridad temporal")
 
         real_points = int(len(real_series))
         if real_points == 0:
@@ -1128,7 +1283,8 @@ class DataEngine:
         if source == "SIN_DATOS_REALES" and not estimated.empty:
             warnings.append("Estimado CSV disponible solo como auxiliar")
         if view == "REAL":
-            sample = self._extract_best_real_sample_for_persist(
+            append_msg = self._persist_real_if_valid(
+                series_target_path=series_target_path,
                 hist=hist,
                 master=master,
                 series_csv=series_csv,
@@ -1138,14 +1294,8 @@ class DataEngine:
                 observed=observed,
                 estimated=estimated,
             )
-            if sample is not None:
-                ts_iso, eq, src = sample
-                repair_msg = self._repair_series_csv_if_needed(series_target_path)
-                if repair_msg:
-                    warnings.append(repair_msg)
-                append_msg = self._append_series_sample_if_new(series_target_path, ts_iso, eq, src)
-                if append_msg:
-                    warnings.append(append_msg)
+            if append_msg:
+                warnings.append(append_msg)
 
         mcut = now - timedelta(minutes=VENTANA_MINUTOS)
         hcut = now - timedelta(hours=VENTANA_HORAS)
@@ -1192,19 +1342,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._error_throttle: Dict[str, Tuple[float, int]] = {}
         self._last_plot_series: Dict[str, pd.DataFrame] = {}
         self._build_ms_hist = deque(maxlen=120)
-        self.follow_latest = True
-        self.manual_view_active = False
         self._force_autorange_once = True
-        self._auto_range_guard = False
         self._last_scale_mode = str(Y_SCALE_MODE)
-        self.rule_enabled = False
         self.markers_enabled = SHOW_LAST_MARKER
-        self.show_ema_fast = True
-        self.show_ema_slow = True
-        self.show_last_value_line = True
-        self.show_breaks = True
-        self.smoothing_mode = "OFF"
-        self.rule_points: List[Tuple[float, float]] = []
+        self._last_warn_compact: str = ""
+        self._startup_warning: Optional[str] = None
+        self._last_real_diag_ts: float = 0.0
+        self._last_real_diag_key: str = ""
         self.setWindowTitle(f"Monitor Saldo Real Deriv {MONITOR_VERSION}")
         self.resize(1600, 900)
 
@@ -1238,18 +1382,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.btn_all = QtWidgets.QPushButton("ALL")
         self.btn_reset = QtWidgets.QPushButton("RESET VISTA")
         self.btn_export = QtWidgets.QPushButton("EXPORTAR CSV")
-        self.btn_rule = QtWidgets.QPushButton("REGLA: OFF")
-        self.btn_markers = QtWidgets.QPushButton("MÁX/MÍN: ON")
-        self.btn_last_line = QtWidgets.QPushButton("ÚLTIMA LÍNEA: ON")
-        self.btn_breaks = QtWidgets.QPushButton("QUIEBRES: ON")
-        self.btn_ema_fast = QtWidgets.QPushButton("EMA 8: ON")
-        self.btn_ema_slow = QtWidgets.QPushButton("EMA 26: ON")
-        self.btn_freeze = QtWidgets.QPushButton("FREEZE VIEW: OFF")
-        for b in (self.btn_real, self.btn_demo, self.btn_all, self.btn_reset, self.btn_export, self.btn_rule, self.btn_markers, self.btn_last_line, self.btn_breaks, self.btn_ema_fast, self.btn_ema_slow, self.btn_freeze):
+        for b in (self.btn_real, self.btn_demo, self.btn_all, self.btn_reset, self.btn_export):
             b.setObjectName("MetaBox")
             controls.addWidget(b)
-        self.cmb_smooth = QtWidgets.QComboBox(); self.cmb_smooth.setObjectName("MetaBox")
-        self.cmb_smooth.addItems(["SMOOTH: OFF", "SMOOTH: LEVE", "SMOOTH: MEDIO"])
         self.cmb_min = QtWidgets.QComboBox(); self.cmb_min.setObjectName("MetaBox")
         self.cmb_min.addItems(["15m", "30m", "60m", "90m", "120m"])
         self.cmb_hour = QtWidgets.QComboBox(); self.cmb_hour.setObjectName("MetaBox")
@@ -1257,7 +1392,6 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.cmb_day = QtWidgets.QComboBox(); self.cmb_day.setObjectName("MetaBox")
         self.cmb_day.addItems(["7d", "14d", "30d"])
         self._sync_window_combos()
-        controls.addWidget(self.cmb_smooth)
         controls.addWidget(self.cmb_min)
         controls.addWidget(self.cmb_hour)
         controls.addWidget(self.cmb_day)
@@ -1294,7 +1428,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.lbl_stats.setObjectName("Warn")
         self.lbl_stats.setMaximumHeight(20)
         root.addWidget(self.lbl_stats)
-        self.lbl_help = QtWidgets.QLabel(f"Teclas: [1]REAL [2]DEMO [3]ALL [F]Fullscreen [R]Reset [E]Export [G]Regla [C]Limpiar regla [M]Máx/Mín [V]Freeze [Q]Salir · {MONITOR_VERSION}")
+        self.lbl_help = QtWidgets.QLabel(f"Teclas: [1]REAL [2]DEMO [3]ALL [F]Fullscreen [R]Reset [E]Export [Q]Salir · {MONITOR_VERSION}")
         self.lbl_help.setObjectName("Help"); root.addWidget(self.lbl_help)
         self.lbl_help.setMaximumHeight(14)
 
@@ -1327,24 +1461,18 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.btn_all.clicked.connect(lambda: self._switch_view("ALL"))
         self.btn_reset.clicked.connect(self._reset_view)
         self.btn_export.clicked.connect(self._export_visible_csv)
-        self.btn_rule.clicked.connect(self._toggle_rule_mode)
-        self.btn_markers.clicked.connect(self._toggle_markers)
-        self.btn_last_line.clicked.connect(self._toggle_last_value_line)
-        self.btn_breaks.clicked.connect(self._toggle_breaks)
-        self.btn_ema_fast.clicked.connect(self._toggle_ema_fast)
-        self.btn_ema_slow.clicked.connect(self._toggle_ema_slow)
-        self.btn_freeze.clicked.connect(self._toggle_freeze)
-        self.cmb_smooth.currentTextChanged.connect(self._on_smooth_changed)
         self.cmb_min.currentTextChanged.connect(self._on_window_combo_changed)
         self.cmb_hour.currentTextChanged.connect(self._on_window_combo_changed)
         self.cmb_day.currentTextChanged.connect(self._on_window_combo_changed)
 
-        self._init_crosshair()
-        self._attach_manual_range_hooks()
-
         if FULLSCREEN_INICIAL:
             self.showMaximized()
-        self.refresh(force=True)
+        try:
+            self.refresh(force=True)
+        except Exception as e:
+            self._startup_warning = f"Refresh inicial falló: {e}"
+            self.lbl_warn.setText(f"⚠ {self._startup_warning}")
+            traceback.print_exc()
 
     def _style_plot(self, plot: pg.PlotItem, title: str):
         plot.setTitle(f"<span style='color:#cfe2ff;font-size:12pt;font-weight:680'>{title}</span>")
@@ -1397,21 +1525,10 @@ class DashboardWindow(QtWidgets.QMainWindow):
     def _init_plot_state(self, plot: pg.PlotItem, color: str, endpoint: str, canonical_window_s: int) -> Dict[str, object]:
         glow = plot.plot([], [], pen=pg.mkPen(color + "55", width=8.0), name=None)
         line = plot.plot([], [], pen=pg.mkPen(color, width=5.2), name="Equity")
-        smooth_line = plot.plot([], [], pen=pg.mkPen("#ffffff66", width=2.0), name="Suavizado")
-        ema_alert = plot.plot([], [], pen=pg.mkPen("#ff8a5b", width=2.2), name="EMA 8")
-        ema_calm = plot.plot([], [], pen=pg.mkPen("#7ea4ff", width=2.0, style=QtCore.Qt.DashLine), name="EMA 26")
-        last_value_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#8ad6ffaa", width=1.1, style=QtCore.Qt.DotLine))
-        last_value_line.setVisible(False)
-        plot.addItem(last_value_line)
         last = plot.plot([], [], pen=None, symbol="o", symbolSize=5, symbolBrush=endpoint, name=None)
-        vmax = plot.plot([], [], pen=None, symbol="o", symbolSize=4, symbolBrush="#ffd36b99", name=None)
-        vmin = plot.plot([], [], pen=None, symbol="o", symbolSize=4, symbolBrush="#ff8f8f99", name=None)
-        cross_up = plot.plot([], [], pen=None, symbol="t", symbolSize=6, symbolBrush="#8ef0a8cc", name=None)
-        cross_down = plot.plot([], [], pen=None, symbol="t1", symbolSize=6, symbolBrush="#ff9b9bcc", name=None)
-        slope_break = plot.plot([], [], pen=None, symbol="d", symbolSize=5, symbolBrush="#f2d88acc", name=None)
         txt = pg.TextItem(text="", color="#9ec2ff", anchor=(0, 1))
         plot.addItem(txt)
-        return {"plot": plot, "glow": glow, "line": line, "smooth_line": smooth_line, "ema_alert": ema_alert, "ema_calm": ema_calm, "last_value_line": last_value_line, "last": last, "max": vmax, "min": vmin, "cross_up": cross_up, "cross_down": cross_down, "slope_break": slope_break, "text": txt, "endpoint": endpoint, "canonical_window_s": int(canonical_window_s)}
+        return {"plot": plot, "glow": glow, "line": line, "last": last, "text": txt, "endpoint": endpoint, "canonical_window_s": int(canonical_window_s)}
 
     def _sync_window_combos(self):
         self.cmb_min.setCurrentText(f"{int(VENTANA_MINUTOS)}m")
@@ -1448,140 +1565,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
         else:
             plot.setXRange(xmax - float(canonical_window_s), xmax, padding=0.0)
 
-    def _attach_manual_range_hooks(self):
-        for p in (self.p_main, self.p_min, self.p_hour, self.p_day):
-            try:
-                vb = p.getViewBox()
-                sig_manual = getattr(vb, "sigRangeChangedManually", None)
-                if sig_manual is not None:
-                    sig_manual.connect(self._on_user_range_changed)
-                else:
-                    vb.sigRangeChanged.connect(self._on_user_range_changed)
-            except Exception:
-                continue
-
-    def _on_user_range_changed(self, *_args):
-        if self._auto_range_guard:
-            return
-        self.manual_view_active = True
-        self.follow_latest = False
-        self.btn_freeze.setText("FREEZE VIEW: ON")
-
     def _switch_view(self, view: str):
         self.view = view
         self.refresh(force=True)
 
     def _reset_view(self):
-        self._auto_range_guard = True
         self.p_main.enableAutoRange(); self.p_min.enableAutoRange(); self.p_hour.enableAutoRange(); self.p_day.enableAutoRange()
-        self._auto_range_guard = False
-        self.manual_view_active = False
-        self.follow_latest = True
         self._force_autorange_once = True
-        self.btn_freeze.setText("FREEZE VIEW: OFF")
         self.refresh(force=True)
-
-    def _toggle_freeze(self):
-        self.follow_latest = not self.follow_latest
-        if self.follow_latest:
-            self.manual_view_active = False
-            self._force_autorange_once = True
-        else:
-            self.manual_view_active = True
-        self.btn_freeze.setText(f"FREEZE VIEW: {'OFF' if self.follow_latest else 'ON'}")
-
-    def _toggle_rule_mode(self):
-        self.rule_enabled = not self.rule_enabled
-        if not self.rule_enabled:
-            self.rule_points = []
-        self.btn_rule.setText(f"REGLA: {'ON' if self.rule_enabled else 'OFF'}")
-
-    def _toggle_markers(self):
-        self.markers_enabled = not self.markers_enabled
-        self.btn_markers.setText(f"MÁX/MÍN: {'ON' if self.markers_enabled else 'OFF'}")
-
-    def _toggle_last_value_line(self):
-        self.show_last_value_line = not self.show_last_value_line
-        self.btn_last_line.setText(f"ÚLTIMA LÍNEA: {'ON' if self.show_last_value_line else 'OFF'}")
-
-    def _toggle_breaks(self):
-        self.show_breaks = not self.show_breaks
-        self.btn_breaks.setText(f"QUIEBRES: {'ON' if self.show_breaks else 'OFF'}")
-
-    def _toggle_ema_fast(self):
-        self.show_ema_fast = not self.show_ema_fast
-        self.btn_ema_fast.setText(f"EMA 8: {'ON' if self.show_ema_fast else 'OFF'}")
-
-    def _toggle_ema_slow(self):
-        self.show_ema_slow = not self.show_ema_slow
-        self.btn_ema_slow.setText(f"EMA 26: {'ON' if self.show_ema_slow else 'OFF'}")
-
-    def _on_smooth_changed(self, text: str):
-        t = str(text or "").upper()
-        if "LEVE" in t:
-            self.smoothing_mode = "LEVE"
-        elif "MEDIO" in t:
-            self.smoothing_mode = "MEDIO"
-        else:
-            self.smoothing_mode = "OFF"
-        self.refresh(force=True)
-
-    def _init_crosshair(self):
-        self.cross_v = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#6688aa88"))
-        self.cross_h = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#6688aa88"))
-        self.p_main.addItem(self.cross_v, ignoreBounds=True)
-        self.p_main.addItem(self.cross_h, ignoreBounds=True)
-        self.main_curve_proxy = pg.SignalProxy(self.p_main.scene().sigMouseMoved, rateLimit=45, slot=self._on_mouse_moved)
-        self.main_click_proxy = pg.SignalProxy(self.p_main.scene().sigMouseClicked, rateLimit=20, slot=self._on_mouse_clicked)
-
-    def _on_mouse_moved(self, evt):
-        if not evt:
-            return
-        pos = evt[0]
-        if not self.p_main.sceneBoundingRect().contains(pos):
-            return
-        point = self.p_main.vb.mapSceneToView(pos)
-        x, y = float(point.x()), float(point.y())
-        self.cross_v.setPos(x); self.cross_h.setPos(y)
-        main_vis = _sanitize_series_for_plot(self._last_plot_series.get("main", pd.DataFrame(columns=["timestamp", "equity"])))
-        if main_vis.empty:
-            return
-        ts = datetime.fromtimestamp(x, tz=timezone.utc).astimezone(DISPLAY_TZ)
-        first = float(main_vis["equity"].iloc[0])
-        delta = y - first
-        pct = (delta / first * 100.0) if abs(first) > 1e-12 else 0.0
-        self.p_main.setToolTip(
-            f"{ts.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
-            f"Saldo: {y:,.2f} USD\n"
-            f"Δ vs primer visible: {delta:+,.2f} USD ({pct:+.2f}%)"
-        )
-
-    def _on_mouse_clicked(self, evt):
-        if not evt or not self.rule_enabled:
-            return
-        mouse_event = evt[0]
-        if mouse_event.button() != QtCore.Qt.LeftButton:
-            return
-        scene_pos = mouse_event.scenePos()
-        if not self.p_main.sceneBoundingRect().contains(scene_pos):
-            return
-        point = self.p_main.vb.mapSceneToView(scene_pos)
-        self.rule_points.append((float(point.x()), float(point.y())))
-        if len(self.rule_points) > 2:
-            self.rule_points = self.rule_points[-2:]
-        if len(self.rule_points) == 2:
-            self._render_rule_stats()
-
-    def _render_rule_stats(self):
-        (x1, y1), (x2, y2) = self.rule_points
-        dt_s = max(0.0, x2 - x1)
-        delta = y2 - y1
-        pct = (delta / y1 * 100.0) if abs(y1) > 1e-12 else 0.0
-        usd_min = (delta / (dt_s / 60.0)) if dt_s > 0 else 0.0
-        pct_hour = (pct / (dt_s / 3600.0)) if dt_s > 0 else 0.0
-        self.lbl_stats.setText(
-            f"REGLA A→B | ΔUSD={delta:+,.2f} | Δ%={pct:+.2f}% | Δt={dt_s/60.0:,.1f} min | Pend={usd_min:+,.2f} USD/min | {pct_hour:+.2f}%/h"
-        )
 
     def _export_visible_csv(self):
         vis = _sanitize_series_for_plot(self._last_plot_series.get("main", pd.DataFrame(columns=["timestamp", "equity"])))
@@ -1612,15 +1603,6 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self._reset_view()
         elif k == QtCore.Qt.Key_E:
             self._export_visible_csv()
-        elif k == QtCore.Qt.Key_G:
-            self._toggle_rule_mode()
-        elif k == QtCore.Qt.Key_C:
-            self.rule_points = []
-            self.lbl_stats.setText("STATS VIS: --")
-        elif k == QtCore.Qt.Key_M:
-            self._toggle_markers()
-        elif k == QtCore.Qt.Key_V:
-            self._toggle_freeze()
         elif k == QtCore.Qt.Key_Q:
             self.close()
         else:
@@ -1662,117 +1644,44 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
     def _update_plot_state(self, state: Dict[str, object], s: pd.DataFrame) -> Tuple[str, float, float]:
         plot = state["plot"]
-        glow = state["glow"]; line = state["line"]; smooth_line = state["smooth_line"]; last = state["last"]; vmax = state["max"]; vmin = state["min"]; txt = state["text"]
-        ema_alert_line = state["ema_alert"]; ema_calm_line = state["ema_calm"]; last_value_line = state["last_value_line"]
-        cross_up = state["cross_up"]; cross_down = state["cross_down"]; slope_break = state["slope_break"]
+        glow = state["glow"]; line = state["line"]; last = state["last"]; txt = state["text"]
         endpoint = state.get("endpoint", "#9ef7d8")
         s = _sanitize_series_for_plot(s)
         if s.empty:
             glow.setData([], [])
             line.setData([], [])
-            smooth_line.setData([], [])
-            ema_alert_line.setData([], [])
-            ema_calm_line.setData([], [])
             last.setData([], [])
-            vmax.setData([], [])
-            vmin.setData([], [])
-            cross_up.setData([], [])
-            cross_down.setData([], [])
-            slope_break.setData([], [])
-            last_value_line.setVisible(False)
             txt.setText("Sin puntos")
             y0, y1, scale_info = self._resolve_y_range(None)
-            auto_apply = bool(self._force_autorange_once or (self.follow_latest and not self.manual_view_active))
-            if auto_apply:
-                self._auto_range_guard = True
-                plot.setYRange(y0, y1, padding=0.0)
-                self._auto_range_guard = False
+            plot.setYRange(y0, y1, padding=0.0)
             return "sin datos", y0, y1
 
         x = (s["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
         y = s["equity"].to_numpy(dtype=float)
-        smooth_y = y.copy()
-        if len(y) >= 5 and self.smoothing_mode in ("LEVE", "MEDIO"):
-            win = 5 if self.smoothing_mode == "LEVE" else 9
-            smooth_y = pd.Series(y).rolling(window=win, min_periods=1, center=True).mean().to_numpy(dtype=float)
 
         if len(x) >= MIN_POINTS_FOR_LINE:
             glow.setData(x, y)
             line.setData(x, y)
-            smooth_line.setData(x, smooth_y) if self.smoothing_mode != "OFF" else smooth_line.setData([], [])
             txt.setText("")
         else:
             glow.setData([], [])
             line.setData([], [])
-            smooth_line.setData([], [])
             txt.setText("1 punto: esperando más histórico")
-
-        if len(y) >= 8:
-            ema_alert = pd.Series(y).ewm(span=8, adjust=False).mean().to_numpy(dtype=float)
-            ema_calm = pd.Series(y).ewm(span=26, adjust=False).mean().to_numpy(dtype=float)
-            ema_alert_line.setData(x, ema_alert) if self.show_ema_fast else ema_alert_line.setData([], [])
-            ema_calm_line.setData(x, ema_calm) if self.show_ema_slow else ema_calm_line.setData([], [])
-            if self.show_breaks:
-                cross = np.sign(ema_alert - ema_calm)
-                cross_shift = np.roll(cross, 1)
-                cross_shift[0] = 0
-                up_idx = np.where((cross > 0) & (cross_shift <= 0))[0]
-                dn_idx = np.where((cross < 0) & (cross_shift >= 0))[0]
-                cross_up.setData(x[up_idx], y[up_idx] if len(up_idx) else [])
-                cross_down.setData(x[dn_idx], y[dn_idx] if len(dn_idx) else [])
-                dy = np.gradient(smooth_y)
-                ddy = np.gradient(dy)
-                thr = np.nanstd(ddy) * 1.25 if np.isfinite(np.nanstd(ddy)) else 0.0
-                sb_idx = np.where(np.abs(ddy) > max(1e-9, thr))[0]
-                slope_break.setData(x[sb_idx], y[sb_idx] if len(sb_idx) else [])
-            else:
-                cross_up.setData([], [])
-                cross_down.setData([], [])
-                slope_break.setData([], [])
-        else:
-            ema_alert_line.setData([], [])
-            ema_calm_line.setData([], [])
-            cross_up.setData([], [])
-            cross_down.setData([], [])
-            slope_break.setData([], [])
-
-        if self.show_last_value_line and len(y) >= 1:
-            last_value_line.setPos(float(y[-1]))
-            last_value_line.setVisible(True)
-        else:
-            last_value_line.setVisible(False)
 
         marker_size = 8 if len(x) == 1 else 4
         try:
             last.setSymbolBrush(endpoint)
         except Exception:
             pass
-        if self.markers_enabled and SHOW_LAST_MARKER:
+        if SHOW_LAST_MARKER:
             last.setData([x[-1]], [y[-1]], symbolSize=marker_size)
         else:
             last.setData([], [])
-        if self.markers_enabled and len(x) >= 5:
-            yy = smooth_y
-            prev = np.roll(yy, 1); nxt = np.roll(yy, -1)
-            peak_idx = np.where((yy > prev) & (yy > nxt))[0]
-            min_idx = np.where((yy < prev) & (yy < nxt))[0]
-            peak_idx = peak_idx[(peak_idx > 0) & (peak_idx < len(yy) - 1)]
-            min_idx = min_idx[(min_idx > 0) & (min_idx < len(yy) - 1)]
-            vmax.setData(x[peak_idx[-20:]], y[peak_idx[-20:]] if len(peak_idx) else [])
-            vmin.setData(x[min_idx[-20:]], y[min_idx[-20:]] if len(min_idx) else [])
-        else:
-            vmax.setData([], [])
-            vmin.setData([], [])
         y0, y1, scale_info = self._resolve_y_range(y)
-        auto_apply = bool(self._force_autorange_once or (self.follow_latest and not self.manual_view_active))
-        if auto_apply:
-            self._auto_range_guard = True
-            plot.setYRange(y0, y1, padding=0.0)
-            if Y_SCALE_MODE == "manual":
-                plot.setLimits(yMin=y0, yMax=y1)
-            if self.follow_latest and not self.manual_view_active:
-                self._set_x_range_visible(plot, x, int(state["canonical_window_s"]))
-            self._auto_range_guard = False
+        plot.setYRange(y0, y1, padding=0.0)
+        if Y_SCALE_MODE == "manual":
+            plot.setLimits(yMin=y0, yMax=y1)
+        self._set_x_range_visible(plot, x, int(state["canonical_window_s"]))
         return scale_info, y0, y1
 
     def refresh(self, force: bool = False):
@@ -1805,26 +1714,29 @@ class DashboardWindow(QtWidgets.QMainWindow):
             elif not current_valid and self.last_good_snapshot is None:
                 status = "NO DATA"
 
+            # FAST-PATH UI principal (saldo + badge): nunca debe caer por errores accesorios.
             effective_saldo = snap.saldo_actual if _is_valid_number(snap.saldo_actual) else self.last_good_saldo
             if _is_valid_number(effective_saldo):
                 self.lbl_big.setText(_fmt_money(float(effective_saldo)))
             else:
                 self.lbl_big.setText("--")
-
-            effective_last_update = snap.last_update if snap.last_update else self.last_good_last_update
-            last = effective_last_update.astimezone(DISPLAY_TZ).strftime("%H:%M:%S") if effective_last_update else "--"
-
             raw_src = snap.source.upper().strip()
             effective_src = raw_src if current_valid else ((self.last_good_source or raw_src).upper().strip() if self.last_good_source or raw_src else "--")
-            source_label = f"FUENTE: {effective_src} · {status}"
-            self.lbl_source.setText(source_label)
+            self.lbl_source.setText(f"FUENTE: {effective_src} · {status}")
+            if self.view == "REAL":
+                now_mono = time.monotonic()
+                diag_key = f"{effective_src}|{status}|{_fmt_money(float(effective_saldo)) if _is_valid_number(effective_saldo) else '--'}"
+                if diag_key != self._last_real_diag_key or (now_mono - self._last_real_diag_ts) >= 15.0:
+                    self._last_real_diag_key = diag_key
+                    self._last_real_diag_ts = now_mono
+                    print(f"[MONITOR][REAL] src={effective_src} status={status} saldo={diag_key.split('|')[-1]}")
             if status == "NO DATA":
                 self.lbl_source.setObjectName("BadgeBad"); self.lbl_big.setStyleSheet("color:#ffb9b9;")
             elif status == "STALE":
                 self.lbl_source.setObjectName("BadgeWarn"); self.lbl_big.setStyleSheet("color:#ffe9b8;")
             elif status == "DEGRADED":
                 self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
-            elif effective_src == "MAESTRO_LIVE":
+            elif effective_src in ("MAESTRO_LIVE", "MAESTRO_5R6M"):
                 self.lbl_source.setObjectName("BadgeMaster"); self.lbl_big.setStyleSheet("color:#72f8b1;")
             elif effective_src in ("MAESTRO_HISTORY_DEGRADED", "SERIE_CSV_DEGRADED"):
                 self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
@@ -1834,6 +1746,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_source.setObjectName("BadgeNeutral"); self.lbl_big.setStyleSheet("color:#d8e7ff;")
             self.lbl_source.style().unpolish(self.lbl_source); self.lbl_source.style().polish(self.lbl_source)
 
+            effective_last_update = snap.last_update if snap.last_update else self.last_good_last_update
+            last = effective_last_update.astimezone(DISPLAY_TZ).strftime("%H:%M:%S") if effective_last_update else "--"
+
             main_scale = "--"
             main_y0, main_y1 = 0.0, 0.0
             series_map = {
@@ -1842,113 +1757,116 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 "hour": snap.series_hours,
                 "day": snap.series_days,
             }
-            for key, series in (
-                ("main", series_map["main"]),
-                ("min", series_map["min"]),
-                ("hour", series_map["hour"]),
-                ("day", series_map["day"]),
-            ):
-                try:
-                    use_series = _sanitize_series_for_plot(series)
-                    if use_series.empty and key in self._last_plot_series and not self._last_plot_series[key].empty:
-                        use_series = self._last_plot_series[key]
-                        if status in ("STALE", "DEGRADED"):
-                            snap.warnings.append(f"Mostrando última serie válida en panel {key}")
-                    elif not use_series.empty:
-                        self._last_plot_series[key] = use_series
-                    scale_info, py0, py1 = self._update_plot_state(self.plot_states[key], use_series)
-                    if key == "main":
-                        main_scale = scale_info
-                        main_y0, main_y1 = py0, py1
-                except Exception as plot_err:
-                    snap.warnings.append(f"plot {key} con error: {plot_err}")
-                    self._throttled_warn(f"plot:{key}", f"Error en gráfico {key}: {plot_err}")
-            visible = _sanitize_series_for_plot(series_map["main"])
-            if visible.empty and "main" in self._last_plot_series:
-                visible = self._last_plot_series["main"]
-            n_visible = int(len(visible))
-            if n_visible >= 1:
-                first = float(visible["equity"].iloc[0])
-                last_v = float(visible["equity"].iloc[-1])
-                delta = last_v - first
-                pct = (delta / first * 100.0) if abs(first) > 1e-12 else 0.0
-                compact_delta = f"{delta:+,.2f} USD ({pct:+.2f}%)"
-            else:
-                compact_delta = "--"
-            if n_visible >= 1:
-                min_v = float(visible["equity"].min())
-                max_v = float(visible["equity"].max())
-                first_v = float(visible["equity"].iloc[0])
-                last_v = float(visible["equity"].iloc[-1])
-                dd = min_v - max_v
-                amp_pct = ((max_v - min_v) / first_v * 100.0) if abs(first_v) > 1e-12 else 0.0
-                self.lbl_stats.setText(
-                    f"VIS | first={first_v:,.2f} last={last_v:,.2f} max={max_v:,.2f} min={min_v:,.2f} "
-                    f"drawdown={dd:,.2f} rango={max_v-min_v:,.2f} amp={amp_pct:.2f}% pts={n_visible}"
-                )
-            elif not self.rule_enabled:
-                self.lbl_stats.setText("STATS VIS: --")
-            if self.rule_enabled and len(self.rule_points) == 2:
-                self._render_rule_stats()
-            self.lbl_meta_compact.setText(
-                f"{snap.now.strftime('%H:%M:%S %Z')} · última {last} · pts {n_visible} · Δvis {compact_delta}"
-            )
-
-            last_good_age = "--"
-            if self.last_good_last_update is not None:
-                age_s = max(0.0, (snap.now - self.last_good_last_update.astimezone(DISPLAY_TZ)).total_seconds())
-                last_good_age = f"{age_s:,.1f}s"
-            if status == "STALE":
-                snap.warnings.insert(0, "Mostrando último saldo válido")
-            elif status == "DEGRADED":
-                snap.warnings.insert(0, "Modo degradado: fuente principal no disponible, fallback válido activo")
-            elif status == "NO DATA":
-                snap.warnings.insert(0, "No hay datos válidos desde el arranque")
-
-            if snap.warnings:
-                compact = [w.strip()[:110] + ("…" if len(w.strip()) > 110 else "") for w in snap.warnings[:3]]
-                self.lbl_warn.setText("⚠ " + " · ".join(compact))
-                self.lbl_warn.setToolTip(
-                    "\n".join(
-                        snap.warnings
-                        + [
-                            f"Estado: {status}",
-                            f"Fuente efectiva actual: {effective_src}",
-                            f"Fuente último saldo válido: {self.last_good_source or '--'}",
-                            f"Edad último saldo válido: {last_good_age}",
-                            f"build ms: {self.last_build_ms:,.2f}",
-                            f"build ms avg: {np.mean(self._build_ms_hist):,.2f}" if self._build_ms_hist else "build ms avg: --",
-                            f"refresh skipped: {self.refresh_skipped}",
-                            f"worker running: {'yes' if self.worker_running else 'no'}",
-                            f"filas series_real: {len(_sanitize_series_for_plot(snap.series_real))}",
-                            f"filas series_main: {len(_sanitize_series_for_plot(snap.series_main))}",
-                            f"ruta live: {SALDO_LIVE_SHARED_PATH}",
-                            f"ruta history: {SALDO_LIVE_HISTORY_SHARED_PATH}",
-                            f"ruta series csv: {SALDO_SERIES_CSV_PATH}",
-                            f"Escala efectiva: {main_scale}",
-                            f"Escala main: {Y_SCALE_MODE} | y=[{main_y0:,.2f}, {main_y1:,.2f}]",
-                        ]
+            try:
+                for key, series in (
+                    ("main", series_map["main"]),
+                    ("min", series_map["min"]),
+                    ("hour", series_map["hour"]),
+                    ("day", series_map["day"]),
+                ):
+                    try:
+                        use_series = _sanitize_series_for_plot(series)
+                        if use_series.empty and key in self._last_plot_series and not self._last_plot_series[key].empty:
+                            use_series = self._last_plot_series[key]
+                            if status in ("STALE", "DEGRADED"):
+                                snap.warnings.append(f"Mostrando última serie válida en panel {key}")
+                        elif not use_series.empty:
+                            self._last_plot_series[key] = use_series
+                        scale_info, py0, py1 = self._update_plot_state(self.plot_states[key], use_series)
+                        if key == "main":
+                            main_scale = scale_info
+                            main_y0, main_y1 = py0, py1
+                    except Exception as plot_err:
+                        snap.warnings.append(f"plot {key} con error: {plot_err}")
+                        self._throttled_warn(f"plot:{key}", f"Error en gráfico {key}: {plot_err}")
+                visible = _sanitize_series_for_plot(series_map["main"])
+                if visible.empty and "main" in self._last_plot_series:
+                    visible = self._last_plot_series["main"]
+                n_visible = int(len(visible))
+                if n_visible >= 1:
+                    first = float(visible["equity"].iloc[0])
+                    last_v = float(visible["equity"].iloc[-1])
+                    delta = last_v - first
+                    pct = (delta / first * 100.0) if abs(first) > 1e-12 else 0.0
+                    compact_delta = f"{delta:+,.2f} USD ({pct:+.2f}%)"
+                else:
+                    compact_delta = "--"
+                if n_visible >= 1:
+                    min_v = float(visible["equity"].min())
+                    max_v = float(visible["equity"].max())
+                    first_v = float(visible["equity"].iloc[0])
+                    last_v = float(visible["equity"].iloc[-1])
+                    dd = min_v - max_v
+                    amp_pct = ((max_v - min_v) / first_v * 100.0) if abs(first_v) > 1e-12 else 0.0
+                    self.lbl_stats.setText(
+                        f"VIS | first={first_v:,.2f} last={last_v:,.2f} max={max_v:,.2f} min={min_v:,.2f} "
+                        f"drawdown={dd:,.2f} rango={max_v-min_v:,.2f} amp={amp_pct:.2f}% pts={n_visible}"
                     )
+                else:
+                    self.lbl_stats.setText("STATS VIS: --")
+                self.lbl_meta_compact.setText(
+                    f"{snap.now.strftime('%H:%M:%S %Z')} · última {last} · pts {n_visible} · Δvis {compact_delta}"
                 )
-            else:
-                self.lbl_warn.setText("")
-                self.lbl_warn.setToolTip(
-                    f"Estado: {status}\n"
-                    f"Fuente efectiva actual: {effective_src}\n"
-                    f"Fuente último saldo válido: {self.last_good_source or '--'}\n"
-                    f"Edad último saldo válido: {last_good_age}\n"
-                    f"build ms: {self.last_build_ms:,.2f}\n"
-                    f"build ms avg: {np.mean(self._build_ms_hist):,.2f}\n"
-                    f"refresh skipped: {self.refresh_skipped}\n"
-                    f"worker running: {'yes' if self.worker_running else 'no'}\n"
-                    f"filas series_real: {len(_sanitize_series_for_plot(snap.series_real))}\n"
-                    f"filas series_main: {len(_sanitize_series_for_plot(snap.series_main))}\n"
-                    f"ruta live: {SALDO_LIVE_SHARED_PATH}\n"
-                    f"ruta history: {SALDO_LIVE_HISTORY_SHARED_PATH}\n"
-                    f"ruta series csv: {SALDO_SERIES_CSV_PATH}\n"
-                    f"Escala efectiva: {main_scale}\n"
-                    f"Escala main: {Y_SCALE_MODE} | y=[{main_y0:,.2f}, {main_y1:,.2f}]"
-                )
+            except Exception as ui_err:
+                self._throttled_warn("ui-secondary", f"Error secundario de UI: {ui_err}")
+                if not self.lbl_meta_compact.text().strip():
+                    self.lbl_meta_compact.setText(f"{snap.now.strftime('%H:%M:%S %Z')} · última {last}")
+
+            try:
+                last_good_age = "--"
+                if self.last_good_last_update is not None:
+                    age_s = max(0.0, (snap.now - self.last_good_last_update.astimezone(DISPLAY_TZ)).total_seconds())
+                    last_good_age = f"{age_s:,.1f}s"
+                if status == "STALE":
+                    snap.warnings.insert(0, "Mostrando último saldo válido")
+                elif status == "DEGRADED":
+                    snap.warnings.insert(0, "Modo degradado: fuente principal no disponible, fallback válido activo")
+                elif status == "NO DATA":
+                    snap.warnings.insert(0, "No hay datos válidos desde el arranque")
+
+                if snap.warnings:
+                    compact = [w.strip()[:96] + ("…" if len(w.strip()) > 96 else "") for w in snap.warnings[:2]]
+                    compact_msg = "⚠ " + " · ".join(compact)
+                    if compact_msg != self._last_warn_compact:
+                        self.lbl_warn.setText(compact_msg)
+                        self._last_warn_compact = compact_msg
+                    self.lbl_warn.setToolTip(
+                        "\n".join(
+                            snap.warnings
+                            + [
+                                f"Estado: {status}",
+                                f"Fuente efectiva actual: {effective_src}",
+                                f"build ms: {self.last_build_ms:,.2f}",
+                                f"build ms avg: {np.mean(self._build_ms_hist):,.2f}" if self._build_ms_hist else "build ms avg: --",
+                                f"Escala efectiva: {main_scale}",
+                                f"Escala main: {Y_SCALE_MODE} | y=[{main_y0:,.2f}, {main_y1:,.2f}]",
+                            ]
+                        )
+                    )
+                else:
+                    self.lbl_warn.setText("")
+                    self._last_warn_compact = ""
+                    self.lbl_warn.setToolTip(
+                        f"Estado: {status}\n"
+                        f"Fuente efectiva actual: {effective_src}\n"
+                        f"Fuente último saldo válido: {self.last_good_source or '--'}\n"
+                        f"Edad último saldo válido: {last_good_age}\n"
+                        f"build ms: {self.last_build_ms:,.2f}\n"
+                        f"build ms avg: {np.mean(self._build_ms_hist):,.2f}\n"
+                        f"refresh skipped: {self.refresh_skipped}\n"
+                        f"worker running: {'yes' if self.worker_running else 'no'}\n"
+                        f"filas series_real: {len(_sanitize_series_for_plot(snap.series_real))}\n"
+                        f"filas series_main: {len(_sanitize_series_for_plot(snap.series_main))}\n"
+                        f"ruta live: {SALDO_LIVE_SHARED_PATH}\n"
+                        f"ruta history: {SALDO_LIVE_HISTORY_SHARED_PATH}\n"
+                        f"ruta series csv: {SALDO_SERIES_CSV_PATH}\n"
+                        f"Escala efectiva: {main_scale}\n"
+                        f"Escala main: {Y_SCALE_MODE} | y=[{main_y0:,.2f}, {main_y1:,.2f}]"
+                    )
+            except Exception as warn_err:
+                self._throttled_warn("ui-warnings", f"Error en warnings/tooltips: {warn_err}")
+                if not self.lbl_warn.text().strip():
+                    self.lbl_warn.setText("⚠ Warning UI parcial; saldo principal sigue activo")
             if self._force_autorange_once:
                 self._force_autorange_once = False
         except Exception as e:
