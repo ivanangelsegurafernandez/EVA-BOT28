@@ -647,6 +647,34 @@ def _emitir_marca_purificacion_real() -> None:
         pass
 
 
+def _guardar_real_owner_state(bot: str, ciclo: int, source: str, round_id: int | None = None, token_state: str | None = None) -> None:
+    """Telemetría mínima del owner REAL asignado por el maestro."""
+    try:
+        payload = {
+            "owner_bot": str(bot),
+            "assigned_ts": float(time.time()),
+            "ciclo": int(ciclo),
+            "source": str(source or "UNKNOWN"),
+            "round_id": int(round_id) if isinstance(round_id, (int, float)) else None,
+            "token_state": str(token_state) if token_state is not None else None,
+        }
+        _atomic_write(REAL_OWNER_STATE_FILE, json.dumps(payload, ensure_ascii=False, indent=2))
+        globals()["LAST_REAL_OWNER_STATE"] = payload
+    except Exception:
+        pass
+
+
+def _registrar_real_close_trace(data: dict) -> None:
+    """Append conservador de cierre REAL confirmado (sin tocar cálculo de saldo)."""
+    try:
+        payload = dict(data or {})
+        payload.setdefault("ts", float(time.time()))
+        _append_line_safe(REAL_CLOSE_TRACE_FILE, json.dumps(payload, ensure_ascii=False) + "\n")
+        globals()["LAST_REAL_CLOSE_TRACE"] = payload
+    except Exception:
+        pass
+
+
 def _resolver_estado_real(meta_live: dict | None = None) -> str:
     """Estado operativo REAL: SHADOW, MICRO, NORMAL."""
     try:
@@ -1202,6 +1230,9 @@ CTT_STATE = {
 REAL_OWNER_LOCK = None  # owner REAL en memoria (evita carreras de lectura de archivo)
 REAL_LOCK_MISMATCH_SINCE = 0.0
 REAL_LOCK_RECONCILE_S = 6.0
+REAL_OWNER_STATE_FILE = "real_owner_state.json"
+REAL_CLOSE_TRACE_FILE = "real_close_trace.jsonl"
+LAST_REAL_CLOSE_TRACE = {}
 
 EMBUDO_DECISION_STATE = {
     "decision_final": EMBUDO_FINAL_WAIT_SOFT,
@@ -2998,6 +3029,16 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
             agregar_evento("🟢 MARTI-AUDIT: apertura explícita en C1 (nuevo ciclo confirmado).")
         _marcar_compuerta_real_consumida()
         DYN_ROOF_STATE["last_real_open_ts"] = float(time.time())
+        try:
+            _guardar_real_owner_state(
+                bot=bot,
+                ciclo=int(ciclo),
+                source=str(globals().get("_REAL_ROUTE_SOURCE", "LEGACY") or "LEGACY"),
+                round_id=globals().get("SYNC_ROUND_ID", None),
+                token_state=f"REAL:{bot}",
+            )
+        except Exception:
+            pass
         try:
             _REAL_SHADOW_MICRO_OPEN_TS.append(float(time.time()))
         except Exception:
@@ -12538,7 +12579,7 @@ def mostrar_panel():
     # Línea de estado general
     print(padding + Fore.GREEN + "🟢 MODO OPERACIÓN ACTIVO – Escaneando…")
     if _purificacion_real_activa():
-        print(padding + Fore.YELLOW + "🧪 MODO PURIFICACION REAL ACTIVO | PROMOCION REAL DESACTIVADA")
+        print(padding + Fore.YELLOW + "🧪 IA REAL purificada | LXV_SYNC habilitado")
 
     # Etapa activa para depuración de flujo
     try:
@@ -12910,6 +12951,19 @@ def mostrar_panel():
                 f"why={emb.get('decision_reason','--')} wait={emb.get('soft_wait_reason','') or '--'} "
                 f"hard={emb.get('hard_block_reason','') or '--'} deg={emb.get('degrade_from','--')}"
             )
+            owner_state = globals().get("LAST_REAL_OWNER_STATE", {}) if isinstance(globals().get("LAST_REAL_OWNER_STATE", {}), dict) else {}
+            if owner_state:
+                print(
+                    padding + Fore.CYAN +
+                    f"🧾 REAL owner: {owner_state.get('owner_bot','--')} | ciclo C{owner_state.get('ciclo','--')} | source={owner_state.get('source','--')}"
+                )
+            close_state = globals().get("LAST_REAL_CLOSE_TRACE", {}) if isinstance(globals().get("LAST_REAL_CLOSE_TRACE", {}), dict) else {}
+            if close_state:
+                print(
+                    padding + Fore.CYAN +
+                    f"🧾 Último cierre REAL: {close_state.get('bot','--')} {close_state.get('resultado','--')} "
+                    f"{float(close_state.get('saldo_real_antes', 0.0) or 0.0):,.2f} -> {float(close_state.get('saldo_real_despues', 0.0) or 0.0):,.2f}"
+                )
 
             ref_racha = ultimo_bot_real if ultimo_bot_real in BOT_NAMES else "--"
             elegido_tick = mejor[0] if isinstance(mejor, tuple) and len(mejor) >= 1 else "--"
@@ -15041,26 +15095,27 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
     """Embudo unificado: selección -> calidad blanda -> modulación -> estado final."""
     if _purificacion_real_activa():
         _emitir_marca_purificacion_real()
+        lxv_on = bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False))
         top1_bot = str(candidatos[0][1]) if candidatos else None
         top1_prob = float(candidatos[0][2] or 0.0) if candidatos else 0.0
         top2_bot = str(candidatos[1][1]) if len(candidatos) > 1 else None
         top2_prob = float(candidatos[1][2] or 0.0) if len(candidatos) > 1 else 0.0
         gap_value = float(top1_prob - top2_prob) if candidatos else 0.0
         return _registrar_estado_embudo({
-            "decision_final": "REAL_DISABLED",
-            "decision_reason": "purificacion_real",
+            "decision_final": "LXV_ONLY" if lxv_on else "REAL_DISABLED",
+            "decision_reason": "ia_purificada_lxv_activo" if lxv_on else "purificacion_real",
             "gate_quality": "disabled",
-            "risk_mode": "REAL_DISABLED",
-            "hard_block_reason": "purificacion_real",
-            "soft_wait_reason": "purificacion_real",
+            "risk_mode": "LXV_ONLY" if lxv_on else "REAL_DISABLED",
+            "hard_block_reason": "ia_purificada_lxv_activo" if lxv_on else "purificacion_real",
+            "soft_wait_reason": "ia_purificada_lxv_activo" if lxv_on else "purificacion_real",
             "top1_bot": top1_bot,
             "top2_bot": top2_bot,
             "gap_value": gap_value,
             "top1_prob": top1_prob,
             "top2_prob": top2_prob,
-            "degrade_from": "purificacion_real",
+            "degrade_from": "ia_purificada_lxv_activo" if lxv_on else "purificacion_real",
             "ia_real_backed": 0,
-            "real_source": "PURIFICACION_REAL",
+            "real_source": "LXV_SYNC" if lxv_on else "PURIFICACION_REAL",
             "ia_model_mature": 0,
         })
     out = _registrar_estado_embudo({
@@ -16425,7 +16480,25 @@ async def main():
                                 LAST_REAL_CLOSE_SIG[bot] = sig
 
                                 if res in ("GANANCIA", "PÉRDIDA"):
+                                    saldo_antes = obtener_valor_saldo()
                                     registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
+                                    try:
+                                        await refresh_saldo_real(forzado=True)
+                                    except Exception:
+                                        pass
+                                    saldo_despues = obtener_valor_saldo()
+                                    try:
+                                        _registrar_real_close_trace({
+                                            "bot": bot,
+                                            "contract_id": estado_bots.get(bot, {}).get("id_contrato"),
+                                            "resultado": res,
+                                            "saldo_real_antes": float(saldo_antes) if isinstance(saldo_antes, (int, float)) else None,
+                                            "saldo_real_despues": float(saldo_despues) if isinstance(saldo_despues, (int, float)) else None,
+                                            "ciclo": int(ciclo or 0),
+                                            "source_real": estado_bots.get(bot, {}).get("fuente"),
+                                        })
+                                    except Exception:
+                                        pass
                                     if res == "GANANCIA":
                                         cerrar_por_fin_de_ciclo(bot, "Ganancia en REAL (fin de turno)")
                                     else:
@@ -16797,6 +16870,9 @@ async def main():
                             candidatos = []
                         elif decision_final == EMBUDO_FINAL_REAL_MICRO:
                             candidatos = candidatos[:1]
+                        elif decision_final == "LXV_ONLY":
+                            agregar_evento("🧪 IA REAL purificada | LXV_SYNC habilitado (embudo en telemetría).")
+                            candidatos = []
 
                         # LXV como ruta única de decisión REAL: el embudo legacy queda en telemetría.
                         if bool(LXV_SYNC_REAL_ROUTE_ENABLE):
