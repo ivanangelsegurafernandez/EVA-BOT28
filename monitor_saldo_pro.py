@@ -554,454 +554,7 @@ class DataEngine:
         self,
         hist: pd.DataFrame,
         master: Optional[Tuple[float, datetime]],
-        saldo_actual: Optional[float],
-        last_update,
-        source: str,
-        observed: pd.DataFrame,
-        estimated: Optional[pd.DataFrame] = None,
-    ) -> Optional[Tuple[str, float, str]]:
-        if master is not None:
-            mv, mts = master
-            ts_iso = self._ts_utc_iso(mts)
-            eq = self._normalize_equity_value(mv)
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "MAESTRO")
-        if not hist.empty:
-            row = hist.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "MAESTRO_HIST")
-        ts_iso = self._ts_utc_iso(last_update)
-        eq = self._normalize_equity_value(saldo_actual)
-        if ts_iso and eq is not None and source in ("MAESTRO", "SERIE_CSV", "OBSERVADO", "LIVE"):
-            return (ts_iso, eq, source)
-        if not observed.empty:
-            row = observed.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "OBSERVADO_FALLBACK")
-        if estimated is not None and not estimated.empty:
-            row = estimated.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "ESTIMADO_EMERGENCIA")
-        return None
-
-    @staticmethod
-    def _ts_utc_iso(ts_obj) -> Optional[str]:
-        try:
-            ts = pd.to_datetime(ts_obj, errors="coerce", utc=True)
-            if pd.isna(ts):
-                return None
-            return ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        except Exception:
-            return None
-
-    @staticmethod
-    def _normalize_equity_value(value) -> Optional[float]:
-        try:
-            v = float(value)
-            if not np.isfinite(v):
-                return None
-            return float(v)
-        except Exception:
-            return None
-
-    def _ensure_series_csv_exists(self, path: Path) -> Optional[str]:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if not path.exists():
-                with path.open("w", encoding="utf-8", newline="") as fh:
-                    fh.write("timestamp,equity,source\n")
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                return f"{SALDO_SERIES_CSV_FILE} creado automáticamente en {path}"
-        except Exception as e:
-            return f"No se pudo crear {SALDO_SERIES_CSV_FILE} en {path}: {e}"
-        return None
-
-    def _read_last_series_row(self, path: Path) -> Optional[Tuple[str, float, str]]:
-        try:
-            if not path.exists() or path.stat().st_size <= 0:
-                return None
-            lines = self._read_tail_lines(path, 32 * 1024)
-            for raw in reversed(lines):
-                row = [c.strip() for c in raw.split(",")]
-                if len(row) < 2:
-                    continue
-                if row[0].lower() in ("timestamp", "ts_utc"):
-                    continue
-                ts_iso = self._ts_utc_iso(row[0])
-                eq = self._normalize_equity_value(row[1])
-                if ts_iso is None or eq is None:
-                    continue
-                src = row[2] if len(row) >= 3 and row[2] else "MONITOR_BACKFILL"
-                return (ts_iso, eq, str(src))
-        except Exception:
-            return None
-        return None
-
-    def _repair_series_csv_if_needed(self, path: Path) -> Optional[str]:
-        try:
-            st = path.stat()
-            sig = (int(st.st_mtime_ns), int(st.st_size))
-        except Exception:
-            sig = (None, None)
-        key = str(path)
-        if self._series_repair_sig.get(key) == sig:
-            return None
-        created_msg = self._ensure_series_csv_exists(path)
-        if created_msg:
-            try:
-                st = path.stat()
-                self._series_repair_sig[key] = (int(st.st_mtime_ns), int(st.st_size))
-            except Exception:
-                self._series_repair_sig[key] = (None, None)
-            return created_msg
-        try:
-            if path.stat().st_size == 0:
-                with path.open("w", encoding="utf-8", newline="") as fh:
-                    fh.write("timestamp,equity,source\n")
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                return f"{SALDO_SERIES_CSV_FILE} estaba vacío; cabecera restaurada en {path}"
-            with path.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
-                lines = fh.read().splitlines()
-            if not lines:
-                with path.open("w", encoding="utf-8", newline="") as fh:
-                    fh.write("timestamp,equity,source\n")
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                return f"{SALDO_SERIES_CSV_FILE} sin contenido; cabecera restaurada en {path}"
-            head = [c.strip().lower() for c in lines[0].split(",")]
-            valid_header = len(head) >= 2 and head[0] in ("timestamp", "ts_utc") and head[1] in ("equity", "saldo_real")
-            if valid_header:
-                return None
-            rescued: List[Tuple[str, float, str]] = []
-            for raw in lines:
-                row = [c.strip() for c in raw.split(",")]
-                if len(row) < 2:
-                    continue
-                if row[0].lower() in ("timestamp", "ts_utc"):
-                    continue
-                ts_iso = self._ts_utc_iso(row[0])
-                eq = self._normalize_equity_value(row[1])
-                if ts_iso is None or eq is None:
-                    continue
-                src = row[2] if len(row) >= 3 and row[2] else "SERIES_RESCUE"
-                rescued.append((ts_iso, eq, src))
-            tmp = path.with_suffix(path.suffix + ".repair.tmp")
-            with tmp.open("w", encoding="utf-8", newline="") as fh:
-                fh.write("timestamp,equity,source\n")
-                for ts_iso, eq, src in rescued:
-                    fh.write(f"{ts_iso},{eq:.8f},{src}\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
-            try:
-                st = path.stat()
-                self._series_repair_sig[key] = (int(st.st_mtime_ns), int(st.st_size))
-            except Exception:
-                self._series_repair_sig[key] = (None, None)
-            if rescued:
-                return f"{SALDO_SERIES_CSV_FILE} reparado de forma conservadora (rescatadas {len(rescued)} filas)"
-            return f"{SALDO_SERIES_CSV_FILE} recreado limpio tras corrupción de cabecera/contenido"
-        except Exception as e:
-            return f"No se pudo reparar {SALDO_SERIES_CSV_FILE} en {path}: {e}"
-        finally:
-            try:
-                st = path.stat()
-                self._series_repair_sig[key] = (int(st.st_mtime_ns), int(st.st_size))
-            except Exception:
-                self._series_repair_sig[key] = (None, None)
-
-    def _append_series_sample_if_new(self, path: Path, ts, equity, source: str) -> Optional[str]:
-        ts_iso = self._ts_utc_iso(ts)
-        eq = self._normalize_equity_value(equity)
-        if ts_iso is None or eq is None:
-            return None
-        src = str(source or "MONITOR_BACKFILL").strip() or "MONITOR_BACKFILL"
-        fp = (ts_iso, f"{eq:.8f}")
-        if self._series_last_fingerprint == fp:
-            return None
-        last = self._read_last_series_row(path)
-        if last is not None:
-            last_ts, last_eq, _ = last
-            if last_ts == ts_iso or (last_ts == ts_iso and abs(last_eq - eq) < 1e-9) or (abs(last_eq - eq) < 1e-9 and self._series_last_fingerprint == fp):
-                self._series_last_fingerprint = fp
-                return None
-        lock_path = path.with_suffix(path.suffix + ".monitor.lock")
-        wrote = False
-        for _ in range(3):
-            lock_fd = None
-            try:
-                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-                with os.fdopen(lock_fd, "w", encoding="utf-8") as lfh:
-                    lfh.write(str(os.getpid()))
-                lock_fd = None
-                if not path.exists():
-                    self._ensure_series_csv_exists(path)
-                with path.open("a", encoding="utf-8", newline="") as fh:
-                    fh.write(f"{ts_iso},{eq:.8f},{src}\n")
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                wrote = True
-                break
-            except FileExistsError:
-                time.sleep(0.06)
-            except Exception:
-                time.sleep(0.04)
-            finally:
-                if lock_fd is not None:
-                    try:
-                        os.close(lock_fd)
-                    except Exception:
-                        pass
-                try:
-                    if lock_path.exists():
-                        lock_path.unlink()
-                except Exception:
-                    pass
-        if not wrote:
-            now_mono = time.monotonic()
-            if (now_mono - self._series_lock_warn_ts) > 20.0:
-                self._series_lock_warn_ts = now_mono
-                return f"No se pudo anexar muestra a {SALDO_SERIES_CSV_FILE} (lock temporal)"
-            return None
-        self._series_last_fingerprint = fp
-        return None
-
-    def _extract_best_real_sample_for_persist(
-        self,
-        hist: pd.DataFrame,
-        master: Optional[Tuple[float, datetime]],
-        saldo_actual: Optional[float],
-        last_update,
-        source: str,
-        observed: pd.DataFrame,
-        estimated: Optional[pd.DataFrame] = None,
-    ) -> Optional[Tuple[str, float, str]]:
-        if master is not None:
-            mv, mts = master
-            ts_iso = self._ts_utc_iso(mts)
-            eq = self._normalize_equity_value(mv)
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "MAESTRO")
-        if not hist.empty:
-            row = hist.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "MAESTRO_HIST")
-        ts_iso = self._ts_utc_iso(last_update)
-        eq = self._normalize_equity_value(saldo_actual)
-        if ts_iso and eq is not None and source in ("MAESTRO", "SERIE_CSV", "OBSERVADO", "LIVE"):
-            return (ts_iso, eq, source)
-        if not observed.empty:
-            row = observed.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "OBSERVADO_FALLBACK")
-        if estimated is not None and not estimated.empty:
-            row = estimated.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "ESTIMADO_EMERGENCIA")
-        return None
-
-    @staticmethod
-    def _ts_utc_iso(ts_obj) -> Optional[str]:
-        try:
-            ts = pd.to_datetime(ts_obj, errors="coerce", utc=True)
-            if pd.isna(ts):
-                return None
-            return ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        except Exception:
-            return None
-
-    @staticmethod
-    def _normalize_equity_value(value) -> Optional[float]:
-        try:
-            v = float(value)
-            if not np.isfinite(v):
-                return None
-            return float(v)
-        except Exception:
-            return None
-
-    def _ensure_series_csv_exists(self, path: Path) -> Optional[str]:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if not path.exists():
-                with path.open("w", encoding="utf-8", newline="") as fh:
-                    fh.write("timestamp,equity,source\n")
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                return f"{SALDO_SERIES_CSV_FILE} creado automáticamente en {path}"
-        except Exception as e:
-            return f"No se pudo crear {SALDO_SERIES_CSV_FILE} en {path}: {e}"
-        return None
-
-    def _read_last_series_row(self, path: Path) -> Optional[Tuple[str, float, str]]:
-        try:
-            if not path.exists() or path.stat().st_size <= 0:
-                return None
-            lines = self._read_tail_lines(path, 32 * 1024)
-            for raw in reversed(lines):
-                row = [c.strip() for c in raw.split(",")]
-                if len(row) < 2:
-                    continue
-                if row[0].lower() in ("timestamp", "ts_utc"):
-                    continue
-                ts_iso = self._ts_utc_iso(row[0])
-                eq = self._normalize_equity_value(row[1])
-                if ts_iso is None or eq is None:
-                    continue
-                src = row[2] if len(row) >= 3 and row[2] else "MONITOR_BACKFILL"
-                return (ts_iso, eq, str(src))
-        except Exception:
-            return None
-        return None
-
-    def _repair_series_csv_if_needed(self, path: Path) -> Optional[str]:
-        try:
-            st = path.stat()
-            sig = (int(st.st_mtime_ns), int(st.st_size))
-        except Exception:
-            sig = (None, None)
-        key = str(path)
-        if self._series_repair_sig.get(key) == sig:
-            return None
-        created_msg = self._ensure_series_csv_exists(path)
-        if created_msg:
-            try:
-                st = path.stat()
-                self._series_repair_sig[key] = (int(st.st_mtime_ns), int(st.st_size))
-            except Exception:
-                self._series_repair_sig[key] = (None, None)
-            return created_msg
-        try:
-            if path.stat().st_size == 0:
-                with path.open("w", encoding="utf-8", newline="") as fh:
-                    fh.write("timestamp,equity,source\n")
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                return f"{SALDO_SERIES_CSV_FILE} estaba vacío; cabecera restaurada en {path}"
-            with path.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
-                lines = fh.read().splitlines()
-            if not lines:
-                with path.open("w", encoding="utf-8", newline="") as fh:
-                    fh.write("timestamp,equity,source\n")
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                return f"{SALDO_SERIES_CSV_FILE} sin contenido; cabecera restaurada en {path}"
-            head = [c.strip().lower() for c in lines[0].split(",")]
-            valid_header = len(head) >= 2 and head[0] in ("timestamp", "ts_utc") and head[1] in ("equity", "saldo_real")
-            if valid_header:
-                return None
-            rescued: List[Tuple[str, float, str]] = []
-            for raw in lines:
-                row = [c.strip() for c in raw.split(",")]
-                if len(row) < 2:
-                    continue
-                if row[0].lower() in ("timestamp", "ts_utc"):
-                    continue
-                ts_iso = self._ts_utc_iso(row[0])
-                eq = self._normalize_equity_value(row[1])
-                if ts_iso is None or eq is None:
-                    continue
-                src = row[2] if len(row) >= 3 and row[2] else "SERIES_RESCUE"
-                rescued.append((ts_iso, eq, src))
-            tmp = path.with_suffix(path.suffix + ".repair.tmp")
-            with tmp.open("w", encoding="utf-8", newline="") as fh:
-                fh.write("timestamp,equity,source\n")
-                for ts_iso, eq, src in rescued:
-                    fh.write(f"{ts_iso},{eq:.8f},{src}\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
-            try:
-                st = path.stat()
-                self._series_repair_sig[key] = (int(st.st_mtime_ns), int(st.st_size))
-            except Exception:
-                self._series_repair_sig[key] = (None, None)
-            if rescued:
-                return f"{SALDO_SERIES_CSV_FILE} reparado de forma conservadora (rescatadas {len(rescued)} filas)"
-            return f"{SALDO_SERIES_CSV_FILE} recreado limpio tras corrupción de cabecera/contenido"
-        except Exception as e:
-            return f"No se pudo reparar {SALDO_SERIES_CSV_FILE} en {path}: {e}"
-        finally:
-            try:
-                st = path.stat()
-                self._series_repair_sig[key] = (int(st.st_mtime_ns), int(st.st_size))
-            except Exception:
-                self._series_repair_sig[key] = (None, None)
-
-    def _append_series_sample_if_new(self, path: Path, ts, equity, source: str) -> Optional[str]:
-        ts_iso = self._ts_utc_iso(ts)
-        eq = self._normalize_equity_value(equity)
-        if ts_iso is None or eq is None:
-            return None
-        src = str(source or "MONITOR_BACKFILL").strip() or "MONITOR_BACKFILL"
-        fp = (ts_iso, f"{eq:.8f}")
-        if self._series_last_fingerprint == fp:
-            return None
-        last = self._read_last_series_row(path)
-        if last is not None:
-            last_ts, last_eq, _ = last
-            if last_ts == ts_iso or (last_ts == ts_iso and abs(last_eq - eq) < 1e-9) or (abs(last_eq - eq) < 1e-9 and self._series_last_fingerprint == fp):
-                self._series_last_fingerprint = fp
-                return None
-        lock_path = path.with_suffix(path.suffix + ".monitor.lock")
-        wrote = False
-        for _ in range(3):
-            lock_fd = None
-            try:
-                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-                with os.fdopen(lock_fd, "w", encoding="utf-8") as lfh:
-                    lfh.write(str(os.getpid()))
-                lock_fd = None
-                if not path.exists():
-                    self._ensure_series_csv_exists(path)
-                with path.open("a", encoding="utf-8", newline="") as fh:
-                    fh.write(f"{ts_iso},{eq:.8f},{src}\n")
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                wrote = True
-                break
-            except FileExistsError:
-                time.sleep(0.06)
-            except Exception:
-                time.sleep(0.04)
-            finally:
-                if lock_fd is not None:
-                    try:
-                        os.close(lock_fd)
-                    except Exception:
-                        pass
-                try:
-                    if lock_path.exists():
-                        lock_path.unlink()
-                except Exception:
-                    pass
-        if not wrote:
-            now_mono = time.monotonic()
-            if (now_mono - self._series_lock_warn_ts) > 20.0:
-                self._series_lock_warn_ts = now_mono
-                return f"No se pudo anexar muestra a {SALDO_SERIES_CSV_FILE} (lock temporal)"
-            return None
-        self._series_last_fingerprint = fp
-        return None
-
-    def _extract_best_real_sample_for_persist(
-        self,
-        hist: pd.DataFrame,
-        master: Optional[Tuple[float, datetime]],
+        series_csv: pd.DataFrame,
         saldo_actual: Optional[float],
         last_update,
         source: str,
@@ -1020,233 +573,15 @@ class DataEngine:
             eq = self._normalize_equity_value(row.get("equity"))
             if ts_iso and eq is not None:
                 return (ts_iso, eq, "MAESTRO_HISTORY")
+        if not series_csv.empty:
+            row = series_csv.iloc[-1]
+            ts_iso = self._ts_utc_iso(row.get("timestamp"))
+            eq = self._normalize_equity_value(row.get("equity"))
+            if ts_iso and eq is not None:
+                return (ts_iso, eq, "SERIE_CSV_DEGRADED")
         ts_iso = self._ts_utc_iso(last_update)
         eq = self._normalize_equity_value(saldo_actual)
-        if ts_iso and eq is not None and source in ("MAESTRO", "SERIE_CSV_DEGRADED", "MAESTRO_HISTORY_DEGRADED"):
-            return (ts_iso, eq, source)
-        if not observed.empty:
-            row = observed.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "OBSERVADO_FALLBACK")
-        if estimated is not None and not estimated.empty:
-            row = estimated.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "ESTIMADO_EMERGENCIA")
-        return None
-
-    @staticmethod
-    def _ts_utc_iso(ts_obj) -> Optional[str]:
-        try:
-            ts = pd.to_datetime(ts_obj, errors="coerce", utc=True)
-            if pd.isna(ts):
-                return None
-            return ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        except Exception:
-            return None
-
-    @staticmethod
-    def _normalize_equity_value(value) -> Optional[float]:
-        try:
-            v = float(value)
-            if not np.isfinite(v):
-                return None
-            return float(v)
-        except Exception:
-            return None
-
-    def _ensure_series_csv_exists(self, path: Path) -> Optional[str]:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if not path.exists():
-                with path.open("w", encoding="utf-8", newline="") as fh:
-                    fh.write("timestamp,equity,source\n")
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                return f"{SALDO_SERIES_CSV_FILE} creado automáticamente en {path}"
-        except Exception as e:
-            return f"No se pudo crear {SALDO_SERIES_CSV_FILE} en {path}: {e}"
-        return None
-
-    def _read_last_series_row(self, path: Path) -> Optional[Tuple[str, float, str]]:
-        try:
-            if not path.exists() or path.stat().st_size <= 0:
-                return None
-            lines = self._read_tail_lines(path, 32 * 1024)
-            for raw in reversed(lines):
-                row = [c.strip() for c in raw.split(",")]
-                if len(row) < 2:
-                    continue
-                if row[0].lower() in ("timestamp", "ts_utc"):
-                    continue
-                ts_iso = self._ts_utc_iso(row[0])
-                eq = self._normalize_equity_value(row[1])
-                if ts_iso is None or eq is None:
-                    continue
-                src = row[2] if len(row) >= 3 and row[2] else "MONITOR_BACKFILL"
-                return (ts_iso, eq, str(src))
-        except Exception:
-            return None
-        return None
-
-    def _repair_series_csv_if_needed(self, path: Path) -> Optional[str]:
-        try:
-            st = path.stat()
-            sig = (int(st.st_mtime_ns), int(st.st_size))
-        except Exception:
-            sig = (None, None)
-        key = str(path)
-        if self._series_repair_sig.get(key) == sig:
-            return None
-        created_msg = self._ensure_series_csv_exists(path)
-        if created_msg:
-            try:
-                st = path.stat()
-                self._series_repair_sig[key] = (int(st.st_mtime_ns), int(st.st_size))
-            except Exception:
-                self._series_repair_sig[key] = (None, None)
-            return created_msg
-        try:
-            if path.stat().st_size == 0:
-                with path.open("w", encoding="utf-8", newline="") as fh:
-                    fh.write("timestamp,equity,source\n")
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                return f"{SALDO_SERIES_CSV_FILE} estaba vacío; cabecera restaurada en {path}"
-            with path.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
-                lines = fh.read().splitlines()
-            if not lines:
-                with path.open("w", encoding="utf-8", newline="") as fh:
-                    fh.write("timestamp,equity,source\n")
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                return f"{SALDO_SERIES_CSV_FILE} sin contenido; cabecera restaurada en {path}"
-            head = [c.strip().lower() for c in lines[0].split(",")]
-            valid_header = len(head) >= 2 and head[0] in ("timestamp", "ts_utc") and head[1] in ("equity", "saldo_real")
-            if valid_header:
-                return None
-            rescued: List[Tuple[str, float, str]] = []
-            for raw in lines:
-                row = [c.strip() for c in raw.split(",")]
-                if len(row) < 2:
-                    continue
-                if row[0].lower() in ("timestamp", "ts_utc"):
-                    continue
-                ts_iso = self._ts_utc_iso(row[0])
-                eq = self._normalize_equity_value(row[1])
-                if ts_iso is None or eq is None:
-                    continue
-                src = row[2] if len(row) >= 3 and row[2] else "SERIES_RESCUE"
-                rescued.append((ts_iso, eq, src))
-            tmp = path.with_suffix(path.suffix + ".repair.tmp")
-            with tmp.open("w", encoding="utf-8", newline="") as fh:
-                fh.write("timestamp,equity,source\n")
-                for ts_iso, eq, src in rescued:
-                    fh.write(f"{ts_iso},{eq:.8f},{src}\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
-            try:
-                st = path.stat()
-                self._series_repair_sig[key] = (int(st.st_mtime_ns), int(st.st_size))
-            except Exception:
-                self._series_repair_sig[key] = (None, None)
-            if rescued:
-                return f"{SALDO_SERIES_CSV_FILE} reparado de forma conservadora (rescatadas {len(rescued)} filas)"
-            return f"{SALDO_SERIES_CSV_FILE} recreado limpio tras corrupción de cabecera/contenido"
-        except Exception as e:
-            return f"No se pudo reparar {SALDO_SERIES_CSV_FILE} en {path}: {e}"
-        finally:
-            try:
-                st = path.stat()
-                self._series_repair_sig[key] = (int(st.st_mtime_ns), int(st.st_size))
-            except Exception:
-                self._series_repair_sig[key] = (None, None)
-
-    def _append_series_sample_if_new(self, path: Path, ts, equity, source: str) -> Optional[str]:
-        ts_iso = self._ts_utc_iso(ts)
-        eq = self._normalize_equity_value(equity)
-        if ts_iso is None or eq is None:
-            return None
-        src = str(source or "MONITOR_BACKFILL").strip() or "MONITOR_BACKFILL"
-        fp = (ts_iso, f"{eq:.8f}")
-        if self._series_last_fingerprint == fp:
-            return None
-        last = self._read_last_series_row(path)
-        if last is not None:
-            last_ts, last_eq, _ = last
-            if last_ts == ts_iso or (last_ts == ts_iso and abs(last_eq - eq) < 1e-9) or (abs(last_eq - eq) < 1e-9 and self._series_last_fingerprint == fp):
-                self._series_last_fingerprint = fp
-                return None
-        lock_path = path.with_suffix(path.suffix + ".monitor.lock")
-        wrote = False
-        for _ in range(3):
-            lock_fd = None
-            try:
-                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-                with os.fdopen(lock_fd, "w", encoding="utf-8") as lfh:
-                    lfh.write(str(os.getpid()))
-                lock_fd = None
-                if not path.exists():
-                    self._ensure_series_csv_exists(path)
-                with path.open("a", encoding="utf-8", newline="") as fh:
-                    fh.write(f"{ts_iso},{eq:.8f},{src}\n")
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                wrote = True
-                break
-            except FileExistsError:
-                time.sleep(0.06)
-            except Exception:
-                time.sleep(0.04)
-            finally:
-                if lock_fd is not None:
-                    try:
-                        os.close(lock_fd)
-                    except Exception:
-                        pass
-                try:
-                    if lock_path.exists():
-                        lock_path.unlink()
-                except Exception:
-                    pass
-        if not wrote:
-            now_mono = time.monotonic()
-            if (now_mono - self._series_lock_warn_ts) > 20.0:
-                self._series_lock_warn_ts = now_mono
-                return f"No se pudo anexar muestra a {SALDO_SERIES_CSV_FILE} (lock temporal)"
-            return None
-        self._series_last_fingerprint = fp
-        return None
-
-    def _extract_best_real_sample_for_persist(
-        self,
-        hist: pd.DataFrame,
-        master: Optional[Tuple[float, datetime]],
-        saldo_actual: Optional[float],
-        last_update,
-        source: str,
-        observed: pd.DataFrame,
-        estimated: Optional[pd.DataFrame] = None,
-    ) -> Optional[Tuple[str, float, str]]:
-        if master is not None:
-            mv, mts = master
-            ts_iso = self._ts_utc_iso(mts)
-            eq = self._normalize_equity_value(mv)
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "MAESTRO_LIVE")
-        if not hist.empty:
-            row = hist.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "MAESTRO_HISTORY")
-        ts_iso = self._ts_utc_iso(last_update)
-        eq = self._normalize_equity_value(saldo_actual)
-        if ts_iso and eq is not None and source in ("MAESTRO", "SERIE_CSV_DEGRADED", "MAESTRO_HISTORY_DEGRADED"):
+        if ts_iso and eq is not None and source in ("MAESTRO_LIVE", "MAESTRO_HISTORY", "SERIE_CSV_DEGRADED"):
             return (ts_iso, eq, source)
         if not observed.empty:
             row = observed.iloc[-1]
@@ -1297,6 +632,7 @@ class DataEngine:
             return cached
 
         found_any = False
+        best_live: Optional[Tuple[float, datetime, Path, int]] = None
         warnings: List[str] = []
         for p in paths:
             if not p.exists():
@@ -1465,8 +801,17 @@ class DataEngine:
                 if len(row) >= 8:
                     ts_utc, _ts_lima, epoch, saldo_real, equity = row[0], row[1], row[2], row[3], row[4]
                 elif len(row) == 3:
-                    ts_utc, equity, _source = row[0], row[1], row[2]
-                    saldo_real = equity
+                    ts_utc, c1, c2 = row[0], row[1], row[2]
+                    epoch_probe = pd.to_numeric(c1, errors="coerce")
+                    if np.isfinite(epoch_probe) and float(epoch_probe) >= 1_000_000_000:
+                        # formato torcido: timestamp,epoch,equity
+                        epoch = c1
+                        equity = c2
+                        saldo_real = c2
+                    else:
+                        # formato sano: timestamp,equity,source
+                        equity = c1
+                        saldo_real = c1
                 elif len(row) >= 4:
                     ts_utc, epoch, saldo_real = row[0], row[1], row[2]
                     equity = saldo_real
@@ -1641,6 +986,15 @@ class DataEngine:
     def build_snapshot(self, view: str) -> Snapshot:
         now = _now()
         warnings: List[str] = []
+        series_target_path = Path(SALDO_SERIES_CSV_PATH).expanduser()
+        if view == "REAL":
+            ensure_msg = self._ensure_series_csv_exists(series_target_path)
+            if ensure_msg and ensure_msg != self._series_ensure_notice_once:
+                warnings.append(ensure_msg)
+                self._series_ensure_notice_once = ensure_msg
+            repair_msg = self._repair_series_csv_if_needed(series_target_path)
+            if repair_msg:
+                warnings.append(repair_msg)
 
         master, master_msg, live_path_used = self._read_master_live() if view == "REAL" else (None, None, None)
         hist, hist_msg, hist_path_used, hist_growth_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None, None)
@@ -1656,12 +1010,11 @@ class DataEngine:
 
         if view == "REAL":
             warnings.append(f"Monitor {MONITOR_VERSION} · id={MONITOR_BUILD_ID}")
-            warnings.append(f"Ruta snapshot real: {live_path_used if live_path_used else SALDO_LIVE_SHARED_PATH}")
-            warnings.append(f"Ruta histórico real: {hist_path_used if hist_path_used else SALDO_LIVE_HISTORY_SHARED_PATH}")
+            warnings.append(f"Ruta live usada: {live_path_used if live_path_used else SALDO_LIVE_SHARED_PATH}")
+            warnings.append(f"Ruta history usada: {hist_path_used if hist_path_used else SALDO_LIVE_HISTORY_SHARED_PATH}")
             if series_msg:
                 warnings.append(series_msg)
-            if series_path_used:
-                warnings.append(f"Ruta serie CSV real: {series_path_used}")
+            warnings.append(f"Ruta series usada: {series_path_used if series_path_used else series_target_path}")
             warnings.append(
                 f"Estado snapshot: {'OK' if live_path_used and Path(live_path_used).exists() else 'NO ENCONTRADO'} | "
                 f"Estado histórico: {'OK' if hist_path_used and Path(hist_path_used).exists() else 'NO ENCONTRADO'}"
@@ -1679,13 +1032,13 @@ class DataEngine:
                 mv_live, mts_live = master
                 live_age_sec = max(0.0, (_now().astimezone(timezone.utc) - mts_live.astimezone(timezone.utc)).total_seconds())
                 if live_age_sec > float(MASTER_LIVE_STALE_SECONDS):
-                    warnings.append(f"DEGRADED: live MAESTRO stale ({live_age_sec:.0f}s > {MASTER_LIVE_STALE_SECONDS}s)")
+                    warnings.append(f"Live stale: {live_age_sec:.0f}s > {MASTER_LIVE_STALE_SECONDS}s")
                 if not hist.empty:
                     hts = pd.to_datetime(hist["timestamp"].iloc[-1], errors="coerce", utc=True)
                     if not pd.isna(hts):
                         newer_by = (hts.to_pydatetime() - mts_live.astimezone(timezone.utc)).total_seconds()
                         if newer_by > 2.0:
-                            warnings.append(f"Incoherencia: histórico más nuevo que live por {newer_by:.1f}s")
+                            warnings.append(f"Histórico más nuevo que live por {newer_by:.1f}s")
                     hdelta = abs(float(hist["equity"].iloc[-1]) - float(mv_live))
                     if hdelta >= float(MASTER_DELTA_WARN_USD):
                         warnings.append(f"Desfase live↔hist: {hdelta:.2f} USD")
@@ -1694,7 +1047,7 @@ class DataEngine:
                     if not pd.isna(sts):
                         newer_by = (sts.to_pydatetime() - mts_live.astimezone(timezone.utc)).total_seconds()
                         if newer_by > 2.0:
-                            warnings.append(f"Incoherencia: series CSV más nueva que live por {newer_by:.1f}s")
+                            warnings.append(f"Series CSV más nueva que live por {newer_by:.1f}s")
                     sdelta = abs(float(series_csv["equity"].iloc[-1]) - float(mv_live))
                     if sdelta >= float(MASTER_DELTA_WARN_USD):
                         warnings.append(f"Desfase live↔series: {sdelta:.2f} USD")
@@ -1704,34 +1057,51 @@ class DataEngine:
         last_update: Optional[datetime] = None
         real_series = pd.DataFrame(columns=["timestamp", "equity"])
 
-        if master is not None:
-            mv, mts = master
-            source = "MAESTRO"
-            saldo_actual = mv
-            last_update = mts
-            if view == "REAL" and not hist.empty:
-                real_series = hist.copy()
-                real_series = pd.concat([real_series, pd.DataFrame([{"timestamp": mts, "equity": mv}])], ignore_index=True)
-                real_series = real_series.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
-            elif view == "REAL" and not series_csv.empty:
-                real_series = pd.concat([series_csv.copy(), pd.DataFrame([{"timestamp": mts, "equity": mv}])], ignore_index=True)
-                real_series = real_series.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+        if view == "REAL":
+            frames = []
+            if not hist.empty:
+                frames.append(hist[["timestamp", "equity"]].copy())
+            if not series_csv.empty:
+                frames.append(series_csv[["timestamp", "equity"]].copy())
+            if master is not None:
+                mv, mts = master
+                frames.append(pd.DataFrame([{"timestamp": mts, "equity": mv}]))
+            if frames:
+                real_series = pd.concat(frames, ignore_index=True)
+                real_series["timestamp"] = pd.to_datetime(real_series["timestamp"], errors="coerce", utc=True)
+                real_series["equity"] = pd.to_numeric(real_series["equity"], errors="coerce")
+                real_series = real_series.dropna(subset=["timestamp", "equity"])
+                real_series = real_series.sort_values("timestamp").drop_duplicates(subset=["timestamp", "equity"], keep="last")
+                real_series = real_series.reset_index(drop=True)
+
+            live_fresh = False
+            if master is not None:
+                _mv, mts_live = master
+                live_age_sec = max(0.0, (_now().astimezone(timezone.utc) - mts_live.astimezone(timezone.utc)).total_seconds())
+                live_fresh = live_age_sec <= float(MASTER_LIVE_STALE_SECONDS)
+
+            if master is not None and live_fresh:
+                mv, mts = master
+                source = "MAESTRO_LIVE"
+                saldo_actual = mv
+                last_update = mts
             else:
-                real_series = pd.DataFrame([{"timestamp": mts, "equity": mv}])
-        elif view == "REAL" and not hist.empty:
-            source = "MAESTRO_HISTORY_DEGRADED"
-            saldo_actual = float(hist["equity"].iloc[-1])
-            last_update = hist["timestamp"].iloc[-1]
-            real_series = hist.copy()
-            warnings.append("DEGRADED: sin live del MAESTRO, usando histórico")
-        elif view == "REAL" and not series_csv.empty:
-            source = "SERIE_CSV_DEGRADED"
-            saldo_actual = float(series_csv["equity"].iloc[-1])
-            last_update = series_csv["timestamp"].iloc[-1]
-            real_series = series_csv
-            warnings.append("DEGRADED: sin live/hist del MAESTRO, usando series CSV")
+                latest_hist = None if hist.empty else hist.iloc[-1]
+                latest_series = None if series_csv.empty else series_csv.iloc[-1]
+                hts = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True) if latest_hist is not None else pd.NaT
+                sts = pd.to_datetime(latest_series["timestamp"], errors="coerce", utc=True) if latest_series is not None else pd.NaT
+                if latest_hist is not None and (pd.isna(sts) or (not pd.isna(hts) and hts >= sts)):
+                    source = "MAESTRO_HISTORY"
+                    saldo_actual = float(latest_hist["equity"])
+                    last_update = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True).to_pydatetime()
+                elif latest_series is not None:
+                    source = "SERIE_CSV_DEGRADED"
+                    saldo_actual = float(latest_series["equity"])
+                    last_update = pd.to_datetime(latest_series["timestamp"], errors="coerce", utc=True).to_pydatetime()
+                if master is not None and not live_fresh and source != "SIN DATOS REALES":
+                    warnings.append("Live stale descartado como saldo principal")
         elif not observed.empty:
-            source = "OBSERVADO_DEGRADED"
+            source = "OBSERVADO_FALLBACK"
             saldo_actual = float(observed["equity"].iloc[-1])
             last_update = observed["timestamp"].iloc[-1]
             real_series = observed
@@ -1739,13 +1109,26 @@ class DataEngine:
         else:
             live_real = self._parse_observed("REAL") if view == "REAL" else self._parse_observed(view)
             if not live_real.empty:
-                source = "OBSERVADO_DEGRADED"
+                source = "OBSERVADO_FALLBACK"
                 saldo_actual = float(live_real["equity"].iloc[-1])
                 last_update = live_real["timestamp"].iloc[-1]
                 real_series = pd.DataFrame([live_real.iloc[-1]])
                 warnings.append("DEGRADED: observado de emergencia")
             else:
                 warnings.append("saldo real del maestro no disponible")
+        if source == "SIN DATOS REALES" and not observed.empty:
+            source = "OBSERVADO_FALLBACK"
+            saldo_actual = float(observed["equity"].iloc[-1])
+            last_update = observed["timestamp"].iloc[-1]
+            real_series = observed
+        if source == "SIN DATOS REALES" and not estimated.empty:
+            source = "ESTIMADO_EMERGENCIA"
+            saldo_actual = float(estimated["equity"].iloc[-1])
+            last_update = estimated["timestamp"].iloc[-1]
+            real_series = estimated[["timestamp", "equity"]].copy()
+            warnings.append("Usando estimado en emergencia")
+        if view == "REAL":
+            warnings.append(f"Fuente real efectiva usada: {source}")
 
         real_points = int(len(real_series))
         if real_points == 0:
@@ -1757,13 +1140,10 @@ class DataEngine:
         if source == "SIN DATOS REALES" and not estimated.empty:
             warnings.append("Estimado CSV disponible solo como auxiliar")
         if view == "REAL":
-            ensure_msg = self._ensure_series_csv_exists(Path(SALDO_SERIES_CSV_PATH).expanduser())
-            if ensure_msg and ensure_msg != self._series_ensure_notice_once:
-                warnings.append(ensure_msg)
-                self._series_ensure_notice_once = ensure_msg
             sample = self._extract_best_real_sample_for_persist(
                 hist=hist,
                 master=master,
+                series_csv=series_csv,
                 saldo_actual=saldo_actual,
                 last_update=last_update,
                 source=source,
@@ -1772,10 +1152,10 @@ class DataEngine:
             )
             if sample is not None:
                 ts_iso, eq, src = sample
-                repair_msg = self._repair_series_csv_if_needed(Path(SALDO_SERIES_CSV_PATH).expanduser())
+                repair_msg = self._repair_series_csv_if_needed(series_target_path)
                 if repair_msg:
                     warnings.append(repair_msg)
-                append_msg = self._append_series_sample_if_new(Path(SALDO_SERIES_CSV_PATH).expanduser(), ts_iso, eq, src)
+                append_msg = self._append_series_sample_if_new(series_target_path, ts_iso, eq, src)
                 if append_msg:
                     warnings.append(append_msg)
 
