@@ -200,6 +200,7 @@ estado_bot = {
     "barra_activa": False,
     "score_senal": None,
     "ciclo_actual": 1,
+    "real_first_cycle_reset_pending": False,
     "sync_round_id": 1,
     "sync_wait": False,
     "pending_contract_resolution": False,
@@ -225,7 +226,7 @@ last_real_contract_id = None
 real_buy_commit_until = 0.0
 
 # Higiene de riesgo: al saltar a REAL, arrancar en C1 (aunque el maestro sugiera C2+)
-RESET_CICLO_EN_ENTRADA_REAL = False
+RESET_CICLO_EN_ENTRADA_REAL = True
 
 def commit_guard_active() -> bool:
     return (last_real_contract_id is not None) and (time.time() < real_buy_commit_until)
@@ -1601,17 +1602,14 @@ async def check_token_and_reconnect(ws, current_token):
                         pass
                     primer_ingreso_real = True
                     real_activado_en_bot = time.time()  # BLOQUE 5 and 2: Set activation time
-                    # Lee la orden del maestro y deja seteado el ciclo para la siguiente vuelta
+                    # Lee la orden del maestro para flags auxiliares, pero primer ingreso REAL manda C1
                     cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
-                    ciclo_objetivo = cyc if cyc else estado_bot.get("ciclo_forzado")
-                    if ciclo_objetivo:
-                        estado_bot["ciclo_forzado"] = int(max(1, min(int(ciclo_objetivo), MAX_CICLOS)))
-                        if cyc:
-                            print(Fore.YELLOW + f"Orden maestro detectada: arrancaré en ciclo #{estado_bot['ciclo_forzado']}.")
-                    else:
-                        estado_bot["ciclo_forzado"] = 1
-                        if RESET_CICLO_EN_ENTRADA_REAL:
-                            print(Fore.YELLOW + "Entrada REAL detectada: reinicio de martingala a C1 por seguridad.")
+                    estado_bot["real_first_cycle_reset_pending"] = True
+                    estado_bot["ciclo_forzado"] = 1
+                    estado_bot["ciclo_actual"] = 1
+                    if cyc and int(cyc) > 1:
+                        print(Fore.YELLOW + f"Orden maestro C{int(cyc)} ignorada por primer ingreso REAL")
+                    print(Fore.YELLOW + "Entrada REAL detectada -> C1 forzado")
 
                     # Silenciar ruido guiado por maestro (BLOQUE 3)
                     if quiet or (str(src).upper() == "MANUAL"):
@@ -1624,11 +1622,14 @@ async def check_token_and_reconnect(ws, current_token):
                         if _print_once("rea-REAL", ttl=180):
                             print(Fore.YELLOW + "Reafirmación de REAL (sin reset de martingala)")
                     cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
-                    ciclo_objetivo = cyc if cyc else estado_bot.get("ciclo_forzado")
-                    if ciclo_objetivo:
-                        estado_bot["ciclo_forzado"] = int(max(1, min(int(ciclo_objetivo), MAX_CICLOS)))
-                    elif RESET_CICLO_EN_ENTRADA_REAL:
+                    if estado_bot.get("real_first_cycle_reset_pending"):
                         estado_bot["ciclo_forzado"] = 1
+                    else:
+                        ciclo_objetivo = cyc if cyc else estado_bot.get("ciclo_forzado")
+                        if ciclo_objetivo:
+                            estado_bot["ciclo_forzado"] = int(max(1, min(int(ciclo_objetivo), MAX_CICLOS)))
+                        elif RESET_CICLO_EN_ENTRADA_REAL:
+                            estado_bot["ciclo_forzado"] = 1
 
                     if quiet or (str(src).upper() == "MANUAL"):
                         asyncio.create_task(_silencio_temporal(90, fuente=src))
@@ -1638,6 +1639,7 @@ async def check_token_and_reconnect(ws, current_token):
             else:
                 # Saliste de REAL: prepara el sonido para la próxima ventana
                 primer_ingreso_real = False
+                estado_bot["real_first_cycle_reset_pending"] = False
                 reinicio_forzado.set()
             ultimo_token = token_desde_archivo  # mantén vigilante y lazo alineados
             return ws, token_desde_archivo
@@ -1662,6 +1664,10 @@ async def check_token_and_reconnect(ws, current_token):
                     pass
 
                 primer_ingreso_real = True
+                estado_bot["real_first_cycle_reset_pending"] = True
+                estado_bot["ciclo_forzado"] = 1
+                estado_bot["ciclo_actual"] = 1
+                print(Fore.YELLOW + "Entrada REAL detectada -> C1 forzado")
                 try:
                     real_activado_en_bot = time.time()
                 except Exception:
@@ -2403,7 +2409,14 @@ async def ejecutar_panel():
             sep_ciclo()
             ciclo_orden, _ts, _quiet, _src = leer_orden_real(NOMBRE_BOT)
             ciclo_forzado = estado_bot.get("ciclo_forzado")
-            ciclo = ciclo_orden or ciclo_forzado or 1
+            if modo_real and estado_bot.get("real_first_cycle_reset_pending"):
+                ciclo = 1
+                if ciclo_orden and int(ciclo_orden) > 1:
+                    print(Fore.YELLOW + f"Orden maestro C{int(ciclo_orden)} ignorada por primer ingreso REAL")
+                print(Fore.YELLOW + "Primer ciclo REAL confirmado en C1")
+                estado_bot["real_first_cycle_reset_pending"] = False
+            else:
+                ciclo = ciclo_orden or ciclo_forzado or 1
 
             estado_bot["ciclo_forzado"] = None
             estado_bot["reinicios_consecutivos"] = 0
