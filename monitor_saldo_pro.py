@@ -367,13 +367,6 @@ class DataEngine:
         return sorted(uniq, key=_rank, reverse=True)
 
     @staticmethod
-    def _path_mtime_ns(path: Path) -> int:
-        try:
-            return int(path.stat().st_mtime_ns)
-        except Exception:
-            return -1
-
-    @staticmethod
     def _ts_utc_iso(ts_obj) -> Optional[str]:
         try:
             ts = pd.to_datetime(ts_obj, errors="coerce", utc=True)
@@ -1026,10 +1019,10 @@ class DataEngine:
             ts_iso = self._ts_utc_iso(row.get("timestamp"))
             eq = self._normalize_equity_value(row.get("equity"))
             if ts_iso and eq is not None:
-                return (ts_iso, eq, "MAESTRO_HIST")
+                return (ts_iso, eq, "MAESTRO_HISTORY")
         ts_iso = self._ts_utc_iso(last_update)
         eq = self._normalize_equity_value(saldo_actual)
-        if ts_iso and eq is not None and source in ("MAESTRO_LIVE", "MAESTRO_HIST", "SERIE_CSV"):
+        if ts_iso and eq is not None and source in ("MAESTRO", "SERIE_CSV_DEGRADED", "MAESTRO_HISTORY_DEGRADED"):
             return (ts_iso, eq, source)
         if not observed.empty:
             row = observed.iloc[-1]
@@ -1250,10 +1243,10 @@ class DataEngine:
             ts_iso = self._ts_utc_iso(row.get("timestamp"))
             eq = self._normalize_equity_value(row.get("equity"))
             if ts_iso and eq is not None:
-                return (ts_iso, eq, "MAESTRO_HIST")
+                return (ts_iso, eq, "MAESTRO_HISTORY")
         ts_iso = self._ts_utc_iso(last_update)
         eq = self._normalize_equity_value(saldo_actual)
-        if ts_iso and eq is not None and source in ("MAESTRO_LIVE", "MAESTRO_HIST", "SERIE_CSV"):
+        if ts_iso and eq is not None and source in ("MAESTRO", "SERIE_CSV_DEGRADED", "MAESTRO_HISTORY_DEGRADED"):
             return (ts_iso, eq, source)
         if not observed.empty:
             row = observed.iloc[-1]
@@ -1305,7 +1298,6 @@ class DataEngine:
 
         found_any = False
         warnings: List[str] = []
-        best_live: Optional[Tuple[float, datetime, Path, int]] = None
         for p in paths:
             if not p.exists():
                 continue
@@ -1711,73 +1703,49 @@ class DataEngine:
         saldo_actual: Optional[float] = None
         last_update: Optional[datetime] = None
         real_series = pd.DataFrame(columns=["timestamp", "equity"])
-        live_ts = master[1].astimezone(timezone.utc) if master is not None else None
-        hist_last_ts = pd.to_datetime(hist["timestamp"].iloc[-1], errors="coerce", utc=True) if not hist.empty else pd.NaT
-        series_last_ts = pd.to_datetime(series_csv["timestamp"].iloc[-1], errors="coerce", utc=True) if not series_csv.empty else pd.NaT
-        fresh_live_ok = False
-        if master is not None and live_ts is not None:
-            live_age_sec = max(0.0, (_now().astimezone(timezone.utc) - live_ts).total_seconds())
-            fresh_live_ok = live_age_sec <= float(MASTER_LIVE_STALE_SECONDS)
-        live_superseded = False
-        refresh_guard_s = max(2.0, float(REFRESH_SEGUNDOS) * 2.0)
-        if master is not None and live_ts is not None:
-            if (not pd.isna(hist_last_ts)) and (hist_last_ts.to_pydatetime() - live_ts).total_seconds() > refresh_guard_s:
-                live_superseded = True
-            if (not pd.isna(series_last_ts)) and (series_last_ts.to_pydatetime() - live_ts).total_seconds() > refresh_guard_s:
-                live_superseded = True
-        effective_live_ok = bool(fresh_live_ok and not live_superseded)
-        if master is not None and not effective_live_ok:
-            warnings.append("live descartado como saldo principal (stale o superado por histórico/series)")
 
-        if view == "REAL":
-            combined_parts: List[pd.DataFrame] = []
-            if not hist.empty:
-                combined_parts.append(hist[["timestamp", "equity"]].copy())
-            if not series_csv.empty:
-                combined_parts.append(series_csv[["timestamp", "equity"]].copy())
-            if master is not None:
-                mv, mts = master
-                combined_parts.append(pd.DataFrame([{"timestamp": mts, "equity": mv}]))
-            if combined_parts:
-                real_series = pd.concat(combined_parts, ignore_index=True)
-                real_series = _sanitize_series_for_plot(real_series)
-                real_series = real_series.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
-
-        if effective_live_ok and master is not None:
+        if master is not None:
             mv, mts = master
-            source = "MAESTRO_LIVE"
+            source = "MAESTRO"
             saldo_actual = mv
             last_update = mts
-        elif view == "REAL" and (not hist.empty or not series_csv.empty):
-            use_hist = False
-            if not hist.empty and series_csv.empty:
-                use_hist = True
-            elif not hist.empty and not series_csv.empty:
-                use_hist = pd.to_datetime(hist["timestamp"].iloc[-1], errors="coerce", utc=True) >= pd.to_datetime(series_csv["timestamp"].iloc[-1], errors="coerce", utc=True)
-            if use_hist:
-                source = "MAESTRO_HIST"
-                saldo_actual = float(hist["equity"].iloc[-1])
-                last_update = hist["timestamp"].iloc[-1]
+            if view == "REAL" and not hist.empty:
+                real_series = hist.copy()
+                real_series = pd.concat([real_series, pd.DataFrame([{"timestamp": mts, "equity": mv}])], ignore_index=True)
+                real_series = real_series.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+            elif view == "REAL" and not series_csv.empty:
+                real_series = pd.concat([series_csv.copy(), pd.DataFrame([{"timestamp": mts, "equity": mv}])], ignore_index=True)
+                real_series = real_series.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
             else:
-                source = "SERIE_CSV"
-                saldo_actual = float(series_csv["equity"].iloc[-1])
-                last_update = series_csv["timestamp"].iloc[-1]
-            warnings.append(f"DEGRADED: saldo principal desde {source}")
+                real_series = pd.DataFrame([{"timestamp": mts, "equity": mv}])
+        elif view == "REAL" and not hist.empty:
+            source = "MAESTRO_HISTORY_DEGRADED"
+            saldo_actual = float(hist["equity"].iloc[-1])
+            last_update = hist["timestamp"].iloc[-1]
+            real_series = hist.copy()
+            warnings.append("DEGRADED: sin live del MAESTRO, usando histórico")
+        elif view == "REAL" and not series_csv.empty:
+            source = "SERIE_CSV_DEGRADED"
+            saldo_actual = float(series_csv["equity"].iloc[-1])
+            last_update = series_csv["timestamp"].iloc[-1]
+            real_series = series_csv
+            warnings.append("DEGRADED: sin live/hist del MAESTRO, usando series CSV")
         elif not observed.empty:
-            source = "OBSERVADO_FALLBACK"
+            source = "OBSERVADO_DEGRADED"
             saldo_actual = float(observed["equity"].iloc[-1])
             last_update = observed["timestamp"].iloc[-1]
             real_series = observed
-            warnings.append("DEGRADED: usando observed fallback")
-        elif estimated is not None and not estimated.empty:
-            source = "ESTIMADO_EMERGENCIA"
-            saldo_actual = float(estimated["equity"].iloc[-1])
-            last_update = estimated["timestamp"].iloc[-1]
-            real_series = estimated
-            warnings.append("DEGRADED: usando estimado de emergencia")
+            warnings.append("DEGRADED: usando observado por falta de feed maestro")
         else:
-            warnings.append("saldo real del maestro no disponible")
-        warnings.append(f"Fuente efectiva REAL: {source}")
+            live_real = self._parse_observed("REAL") if view == "REAL" else self._parse_observed(view)
+            if not live_real.empty:
+                source = "OBSERVADO_DEGRADED"
+                saldo_actual = float(live_real["equity"].iloc[-1])
+                last_update = live_real["timestamp"].iloc[-1]
+                real_series = pd.DataFrame([live_real.iloc[-1]])
+                warnings.append("DEGRADED: observado de emergencia")
+            else:
+                warnings.append("saldo real del maestro no disponible")
 
         real_points = int(len(real_series))
         if real_points == 0:
@@ -2464,7 +2432,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             status = "OK"
             if not current_valid and self.last_good_snapshot is not None:
                 status = "STALE"
-            elif current_valid and self.view == "REAL" and snap.source in ("MAESTRO_HIST", "SERIE_CSV", "OBSERVADO_FALLBACK", "ESTIMADO_EMERGENCIA"):
+            elif current_valid and self.view == "REAL" and snap.source in ("SERIE_CSV", "SERIE_CSV_DEGRADED", "OBSERVADO", "OBSERVADO_DEGRADED", "LIVE"):
                 status = "DEGRADED"
             elif not current_valid and self.last_good_snapshot is None:
                 status = "NO DATA"
@@ -2488,13 +2456,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_source.setObjectName("BadgeWarn"); self.lbl_big.setStyleSheet("color:#ffe9b8;")
             elif status == "DEGRADED":
                 self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
-            elif effective_src == "MAESTRO_LIVE":
+            elif effective_src == "MAESTRO":
                 self.lbl_source.setObjectName("BadgeMaster"); self.lbl_big.setStyleSheet("color:#72f8b1;")
-            elif effective_src in ("MAESTRO_HIST", "SERIE_CSV", "OBSERVADO_FALLBACK"):
+            elif effective_src in ("OBSERVADO", "OBSERVADO_DEGRADED", "MAESTRO_HIST", "MAESTRO_HISTORY_DEGRADED", "SERIE_CSV", "SERIE_CSV_DEGRADED"):
                 self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
             elif effective_src == "LIVE":
                 self.lbl_source.setObjectName("BadgeLive"); self.lbl_big.setStyleSheet("color:#9ef7d8;")
-            elif effective_src in ("ESTIMADO", "ESTIMADO_EMERGENCIA", "SIN DATOS REALES"):
+            elif effective_src in ("ESTIMADO", "SIN DATOS REALES"):
                 self.lbl_source.setObjectName("BadgeBad"); self.lbl_big.setStyleSheet("color:#ffb9b9;")
             else:
                 self.lbl_source.setObjectName("BadgeNeutral"); self.lbl_big.setStyleSheet("color:#d8e7ff;")
