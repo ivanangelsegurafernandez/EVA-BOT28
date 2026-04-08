@@ -722,6 +722,7 @@ class MonitorSaldoApp:
                     self.last_valid = sample
                 wrote, reason = anexar_muestra_csv(self.db_path, sample, self.last_saved, self.lock_path)
                 if wrote:
+                    self._flush_skip_summary(force=True)
                     self.series.append(sample)
                     self.last_saved = sample
                 elif reason in {"duplicada_exacta", "sin_cambio"}:
