@@ -583,18 +583,6 @@ class DataEngine:
         eq = self._normalize_equity_value(saldo_actual)
         if ts_iso and eq is not None and source in ("MAESTRO_LIVE", "MAESTRO_HISTORY", "SERIE_CSV_DEGRADED"):
             return (ts_iso, eq, source)
-        if not observed.empty:
-            row = observed.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "OBSERVADO_FALLBACK")
-        if estimated is not None and not estimated.empty:
-            row = estimated.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "ESTIMADO_EMERGENCIA")
         return None
 
     def _cached(self, key: str, sig: Tuple):
@@ -1052,7 +1040,7 @@ class DataEngine:
                     if sdelta >= float(MASTER_DELTA_WARN_USD):
                         warnings.append(f"Desfase live↔series: {sdelta:.2f} USD")
 
-        source = "SIN DATOS REALES"
+        source = "SIN_DATOS_REALES"
         saldo_actual: Optional[float] = None
         last_update: Optional[datetime] = None
         real_series = pd.DataFrame(columns=["timestamp", "equity"])
@@ -1137,7 +1125,7 @@ class DataEngine:
         elif real_points == 1:
             warnings.append("Histórico insuficiente: solo 1 muestra real válida")
             warnings.append("No se puede trazar línea: se requieren al menos 2 puntos")
-        if source == "SIN DATOS REALES" and not estimated.empty:
+        if source == "SIN_DATOS_REALES" and not estimated.empty:
             warnings.append("Estimado CSV disponible solo como auxiliar")
         if view == "REAL":
             sample = self._extract_best_real_sample_for_persist(
@@ -1812,7 +1800,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             status = "OK"
             if not current_valid and self.last_good_snapshot is not None:
                 status = "STALE"
-            elif current_valid and self.view == "REAL" and snap.source in ("SERIE_CSV", "SERIE_CSV_DEGRADED", "OBSERVADO", "OBSERVADO_DEGRADED", "LIVE"):
+            elif current_valid and self.view == "REAL" and snap.source in ("MAESTRO_HISTORY_DEGRADED", "SERIE_CSV_DEGRADED"):
                 status = "DEGRADED"
             elif not current_valid and self.last_good_snapshot is None:
                 status = "NO DATA"
@@ -1836,13 +1824,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_source.setObjectName("BadgeWarn"); self.lbl_big.setStyleSheet("color:#ffe9b8;")
             elif status == "DEGRADED":
                 self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
-            elif effective_src == "MAESTRO":
+            elif effective_src == "MAESTRO_LIVE":
                 self.lbl_source.setObjectName("BadgeMaster"); self.lbl_big.setStyleSheet("color:#72f8b1;")
-            elif effective_src in ("OBSERVADO", "OBSERVADO_DEGRADED", "MAESTRO_HIST", "MAESTRO_HISTORY_DEGRADED", "SERIE_CSV", "SERIE_CSV_DEGRADED"):
+            elif effective_src in ("MAESTRO_HISTORY_DEGRADED", "SERIE_CSV_DEGRADED"):
                 self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
-            elif effective_src == "LIVE":
-                self.lbl_source.setObjectName("BadgeLive"); self.lbl_big.setStyleSheet("color:#9ef7d8;")
-            elif effective_src in ("ESTIMADO", "SIN DATOS REALES"):
+            elif effective_src in ("SIN_DATOS_REALES",):
                 self.lbl_source.setObjectName("BadgeBad"); self.lbl_big.setStyleSheet("color:#ffb9b9;")
             else:
                 self.lbl_source.setObjectName("BadgeNeutral"); self.lbl_big.setStyleSheet("color:#d8e7ff;")
