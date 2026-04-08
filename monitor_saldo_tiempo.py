@@ -581,6 +581,9 @@ class MonitorSaldoApp:
         print(f"[DB SALDO][CARGA] filas en DB: {len(self.series)} | db_path={self.db_path}")
         self.last_saved: Optional[SaldoSample] = self.series[-1] if self.series else None
         self.last_valid: Optional[SaldoSample] = self.last_saved
+        self.skip_counts = {"sin_cambio": 0, "duplicada_exacta": 0}
+        self.last_skip_summary_ts = 0.0
+        self.skip_summary_every_s = 20.0
         self.stop_evt = threading.Event()
         self.view_mode = tk.StringVar(value="15m")
 
@@ -695,7 +698,7 @@ class MonitorSaldoApp:
             expanded = True
 
         if expanded:
-            print(f"[ESCALA] expandida automáticamente: {orig_min:.2f}..{orig_max:.2f} -> {min_y:.2f}..{max_y:.2f}")
+            print(f"[ESCALA] expandida automáticamente: {orig_min:,.2f}..{orig_max:,.2f} -> {min_y:,.2f}..{max_y:,.2f}")
             self.manual_min_y = min_y
             self.manual_max_y = max_y
             self.last_valid_manual_range = (min_y, max_y)
@@ -704,6 +707,21 @@ class MonitorSaldoApp:
 
         self.ax.set_ylim(min_y, max_y)
         self.lbl_scale.config(text=f"ESCALA: MANUAL {min_y:,.2f}..{max_y:,.2f} USD")
+
+    def _flush_skip_summary(self, force: bool = False):
+        now = time.time()
+        total = int(self.skip_counts.get("sin_cambio", 0)) + int(self.skip_counts.get("duplicada_exacta", 0))
+        if total <= 0:
+            return
+        if (not force) and (now - float(self.last_skip_summary_ts or 0.0) < float(self.skip_summary_every_s)):
+            return
+        print(
+            f"[DB SALDO][SKIP-RESUMEN] "
+            f"sin_cambio={int(self.skip_counts.get('sin_cambio', 0))} "
+            f"duplicada_exacta={int(self.skip_counts.get('duplicada_exacta', 0))}"
+        )
+        self.skip_counts = {"sin_cambio": 0, "duplicada_exacta": 0}
+        self.last_skip_summary_ts = now
 
     def loop_muestreo(self):
         last_log_err = 0.0
@@ -725,8 +743,13 @@ class MonitorSaldoApp:
                     self._flush_skip_summary(force=True)
                     self.series.append(sample)
                     self.last_saved = sample
+                    print(
+                        f"[DB SALDO][WRITE] saldo={float(sample.saldo):,.2f} "
+                        f"fuente={sample.fuente} ts={_fmt_lima(sample.ts_epoch)} db={self.db_path.name}"
+                    )
                 elif reason in {"duplicada_exacta", "sin_cambio"}:
-                    print(f"[DB SALDO][SKIP] muestra duplicada ({reason})")
+                    self.skip_counts[reason] = int(self.skip_counts.get(reason, 0)) + 1
+                    self._flush_skip_summary(force=False)
 
                 status = "OK"
                 if sample.observacion == "stale":
