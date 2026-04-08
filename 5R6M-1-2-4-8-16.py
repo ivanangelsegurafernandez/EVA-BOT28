@@ -2627,15 +2627,40 @@ def _sync_round_tick_maestro():
             pick, patron, motivo = _lxv_evaluar_columna(round_id, snapshot)
         if pick:
             bot_pick = str(pick.get("bot"))
-            ciclo_pick = int(pick.get("ciclo", estado_bots.get(bot_pick, {}).get("ciclo_actual", 1)) or 1)
-            agregar_evento(f"🧠 LXV columna #{round_id}: {patron} → candidato REAL {bot_pick} ({motivo}).")
+
+            # Solo diagnóstico: ciclo que venía en el snapshot de la columna
+            ciclo_snapshot = int(
+                pick.get("ciclo", estado_bots.get(bot_pick, {}).get("ciclo_actual", 1)) or 1
+            )
+
+            # Fuente canónica real del ciclo de martingala
+            ciclo_pick = ciclo_martingala_siguiente()
+
+            # Blindaje por saldo, igual que en otras rutas REAL
+            saldo_val = obtener_valor_saldo()
+            if reset_martingala_por_saldo(ciclo_pick, saldo_val):
+                ciclo_pick = 1
+
+            agregar_evento(
+                f"🧠 LXV columna #{round_id}: {patron} → candidato REAL {bot_pick} ({motivo}) "
+                f"| snapshot=C{ciclo_snapshot} | global=C{ciclo_pick}"
+            )
+
             if int(_LXV_LAST_EMITTED_ROUND or 0) != int(round_id):
                 ok_emit = emitir_real_autorizado(bot_pick, ciclo_pick, source=LXV_SYNC_REAL_SOURCE)
                 _LXV_LAST_EMITTED_ROUND = int(round_id) if ok_emit else int(_LXV_LAST_EMITTED_ROUND or 0)
                 if ok_emit:
-                    agregar_evento(f"🚨 LXV_SYNC REAL emitido: ronda #{round_id} -> {bot_pick} ciclo #{ciclo_pick}.")
+                    try:
+                        estado_bots[bot_pick]["ciclo_actual"] = int(ciclo_pick)
+                    except Exception:
+                        pass
+                    agregar_evento(
+                        f"🚨 LXV_SYNC REAL emitido: ronda #{round_id} -> {bot_pick} ciclo_global C{ciclo_pick}."
+                    )
                 else:
-                    agregar_evento(f"⚠️ LXV_SYNC REAL no emitido en ronda #{round_id} (lock/purificación/estado).")
+                    agregar_evento(
+                        f"⚠️ LXV_SYNC REAL no emitido en ronda #{round_id} (lock/purificación/estado)."
+                    )
         else:
             agregar_evento(f"ℹ️ LXV columna #{round_id}: {patron} → {motivo}.")
         # Higiene mínima: baja "sync_wait" en bots ya contabilizados

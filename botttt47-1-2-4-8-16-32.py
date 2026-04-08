@@ -2483,6 +2483,11 @@ async def ejecutar_panel():
                 ciclo_forzado = None
 
             ciclo = ciclo_maestro or ciclo_forzado or 1
+            if ciclo_maestro is not None and ciclo_forzado is not None and int(ciclo_maestro) != int(ciclo_forzado):
+                print(
+                    Fore.CYAN + Style.BRIGHT +
+                    f"🔎 Divergencia ciclo: maestro=C{ciclo_maestro} | retenido=C{ciclo_forzado} -> prevalece maestro."
+                )
             if modo_real and estado_bot.get("real_first_cycle_reset_pending"):
                 if ciclo_maestro is not None:
                     print(Fore.YELLOW + f"Primer ciclo REAL confirmado por maestro en C{ciclo_maestro}")
