@@ -563,6 +563,7 @@ class MonitorSaldoApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Monitor saldo vs tiempo (5R6M)")
+        self.root.configure(bg="#0b0b0b")
         self.db_path = SCRIPT_DIR / DB_FILENAME
         self.lock_path = SCRIPT_DIR / f"{DB_FILENAME}.lock"
         self.legacy_db_path = SCRIPT_DIR / LEGACY_DB_FILENAME
@@ -586,6 +587,7 @@ class MonitorSaldoApp:
         self.skip_summary_every_s = 20.0
         self.stop_evt = threading.Event()
         self.view_mode = tk.StringVar(value="15m")
+        self.last_status = "OK"
 
         self.scale_mode = tk.StringVar(value="AUTO")
         self.min_y_var = tk.StringVar(value="0")
@@ -594,43 +596,91 @@ class MonitorSaldoApp:
         self.manual_max_y = 100.0
         self.last_valid_manual_range: Tuple[float, float] = (self.manual_min_y, self.manual_max_y)
 
-        self.lbl_saldo = ttk.Label(root, text="--", font=("Segoe UI", 24, "bold"))
-        self.lbl_saldo.pack(anchor="w", padx=10, pady=6)
+        # === Tema oscuro visual (sin tocar lógica) ===
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure(".", background="#101010", foreground="#f5f5f5")
+        style.configure("Dark.TFrame", background="#101010")
+        style.configure("DarkPanel.TFrame", background="#151515")
+        style.configure("Dark.TLabel", background="#101010", foreground="#f5f5f5")
+        style.configure("Muted.TLabel", background="#101010", foreground="#cfcfcf")
+        style.configure("Scale.TLabel", background="#101010", foreground="#8ad8ff")
+        style.configure("Dark.TRadiobutton", background="#151515", foreground="#f5f5f5")
+        style.map(
+            "Dark.TRadiobutton",
+            background=[("active", "#1b1b1b"), ("selected", "#1b1b1b")],
+            foreground=[("disabled", "#777777"), ("active", "#f5f5f5"), ("selected", "#8ad8ff")],
+        )
+        style.configure("Dark.TButton", background="#222222", foreground="#f5f5f5", borderwidth=1, focusthickness=0)
+        style.map("Dark.TButton", background=[("active", "#2f2f2f"), ("pressed", "#1d1d1d")])
+        style.configure("Dark.TEntry", fieldbackground="#171717", foreground="#f5f5f5")
 
-        self.lbl_status = ttk.Label(root, text="Estado: iniciando...")
-        self.lbl_status.pack(anchor="w", padx=10)
+        header = ttk.Frame(root, style="Dark.TFrame")
+        header.pack(fill="x", padx=8, pady=(8, 2))
 
-        controls = ttk.Frame(root)
-        controls.pack(fill="x", padx=10, pady=6)
+        status_band = ttk.Frame(header, style="DarkPanel.TFrame")
+        status_band.pack(fill="x", pady=(0, 4))
+        self.lbl_status = ttk.Label(status_band, text="Estado: iniciando...", style="Muted.TLabel", anchor="center")
+        self.lbl_status.pack(fill="x", padx=10, pady=(6, 4))
+
+        saldo_band = ttk.Frame(header, style="DarkPanel.TFrame")
+        saldo_band.pack(fill="x", pady=(0, 6))
+        self.lbl_saldo = ttk.Label(
+            saldo_band,
+            text="--",
+            font=("Segoe UI", 120, "bold"),
+            style="Dark.TLabel",
+            anchor="center",
+            justify="center",
+        )
+        self.lbl_saldo.pack(fill="x", padx=10, pady=(6, 8))
+
+        controls = ttk.Frame(header, style="DarkPanel.TFrame")
+        controls.pack(fill="x", padx=0, pady=(0, 4))
         for txt, val in (("5 min", "5m"), ("15 min", "15m"), ("1 hora", "1h"), ("Todo", "all")):
-            ttk.Radiobutton(controls, text=txt, value=val, variable=self.view_mode, command=self.actualizar_grafica).pack(side="left", padx=4)
+            ttk.Radiobutton(
+                controls, text=txt, value=val, variable=self.view_mode, command=self.actualizar_grafica, style="Dark.TRadiobutton"
+            ).pack(side="left", padx=4, pady=2)
 
-        scale_controls = ttk.Frame(root)
-        scale_controls.pack(fill="x", padx=10, pady=4)
-        ttk.Label(scale_controls, text="Escala Y:").pack(side="left", padx=(0, 6))
-        ttk.Radiobutton(scale_controls, text="AUTO", value="AUTO", variable=self.scale_mode, command=self.actualizar_grafica).pack(side="left", padx=3)
-        ttk.Radiobutton(scale_controls, text="MANUAL", value="MANUAL", variable=self.scale_mode, command=self.actualizar_grafica).pack(side="left", padx=3)
-        ttk.Label(scale_controls, text="Min Y").pack(side="left", padx=(12, 4))
-        ttk.Entry(scale_controls, textvariable=self.min_y_var, width=10).pack(side="left", padx=2)
-        ttk.Label(scale_controls, text="Max Y").pack(side="left", padx=(8, 4))
-        ttk.Entry(scale_controls, textvariable=self.max_y_var, width=10).pack(side="left", padx=2)
-        ttk.Button(scale_controls, text="Aplicar escala", command=self.aplicar_escala_manual).pack(side="left", padx=8)
-        ttk.Button(scale_controls, text="Reset auto", command=self.reset_auto_scale).pack(side="left", padx=4)
+        scale_controls = ttk.Frame(header, style="DarkPanel.TFrame")
+        scale_controls.pack(fill="x", padx=0, pady=(0, 2))
+        ttk.Label(scale_controls, text="Escala Y:", style="Dark.TLabel").pack(side="left", padx=(6, 6), pady=2)
+        ttk.Radiobutton(scale_controls, text="AUTO", value="AUTO", variable=self.scale_mode, command=self.actualizar_grafica, style="Dark.TRadiobutton").pack(side="left", padx=3, pady=2)
+        ttk.Radiobutton(scale_controls, text="MANUAL", value="MANUAL", variable=self.scale_mode, command=self.actualizar_grafica, style="Dark.TRadiobutton").pack(side="left", padx=3, pady=2)
+        ttk.Label(scale_controls, text="Min Y", style="Dark.TLabel").pack(side="left", padx=(12, 4), pady=2)
+        ttk.Entry(scale_controls, textvariable=self.min_y_var, width=10, style="Dark.TEntry").pack(side="left", padx=2, pady=2)
+        ttk.Label(scale_controls, text="Max Y", style="Dark.TLabel").pack(side="left", padx=(8, 4), pady=2)
+        ttk.Entry(scale_controls, textvariable=self.max_y_var, width=10, style="Dark.TEntry").pack(side="left", padx=2, pady=2)
+        ttk.Button(scale_controls, text="Aplicar escala", command=self.aplicar_escala_manual, style="Dark.TButton").pack(side="left", padx=8, pady=2)
+        ttk.Button(scale_controls, text="Reset auto", command=self.reset_auto_scale, style="Dark.TButton").pack(side="left", padx=4, pady=2)
 
-        self.lbl_scale = ttk.Label(root, text="ESCALA: AUTO")
-        self.lbl_scale.pack(anchor="w", padx=10, pady=(0, 4))
+        self.lbl_scale = ttk.Label(header, text="ESCALA: AUTO", style="Scale.TLabel", anchor="center")
+        self.lbl_scale.pack(fill="x", padx=10, pady=(0, 4))
 
         fig = Figure(figsize=(10, 5), dpi=100)
         self.ax = fig.add_subplot(111)
-        self.ax.set_title("Saldo REAL vs Tiempo")
-        self.ax.set_xlabel("Tiempo (hora Perú)")
-        self.ax.set_ylabel("Dinero / Saldo")
-        self.line_main, = self.ax.plot([], [], lw=2, label="Saldo")
-        self.line_ma_short, = self.ax.plot([], [], lw=1.2, alpha=0.8, label="MM corta")
-        self.line_ma_long, = self.ax.plot([], [], lw=1.2, alpha=0.8, label="MM lenta")
-        self.marker_last, = self.ax.plot([], [], marker="o", linestyle="", markersize=6)
-        self.ax.legend(loc="best")
-        self.ax.grid(True, alpha=0.3)
+        fig.patch.set_facecolor("#0b0b0b")
+        self.ax.set_facecolor("#111111")
+        self.ax.set_title("Saldo REAL vs Tiempo", color="#f5f5f5")
+        self.ax.set_xlabel("Tiempo (hora Perú)", color="#cfcfcf")
+        self.ax.set_ylabel("Dinero / Saldo", color="#cfcfcf")
+        self.ax.tick_params(colors="#cfcfcf")
+        for sp in self.ax.spines.values():
+            sp.set_color("#4a4a4a")
+        self.line_main, = self.ax.plot([], [], lw=2.2, color="#7fe8ff", label="Saldo")
+        self.line_ma_short, = self.ax.plot([], [], lw=1.4, alpha=0.9, color="#8affb2", label="MM corta")
+        self.line_ma_long, = self.ax.plot([], [], lw=1.3, alpha=0.9, color="#f4d35e", label="MM lenta")
+        self.marker_last, = self.ax.plot([], [], marker="o", linestyle="", markersize=7, color="#ffffff")
+        legend = self.ax.legend(loc="best")
+        if legend:
+            legend.get_frame().set_facecolor("#1a1a1a")
+            legend.get_frame().set_edgecolor("#4a4a4a")
+            for t in legend.get_texts():
+                t.set_color("#f5f5f5")
+        self.ax.grid(True, color="#2f2f2f", alpha=0.6, linewidth=0.8)
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S", tz=LIMA_TZ))
 
         self.canvas = FigureCanvasTkAgg(fig, master=root)
@@ -776,7 +826,14 @@ class MonitorSaldoApp:
         )
 
         def apply_text():
+            self.last_status = status
             self.lbl_saldo.config(text=saldo_txt)
+            if status == "OK":
+                self.lbl_saldo.config(foreground="#f5f5f5")
+            elif status == "STALE":
+                self.lbl_saldo.config(foreground="#f4d35e")
+            else:
+                self.lbl_saldo.config(foreground="#ff9f7f")
             self.lbl_status.config(text=text)
 
         self.root.after(0, apply_text)
