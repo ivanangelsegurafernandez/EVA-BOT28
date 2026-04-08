@@ -69,20 +69,27 @@ SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
 SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
 DISPLAY_TIMEZONE = "America/Lima"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SALDO_FEED_DIR = os.path.abspath(
+    os.path.expanduser(
+        os.getenv("SALDO_FEED_DIR", os.path.join(os.path.expanduser("~"), "saldo_feed_5r6m"))
+    )
+)
 SALDO_LIVE_SHARED_PATH = os.path.abspath(
-    os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))
+    os.path.expanduser(os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(SALDO_FEED_DIR, SALDO_LIVE_FILE)))
 )
 SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(
-    os.getenv(
-        "SALDO_LIVE_HISTORY_SHARED_PATH",
-        os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE),
+    os.path.expanduser(
+        os.getenv(
+            "SALDO_LIVE_HISTORY_SHARED_PATH",
+            os.path.join(SALDO_FEED_DIR, SALDO_LIVE_HISTORY_FILE),
+        )
     )
 )
 def resolver_ruta_saldo_series() -> str:
     custom = os.getenv("SALDO_SERIES_CSV_PATH", "").strip()
     if custom:
         return os.path.abspath(os.path.expanduser(custom))
-    return os.path.abspath(os.path.join(SCRIPT_DIR, SALDO_SERIES_CSV_FILE))
+    return os.path.abspath(os.path.join(SALDO_FEED_DIR, SALDO_SERIES_CSV_FILE))
 
 SALDO_SERIES_CSV_PATH = resolver_ruta_saldo_series()
 SALDO_LIVE_PATH = os.getenv("SALDO_LIVE_PATH", "").strip()
@@ -371,20 +378,30 @@ class DataEngine:
         return tuple(sig)
 
     def _master_live_candidates(self) -> List[Path]:
-        cands: List[Path] = [Path(SALDO_LIVE_SHARED_PATH).expanduser(), self.base_dir / SALDO_LIVE_FILE]
+        canonical = Path(SALDO_LIVE_SHARED_PATH).expanduser()
+        cands: List[Path] = [canonical]
+        if canonical.exists():
+            return [canonical]
+        cands.append(self.base_dir / SALDO_LIVE_FILE)
         if SALDO_LIVE_PATH:
             custom = Path(SALDO_LIVE_PATH).expanduser()
             cands.append(custom / SALDO_LIVE_FILE if custom.is_dir() else custom)
         return self._sort_candidates_by_freshness(cands)
 
     def _master_history_candidates(self) -> List[Path]:
-        cands: List[Path] = [Path(SALDO_LIVE_HISTORY_SHARED_PATH).expanduser()]
+        canonical = Path(SALDO_LIVE_HISTORY_SHARED_PATH).expanduser()
+        cands: List[Path] = [canonical]
+        if canonical.exists():
+            return [canonical]
         for p in self._master_live_candidates():
             cands.append(p.parent / SALDO_LIVE_HISTORY_FILE)
         return self._sort_candidates_by_freshness(cands)
 
     def _master_series_candidates(self) -> List[Path]:
-        cands: List[Path] = [Path(SALDO_SERIES_CSV_PATH).expanduser()]
+        canonical = Path(SALDO_SERIES_CSV_PATH).expanduser()
+        cands: List[Path] = [canonical]
+        if canonical.exists():
+            return [canonical]
         for p in self._master_live_candidates():
             cands.append(p.parent / SALDO_SERIES_CSV_FILE)
         return self._sort_candidates_by_freshness(cands)
@@ -1926,6 +1943,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
 def main():
     print(f"[MONITOR] Monitor Saldo Real Deriv {MONITOR_VERSION} · build={MONITOR_BUILD_ID}")
+    print(f"[MONITOR] ejecutando archivo: {Path(__file__).resolve()}")
+    print(f"[MONITOR] versión: {MONITOR_VERSION}")
+    print(f"[MONITOR] live canónico: {SALDO_LIVE_SHARED_PATH}")
+    print(f"[MONITOR] history canónico: {SALDO_LIVE_HISTORY_SHARED_PATH}")
+    print(f"[MONITOR] series canónico: {SALDO_SERIES_CSV_PATH}")
     try:
         app = QtWidgets.QApplication(sys.argv)
         w = DashboardWindow(DataEngine(Path(__file__).resolve().parent))
