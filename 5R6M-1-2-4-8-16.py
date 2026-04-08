@@ -36,7 +36,7 @@ import os, csv, time, random, asyncio, json, re
 from collections import deque
 from unicodedata import normalize
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 import sys
 import shutil
@@ -2299,40 +2299,34 @@ def _append_series_csv_if_new(path: str, ts_iso: str, val: float, source: str):
 def _update_saldo_monitor_feed(valor_saldo: float):
     try:
         val = float(valor_saldo)
-    except Exception:
-        return
-    now = float(time.time())
-    ts_iso = datetime.now(timezone.utc).isoformat()
-    payload_live = {
-        "saldo_real": val,
-        "equity": val,
-        "balance": val,
-        "timestamp": ts_iso,
-        "ts": now,
-        "source": "MAESTRO_5R6M",
-    }
-    payload_hist = {
-        "timestamp": ts_iso,
-        "equity": val,
-        "saldo_real": val,
-        "balance": val,
-        "source": "MAESTRO_5R6M",
-    }
-    for p in dict.fromkeys(_saldo_feed_targets()["live"]):
-        try:
+        now = float(time.time())
+        ts_iso = datetime.now(timezone.utc).isoformat()
+        payload_live = {
+            "saldo_real": val,
+            "equity": val,
+            "balance": val,
+            "timestamp": ts_iso,
+            "ts": now,
+            "source": "MAESTRO_5R6M",
+        }
+        payload_hist = {
+            "timestamp": ts_iso,
+            "equity": val,
+            "saldo_real": val,
+            "balance": val,
+            "source": "MAESTRO_5R6M",
+        }
+        for p in dict.fromkeys(_saldo_feed_targets()["live"]):
             _atomic_write(p, json.dumps(payload_live, ensure_ascii=False))
-        except Exception:
-            pass
-    for p in dict.fromkeys(_saldo_feed_targets()["history"]):
-        try:
+        for p in dict.fromkeys(_saldo_feed_targets()["history"]):
             _append_line_safe(p, json.dumps(payload_hist, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-    for p in dict.fromkeys(_saldo_feed_targets()["series"]):
-        try:
+        for p in dict.fromkeys(_saldo_feed_targets()["series"]):
             _append_series_csv_if_new(p, ts_iso, val, "MAESTRO_5R6M")
-        except Exception:
-            pass
+        print(f"[SALDO FEED][OK] saldo={val:.2f} ts={ts_iso}")
+        return True
+    except Exception as e:
+        print(f"[SALDO FEED][ERROR] {e}")
+        return False
 # === /SALDO LIVE FEED ===
 
 # === LXV_SYNC_COLUMN: sincronización de ronda/columna maestro↔bots ===
@@ -15896,10 +15890,7 @@ async def obtener_saldo_real():
             if "balance" in resp:
                 saldo_real = f"{resp['balance']['balance']:.2f}"
                 ULTIMA_ACT_SALDO = time.time()
-                try:
-                    _update_saldo_monitor_feed(float(resp["balance"]["balance"]))
-                except Exception:
-                    pass
+                _update_saldo_monitor_feed(float(resp["balance"]["balance"]))
     except Exception as e:
         print(f"⚠️ Error obteniendo saldo: {e}")
 
