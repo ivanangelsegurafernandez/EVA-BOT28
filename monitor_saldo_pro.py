@@ -672,11 +672,37 @@ class DataEngine:
                 continue
             found_any = True
             try:
-                obj = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+                raw_text = ""
+                obj = None
+                for attempt in range(3):
+                    raw_text = p.read_text(encoding="utf-8", errors="ignore").strip()
+                    if not raw_text:
+                        time.sleep(0.02)
+                        continue
+                    try:
+                        obj = json.loads(raw_text)
+                        break
+                    except Exception:
+                        # tolerancia a archivo parcialmente escrito: intenta rescatar último objeto JSON.
+                        try:
+                            m = re.search(r"\{.*\}", raw_text, flags=re.DOTALL)
+                            if m:
+                                obj = json.loads(m.group(0))
+                                break
+                        except Exception:
+                            pass
+                        time.sleep(0.03)
+                if obj is None:
+                    warnings.append(f"{SALDO_LIVE_FILE} inválido en {'ruta compartida' if str(p)==SALDO_LIVE_SHARED_PATH else p}")
+                    continue
                 v = _safe_float(
                     obj.get("saldo_real", obj.get("equity", obj.get("balance"))),
                     default=np.nan,
                 )
+                if not np.isfinite(v):
+                    bal = obj.get("balance")
+                    if isinstance(bal, dict):
+                        v = _safe_float(bal.get("balance", bal.get("equity", bal.get("saldo_real"))), default=np.nan)
                 if not np.isfinite(v):
                     warnings.append(f"{SALDO_LIVE_FILE} inválido en {'ruta compartida' if str(p)==SALDO_LIVE_SHARED_PATH else p}")
                     continue
