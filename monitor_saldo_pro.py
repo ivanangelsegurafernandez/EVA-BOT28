@@ -69,19 +69,16 @@ SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
 SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
 DISPLAY_TIMEZONE = "America/Lima"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SALDO_FEED_DIR = os.path.abspath(
-    os.path.expanduser(
-        os.getenv("SALDO_FEED_DIR", os.path.join(os.path.expanduser("~"), "saldo_feed_5r6m"))
-    )
-)
+_DEFAULT_SALDO_LIVE_PATH = os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE)
 SALDO_LIVE_SHARED_PATH = os.path.abspath(
-    os.path.expanduser(os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(SALDO_FEED_DIR, SALDO_LIVE_FILE)))
+    os.path.expanduser(os.getenv("SALDO_LIVE_SHARED_PATH", _DEFAULT_SALDO_LIVE_PATH))
 )
+_DEFAULT_SALDO_HISTORY_PATH = os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE)
 SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(
     os.path.expanduser(
         os.getenv(
             "SALDO_LIVE_HISTORY_SHARED_PATH",
-            os.path.join(SALDO_FEED_DIR, SALDO_LIVE_HISTORY_FILE),
+            _DEFAULT_SALDO_HISTORY_PATH,
         )
     )
 )
@@ -89,7 +86,7 @@ def resolver_ruta_saldo_series() -> str:
     custom = os.getenv("SALDO_SERIES_CSV_PATH", "").strip()
     if custom:
         return os.path.abspath(os.path.expanduser(custom))
-    return os.path.abspath(os.path.join(SALDO_FEED_DIR, SALDO_SERIES_CSV_FILE))
+    return os.path.abspath(os.path.join(SCRIPT_DIR, SALDO_SERIES_CSV_FILE))
 
 SALDO_SERIES_CSV_PATH = resolver_ruta_saldo_series()
 SALDO_LIVE_PATH = os.getenv("SALDO_LIVE_PATH", "").strip()
