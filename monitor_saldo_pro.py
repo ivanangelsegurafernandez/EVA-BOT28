@@ -1052,9 +1052,6 @@ class DataEngine:
             if ensure_msg and ensure_msg != self._series_ensure_notice_once:
                 warnings.append(ensure_msg)
                 self._series_ensure_notice_once = ensure_msg
-            repair_msg = self._repair_series_csv_if_needed(series_target_path)
-            if repair_msg:
-                warnings.append(repair_msg)
 
         master, master_msg, live_path_used = self._read_master_live() if view == "REAL" else (None, None, None)
         hist, hist_msg, hist_path_used, hist_growth_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None, None)
@@ -1086,8 +1083,6 @@ class DataEngine:
             )
             if hist_growth_msg:
                 warnings.append(hist_growth_msg)
-            if real_primary_ok:
-                warnings.append("Modo FAST-PATH REAL: fuentes auxiliares en lazy")
             if master is not None:
                 mv_live, mts_live = master
                 live_age_sec = max(0.0, (_now().astimezone(timezone.utc) - mts_live.astimezone(timezone.utc)).total_seconds())
@@ -1214,7 +1209,8 @@ class DataEngine:
         if source == "SIN_DATOS_REALES" and not estimated.empty:
             warnings.append("Estimado CSV disponible solo como auxiliar")
         if view == "REAL":
-            sample = self._extract_best_real_sample_for_persist(
+            append_msg = self._persist_real_if_valid(
+                series_target_path=series_target_path,
                 hist=hist,
                 master=master,
                 series_csv=series_csv,
@@ -1224,14 +1220,8 @@ class DataEngine:
                 observed=observed,
                 estimated=estimated,
             )
-            if sample is not None:
-                ts_iso, eq, src = sample
-                repair_msg = self._repair_series_csv_if_needed(series_target_path)
-                if repair_msg:
-                    warnings.append(repair_msg)
-                append_msg = self._append_series_sample_if_new(series_target_path, ts_iso, eq, src)
-                if append_msg:
-                    warnings.append(append_msg)
+            if append_msg:
+                warnings.append(append_msg)
 
         mcut = now - timedelta(minutes=VENTANA_MINUTOS)
         hcut = now - timedelta(hours=VENTANA_HORAS)
@@ -1278,19 +1268,10 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._error_throttle: Dict[str, Tuple[float, int]] = {}
         self._last_plot_series: Dict[str, pd.DataFrame] = {}
         self._build_ms_hist = deque(maxlen=120)
-        self.follow_latest = True
-        self.manual_view_active = False
         self._force_autorange_once = True
-        self._auto_range_guard = False
         self._last_scale_mode = str(Y_SCALE_MODE)
-        self.rule_enabled = False
         self.markers_enabled = SHOW_LAST_MARKER
-        self.show_ema_fast = True
-        self.show_ema_slow = True
-        self.show_last_value_line = True
-        self.show_breaks = True
-        self.smoothing_mode = "OFF"
-        self.rule_points: List[Tuple[float, float]] = []
+        self._last_warn_compact: str = ""
         self.setWindowTitle(f"Monitor Saldo Real Deriv {MONITOR_VERSION}")
         self.resize(1600, 900)
 
@@ -1324,18 +1305,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.btn_all = QtWidgets.QPushButton("ALL")
         self.btn_reset = QtWidgets.QPushButton("RESET VISTA")
         self.btn_export = QtWidgets.QPushButton("EXPORTAR CSV")
-        self.btn_rule = QtWidgets.QPushButton("REGLA: OFF")
-        self.btn_markers = QtWidgets.QPushButton("MÁX/MÍN: ON")
-        self.btn_last_line = QtWidgets.QPushButton("ÚLTIMA LÍNEA: ON")
-        self.btn_breaks = QtWidgets.QPushButton("QUIEBRES: ON")
-        self.btn_ema_fast = QtWidgets.QPushButton("EMA 8: ON")
-        self.btn_ema_slow = QtWidgets.QPushButton("EMA 26: ON")
-        self.btn_freeze = QtWidgets.QPushButton("FREEZE VIEW: OFF")
-        for b in (self.btn_real, self.btn_demo, self.btn_all, self.btn_reset, self.btn_export, self.btn_rule, self.btn_markers, self.btn_last_line, self.btn_breaks, self.btn_ema_fast, self.btn_ema_slow, self.btn_freeze):
+        for b in (self.btn_real, self.btn_demo, self.btn_all, self.btn_reset, self.btn_export):
             b.setObjectName("MetaBox")
             controls.addWidget(b)
-        self.cmb_smooth = QtWidgets.QComboBox(); self.cmb_smooth.setObjectName("MetaBox")
-        self.cmb_smooth.addItems(["SMOOTH: OFF", "SMOOTH: LEVE", "SMOOTH: MEDIO"])
         self.cmb_min = QtWidgets.QComboBox(); self.cmb_min.setObjectName("MetaBox")
         self.cmb_min.addItems(["15m", "30m", "60m", "90m", "120m"])
         self.cmb_hour = QtWidgets.QComboBox(); self.cmb_hour.setObjectName("MetaBox")
@@ -1343,7 +1315,6 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.cmb_day = QtWidgets.QComboBox(); self.cmb_day.setObjectName("MetaBox")
         self.cmb_day.addItems(["7d", "14d", "30d"])
         self._sync_window_combos()
-        controls.addWidget(self.cmb_smooth)
         controls.addWidget(self.cmb_min)
         controls.addWidget(self.cmb_hour)
         controls.addWidget(self.cmb_day)
@@ -1380,7 +1351,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.lbl_stats.setObjectName("Warn")
         self.lbl_stats.setMaximumHeight(20)
         root.addWidget(self.lbl_stats)
-        self.lbl_help = QtWidgets.QLabel(f"Teclas: [1]REAL [2]DEMO [3]ALL [F]Fullscreen [R]Reset [E]Export [G]Regla [C]Limpiar regla [M]Máx/Mín [V]Freeze [Q]Salir · {MONITOR_VERSION}")
+        self.lbl_help = QtWidgets.QLabel(f"Teclas: [1]REAL [2]DEMO [3]ALL [F]Fullscreen [R]Reset [E]Export [Q]Salir · {MONITOR_VERSION}")
         self.lbl_help.setObjectName("Help"); root.addWidget(self.lbl_help)
         self.lbl_help.setMaximumHeight(14)
 
@@ -1413,20 +1384,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.btn_all.clicked.connect(lambda: self._switch_view("ALL"))
         self.btn_reset.clicked.connect(self._reset_view)
         self.btn_export.clicked.connect(self._export_visible_csv)
-        self.btn_rule.clicked.connect(self._toggle_rule_mode)
-        self.btn_markers.clicked.connect(self._toggle_markers)
-        self.btn_last_line.clicked.connect(self._toggle_last_value_line)
-        self.btn_breaks.clicked.connect(self._toggle_breaks)
-        self.btn_ema_fast.clicked.connect(self._toggle_ema_fast)
-        self.btn_ema_slow.clicked.connect(self._toggle_ema_slow)
-        self.btn_freeze.clicked.connect(self._toggle_freeze)
-        self.cmb_smooth.currentTextChanged.connect(self._on_smooth_changed)
         self.cmb_min.currentTextChanged.connect(self._on_window_combo_changed)
         self.cmb_hour.currentTextChanged.connect(self._on_window_combo_changed)
         self.cmb_day.currentTextChanged.connect(self._on_window_combo_changed)
-
-        self._init_crosshair()
-        self._attach_manual_range_hooks()
 
         if FULLSCREEN_INICIAL:
             self.showMaximized()
@@ -1483,21 +1443,10 @@ class DashboardWindow(QtWidgets.QMainWindow):
     def _init_plot_state(self, plot: pg.PlotItem, color: str, endpoint: str, canonical_window_s: int) -> Dict[str, object]:
         glow = plot.plot([], [], pen=pg.mkPen(color + "55", width=8.0), name=None)
         line = plot.plot([], [], pen=pg.mkPen(color, width=5.2), name="Equity")
-        smooth_line = plot.plot([], [], pen=pg.mkPen("#ffffff66", width=2.0), name="Suavizado")
-        ema_alert = plot.plot([], [], pen=pg.mkPen("#ff8a5b", width=2.2), name="EMA 8")
-        ema_calm = plot.plot([], [], pen=pg.mkPen("#7ea4ff", width=2.0, style=QtCore.Qt.DashLine), name="EMA 26")
-        last_value_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#8ad6ffaa", width=1.1, style=QtCore.Qt.DotLine))
-        last_value_line.setVisible(False)
-        plot.addItem(last_value_line)
         last = plot.plot([], [], pen=None, symbol="o", symbolSize=5, symbolBrush=endpoint, name=None)
-        vmax = plot.plot([], [], pen=None, symbol="o", symbolSize=4, symbolBrush="#ffd36b99", name=None)
-        vmin = plot.plot([], [], pen=None, symbol="o", symbolSize=4, symbolBrush="#ff8f8f99", name=None)
-        cross_up = plot.plot([], [], pen=None, symbol="t", symbolSize=6, symbolBrush="#8ef0a8cc", name=None)
-        cross_down = plot.plot([], [], pen=None, symbol="t1", symbolSize=6, symbolBrush="#ff9b9bcc", name=None)
-        slope_break = plot.plot([], [], pen=None, symbol="d", symbolSize=5, symbolBrush="#f2d88acc", name=None)
         txt = pg.TextItem(text="", color="#9ec2ff", anchor=(0, 1))
         plot.addItem(txt)
-        return {"plot": plot, "glow": glow, "line": line, "smooth_line": smooth_line, "ema_alert": ema_alert, "ema_calm": ema_calm, "last_value_line": last_value_line, "last": last, "max": vmax, "min": vmin, "cross_up": cross_up, "cross_down": cross_down, "slope_break": slope_break, "text": txt, "endpoint": endpoint, "canonical_window_s": int(canonical_window_s)}
+        return {"plot": plot, "glow": glow, "line": line, "last": last, "text": txt, "endpoint": endpoint, "canonical_window_s": int(canonical_window_s)}
 
     def _sync_window_combos(self):
         self.cmb_min.setCurrentText(f"{int(VENTANA_MINUTOS)}m")
@@ -1534,140 +1483,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
         else:
             plot.setXRange(xmax - float(canonical_window_s), xmax, padding=0.0)
 
-    def _attach_manual_range_hooks(self):
-        for p in (self.p_main, self.p_min, self.p_hour, self.p_day):
-            try:
-                vb = p.getViewBox()
-                sig_manual = getattr(vb, "sigRangeChangedManually", None)
-                if sig_manual is not None:
-                    sig_manual.connect(self._on_user_range_changed)
-                else:
-                    vb.sigRangeChanged.connect(self._on_user_range_changed)
-            except Exception:
-                continue
-
-    def _on_user_range_changed(self, *_args):
-        if self._auto_range_guard:
-            return
-        self.manual_view_active = True
-        self.follow_latest = False
-        self.btn_freeze.setText("FREEZE VIEW: ON")
-
     def _switch_view(self, view: str):
         self.view = view
         self.refresh(force=True)
 
     def _reset_view(self):
-        self._auto_range_guard = True
         self.p_main.enableAutoRange(); self.p_min.enableAutoRange(); self.p_hour.enableAutoRange(); self.p_day.enableAutoRange()
-        self._auto_range_guard = False
-        self.manual_view_active = False
-        self.follow_latest = True
         self._force_autorange_once = True
-        self.btn_freeze.setText("FREEZE VIEW: OFF")
         self.refresh(force=True)
-
-    def _toggle_freeze(self):
-        self.follow_latest = not self.follow_latest
-        if self.follow_latest:
-            self.manual_view_active = False
-            self._force_autorange_once = True
-        else:
-            self.manual_view_active = True
-        self.btn_freeze.setText(f"FREEZE VIEW: {'OFF' if self.follow_latest else 'ON'}")
-
-    def _toggle_rule_mode(self):
-        self.rule_enabled = not self.rule_enabled
-        if not self.rule_enabled:
-            self.rule_points = []
-        self.btn_rule.setText(f"REGLA: {'ON' if self.rule_enabled else 'OFF'}")
-
-    def _toggle_markers(self):
-        self.markers_enabled = not self.markers_enabled
-        self.btn_markers.setText(f"MÁX/MÍN: {'ON' if self.markers_enabled else 'OFF'}")
-
-    def _toggle_last_value_line(self):
-        self.show_last_value_line = not self.show_last_value_line
-        self.btn_last_line.setText(f"ÚLTIMA LÍNEA: {'ON' if self.show_last_value_line else 'OFF'}")
-
-    def _toggle_breaks(self):
-        self.show_breaks = not self.show_breaks
-        self.btn_breaks.setText(f"QUIEBRES: {'ON' if self.show_breaks else 'OFF'}")
-
-    def _toggle_ema_fast(self):
-        self.show_ema_fast = not self.show_ema_fast
-        self.btn_ema_fast.setText(f"EMA 8: {'ON' if self.show_ema_fast else 'OFF'}")
-
-    def _toggle_ema_slow(self):
-        self.show_ema_slow = not self.show_ema_slow
-        self.btn_ema_slow.setText(f"EMA 26: {'ON' if self.show_ema_slow else 'OFF'}")
-
-    def _on_smooth_changed(self, text: str):
-        t = str(text or "").upper()
-        if "LEVE" in t:
-            self.smoothing_mode = "LEVE"
-        elif "MEDIO" in t:
-            self.smoothing_mode = "MEDIO"
-        else:
-            self.smoothing_mode = "OFF"
-        self.refresh(force=True)
-
-    def _init_crosshair(self):
-        self.cross_v = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#6688aa88"))
-        self.cross_h = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#6688aa88"))
-        self.p_main.addItem(self.cross_v, ignoreBounds=True)
-        self.p_main.addItem(self.cross_h, ignoreBounds=True)
-        self.main_curve_proxy = pg.SignalProxy(self.p_main.scene().sigMouseMoved, rateLimit=45, slot=self._on_mouse_moved)
-        self.main_click_proxy = pg.SignalProxy(self.p_main.scene().sigMouseClicked, rateLimit=20, slot=self._on_mouse_clicked)
-
-    def _on_mouse_moved(self, evt):
-        if not evt:
-            return
-        pos = evt[0]
-        if not self.p_main.sceneBoundingRect().contains(pos):
-            return
-        point = self.p_main.vb.mapSceneToView(pos)
-        x, y = float(point.x()), float(point.y())
-        self.cross_v.setPos(x); self.cross_h.setPos(y)
-        main_vis = _sanitize_series_for_plot(self._last_plot_series.get("main", pd.DataFrame(columns=["timestamp", "equity"])))
-        if main_vis.empty:
-            return
-        ts = datetime.fromtimestamp(x, tz=timezone.utc).astimezone(DISPLAY_TZ)
-        first = float(main_vis["equity"].iloc[0])
-        delta = y - first
-        pct = (delta / first * 100.0) if abs(first) > 1e-12 else 0.0
-        self.p_main.setToolTip(
-            f"{ts.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
-            f"Saldo: {y:,.2f} USD\n"
-            f"Δ vs primer visible: {delta:+,.2f} USD ({pct:+.2f}%)"
-        )
-
-    def _on_mouse_clicked(self, evt):
-        if not evt or not self.rule_enabled:
-            return
-        mouse_event = evt[0]
-        if mouse_event.button() != QtCore.Qt.LeftButton:
-            return
-        scene_pos = mouse_event.scenePos()
-        if not self.p_main.sceneBoundingRect().contains(scene_pos):
-            return
-        point = self.p_main.vb.mapSceneToView(scene_pos)
-        self.rule_points.append((float(point.x()), float(point.y())))
-        if len(self.rule_points) > 2:
-            self.rule_points = self.rule_points[-2:]
-        if len(self.rule_points) == 2:
-            self._render_rule_stats()
-
-    def _render_rule_stats(self):
-        (x1, y1), (x2, y2) = self.rule_points
-        dt_s = max(0.0, x2 - x1)
-        delta = y2 - y1
-        pct = (delta / y1 * 100.0) if abs(y1) > 1e-12 else 0.0
-        usd_min = (delta / (dt_s / 60.0)) if dt_s > 0 else 0.0
-        pct_hour = (pct / (dt_s / 3600.0)) if dt_s > 0 else 0.0
-        self.lbl_stats.setText(
-            f"REGLA A→B | ΔUSD={delta:+,.2f} | Δ%={pct:+.2f}% | Δt={dt_s/60.0:,.1f} min | Pend={usd_min:+,.2f} USD/min | {pct_hour:+.2f}%/h"
-        )
 
     def _export_visible_csv(self):
         vis = _sanitize_series_for_plot(self._last_plot_series.get("main", pd.DataFrame(columns=["timestamp", "equity"])))
@@ -1698,15 +1521,6 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self._reset_view()
         elif k == QtCore.Qt.Key_E:
             self._export_visible_csv()
-        elif k == QtCore.Qt.Key_G:
-            self._toggle_rule_mode()
-        elif k == QtCore.Qt.Key_C:
-            self.rule_points = []
-            self.lbl_stats.setText("STATS VIS: --")
-        elif k == QtCore.Qt.Key_M:
-            self._toggle_markers()
-        elif k == QtCore.Qt.Key_V:
-            self._toggle_freeze()
         elif k == QtCore.Qt.Key_Q:
             self.close()
         else:
@@ -1748,117 +1562,44 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
     def _update_plot_state(self, state: Dict[str, object], s: pd.DataFrame) -> Tuple[str, float, float]:
         plot = state["plot"]
-        glow = state["glow"]; line = state["line"]; smooth_line = state["smooth_line"]; last = state["last"]; vmax = state["max"]; vmin = state["min"]; txt = state["text"]
-        ema_alert_line = state["ema_alert"]; ema_calm_line = state["ema_calm"]; last_value_line = state["last_value_line"]
-        cross_up = state["cross_up"]; cross_down = state["cross_down"]; slope_break = state["slope_break"]
+        glow = state["glow"]; line = state["line"]; last = state["last"]; txt = state["text"]
         endpoint = state.get("endpoint", "#9ef7d8")
         s = _sanitize_series_for_plot(s)
         if s.empty:
             glow.setData([], [])
             line.setData([], [])
-            smooth_line.setData([], [])
-            ema_alert_line.setData([], [])
-            ema_calm_line.setData([], [])
             last.setData([], [])
-            vmax.setData([], [])
-            vmin.setData([], [])
-            cross_up.setData([], [])
-            cross_down.setData([], [])
-            slope_break.setData([], [])
-            last_value_line.setVisible(False)
             txt.setText("Sin puntos")
             y0, y1, scale_info = self._resolve_y_range(None)
-            auto_apply = bool(self._force_autorange_once or (self.follow_latest and not self.manual_view_active))
-            if auto_apply:
-                self._auto_range_guard = True
-                plot.setYRange(y0, y1, padding=0.0)
-                self._auto_range_guard = False
+            plot.setYRange(y0, y1, padding=0.0)
             return "sin datos", y0, y1
 
         x = (s["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
         y = s["equity"].to_numpy(dtype=float)
-        smooth_y = y.copy()
-        if len(y) >= 5 and self.smoothing_mode in ("LEVE", "MEDIO"):
-            win = 5 if self.smoothing_mode == "LEVE" else 9
-            smooth_y = pd.Series(y).rolling(window=win, min_periods=1, center=True).mean().to_numpy(dtype=float)
 
         if len(x) >= MIN_POINTS_FOR_LINE:
             glow.setData(x, y)
             line.setData(x, y)
-            smooth_line.setData(x, smooth_y) if self.smoothing_mode != "OFF" else smooth_line.setData([], [])
             txt.setText("")
         else:
             glow.setData([], [])
             line.setData([], [])
-            smooth_line.setData([], [])
             txt.setText("1 punto: esperando más histórico")
-
-        if len(y) >= 8:
-            ema_alert = pd.Series(y).ewm(span=8, adjust=False).mean().to_numpy(dtype=float)
-            ema_calm = pd.Series(y).ewm(span=26, adjust=False).mean().to_numpy(dtype=float)
-            ema_alert_line.setData(x, ema_alert) if self.show_ema_fast else ema_alert_line.setData([], [])
-            ema_calm_line.setData(x, ema_calm) if self.show_ema_slow else ema_calm_line.setData([], [])
-            if self.show_breaks:
-                cross = np.sign(ema_alert - ema_calm)
-                cross_shift = np.roll(cross, 1)
-                cross_shift[0] = 0
-                up_idx = np.where((cross > 0) & (cross_shift <= 0))[0]
-                dn_idx = np.where((cross < 0) & (cross_shift >= 0))[0]
-                cross_up.setData(x[up_idx], y[up_idx] if len(up_idx) else [])
-                cross_down.setData(x[dn_idx], y[dn_idx] if len(dn_idx) else [])
-                dy = np.gradient(smooth_y)
-                ddy = np.gradient(dy)
-                thr = np.nanstd(ddy) * 1.25 if np.isfinite(np.nanstd(ddy)) else 0.0
-                sb_idx = np.where(np.abs(ddy) > max(1e-9, thr))[0]
-                slope_break.setData(x[sb_idx], y[sb_idx] if len(sb_idx) else [])
-            else:
-                cross_up.setData([], [])
-                cross_down.setData([], [])
-                slope_break.setData([], [])
-        else:
-            ema_alert_line.setData([], [])
-            ema_calm_line.setData([], [])
-            cross_up.setData([], [])
-            cross_down.setData([], [])
-            slope_break.setData([], [])
-
-        if self.show_last_value_line and len(y) >= 1:
-            last_value_line.setPos(float(y[-1]))
-            last_value_line.setVisible(True)
-        else:
-            last_value_line.setVisible(False)
 
         marker_size = 8 if len(x) == 1 else 4
         try:
             last.setSymbolBrush(endpoint)
         except Exception:
             pass
-        if self.markers_enabled and SHOW_LAST_MARKER:
+        if SHOW_LAST_MARKER:
             last.setData([x[-1]], [y[-1]], symbolSize=marker_size)
         else:
             last.setData([], [])
-        if self.markers_enabled and len(x) >= 5:
-            yy = smooth_y
-            prev = np.roll(yy, 1); nxt = np.roll(yy, -1)
-            peak_idx = np.where((yy > prev) & (yy > nxt))[0]
-            min_idx = np.where((yy < prev) & (yy < nxt))[0]
-            peak_idx = peak_idx[(peak_idx > 0) & (peak_idx < len(yy) - 1)]
-            min_idx = min_idx[(min_idx > 0) & (min_idx < len(yy) - 1)]
-            vmax.setData(x[peak_idx[-20:]], y[peak_idx[-20:]] if len(peak_idx) else [])
-            vmin.setData(x[min_idx[-20:]], y[min_idx[-20:]] if len(min_idx) else [])
-        else:
-            vmax.setData([], [])
-            vmin.setData([], [])
         y0, y1, scale_info = self._resolve_y_range(y)
-        auto_apply = bool(self._force_autorange_once or (self.follow_latest and not self.manual_view_active))
-        if auto_apply:
-            self._auto_range_guard = True
-            plot.setYRange(y0, y1, padding=0.0)
-            if Y_SCALE_MODE == "manual":
-                plot.setLimits(yMin=y0, yMax=y1)
-            if self.follow_latest and not self.manual_view_active:
-                self._set_x_range_visible(plot, x, int(state["canonical_window_s"]))
-            self._auto_range_guard = False
+        plot.setYRange(y0, y1, padding=0.0)
+        if Y_SCALE_MODE == "manual":
+            plot.setLimits(yMin=y0, yMax=y1)
+        self._set_x_range_visible(plot, x, int(state["canonical_window_s"]))
         return scale_info, y0, y1
 
     def refresh(self, force: bool = False):
@@ -1972,10 +1713,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
                     f"VIS | first={first_v:,.2f} last={last_v:,.2f} max={max_v:,.2f} min={min_v:,.2f} "
                     f"drawdown={dd:,.2f} rango={max_v-min_v:,.2f} amp={amp_pct:.2f}% pts={n_visible}"
                 )
-            elif not self.rule_enabled:
+            else:
                 self.lbl_stats.setText("STATS VIS: --")
-            if self.rule_enabled and len(self.rule_points) == 2:
-                self._render_rule_stats()
             self.lbl_meta_compact.setText(
                 f"{snap.now.strftime('%H:%M:%S %Z')} · última {last} · pts {n_visible} · Δvis {compact_delta}"
             )
@@ -1992,25 +1731,19 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 snap.warnings.insert(0, "No hay datos válidos desde el arranque")
 
             if snap.warnings:
-                compact = [w.strip()[:110] + ("…" if len(w.strip()) > 110 else "") for w in snap.warnings[:3]]
-                self.lbl_warn.setText("⚠ " + " · ".join(compact))
+                compact = [w.strip()[:96] + ("…" if len(w.strip()) > 96 else "") for w in snap.warnings[:2]]
+                compact_msg = "⚠ " + " · ".join(compact)
+                if compact_msg != self._last_warn_compact:
+                    self.lbl_warn.setText(compact_msg)
+                    self._last_warn_compact = compact_msg
                 self.lbl_warn.setToolTip(
                     "\n".join(
                         snap.warnings
                         + [
                             f"Estado: {status}",
                             f"Fuente efectiva actual: {effective_src}",
-                            f"Fuente último saldo válido: {self.last_good_source or '--'}",
-                            f"Edad último saldo válido: {last_good_age}",
                             f"build ms: {self.last_build_ms:,.2f}",
                             f"build ms avg: {np.mean(self._build_ms_hist):,.2f}" if self._build_ms_hist else "build ms avg: --",
-                            f"refresh skipped: {self.refresh_skipped}",
-                            f"worker running: {'yes' if self.worker_running else 'no'}",
-                            f"filas series_real: {len(_sanitize_series_for_plot(snap.series_real))}",
-                            f"filas series_main: {len(_sanitize_series_for_plot(snap.series_main))}",
-                            f"ruta live: {SALDO_LIVE_SHARED_PATH}",
-                            f"ruta history: {SALDO_LIVE_HISTORY_SHARED_PATH}",
-                            f"ruta series csv: {SALDO_SERIES_CSV_PATH}",
                             f"Escala efectiva: {main_scale}",
                             f"Escala main: {Y_SCALE_MODE} | y=[{main_y0:,.2f}, {main_y1:,.2f}]",
                         ]
@@ -2018,6 +1751,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 )
             else:
                 self.lbl_warn.setText("")
+                self._last_warn_compact = ""
                 self.lbl_warn.setToolTip(
                     f"Estado: {status}\n"
                     f"Fuente efectiva actual: {effective_src}\n"
