@@ -1412,7 +1412,12 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
         if FULLSCREEN_INICIAL:
             self.showMaximized()
-        self.refresh(force=True)
+        try:
+            self.refresh(force=True)
+        except Exception as e:
+            self._startup_warning = f"Refresh inicial falló: {e}"
+            self.lbl_warn.setText(f"⚠ {self._startup_warning}")
+            traceback.print_exc()
 
     def _style_plot(self, plot: pg.PlotItem, title: str):
         plot.setTitle(f"<span style='color:#cfe2ff;font-size:12pt;font-weight:680'>{title}</span>")
