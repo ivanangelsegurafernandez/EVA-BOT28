@@ -572,7 +572,7 @@ class DataEngine:
             ts_iso = self._ts_utc_iso(row.get("timestamp"))
             eq = self._normalize_equity_value(row.get("equity"))
             if ts_iso and eq is not None:
-                return (ts_iso, eq, "MAESTRO_HISTORY_DEGRADED")
+                return (ts_iso, eq, "MAESTRO_HISTORY")
         if not series_csv.empty:
             row = series_csv.iloc[-1]
             ts_iso = self._ts_utc_iso(row.get("timestamp"))
@@ -581,7 +581,7 @@ class DataEngine:
                 return (ts_iso, eq, "SERIE_CSV_DEGRADED")
         ts_iso = self._ts_utc_iso(last_update)
         eq = self._normalize_equity_value(saldo_actual)
-        if ts_iso and eq is not None and source in ("MAESTRO_LIVE", "MAESTRO_HISTORY_DEGRADED", "SERIE_CSV_DEGRADED"):
+        if ts_iso and eq is not None and source in ("MAESTRO_LIVE", "MAESTRO_HISTORY", "SERIE_CSV_DEGRADED"):
             return (ts_iso, eq, source)
         return None
 
@@ -1079,17 +1079,15 @@ class DataEngine:
                 hts = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True) if latest_hist is not None else pd.NaT
                 sts = pd.to_datetime(latest_series["timestamp"], errors="coerce", utc=True) if latest_series is not None else pd.NaT
                 if latest_hist is not None and (pd.isna(sts) or (not pd.isna(hts) and hts >= sts)):
-                    source = "MAESTRO_HISTORY_DEGRADED"
+                    source = "MAESTRO_HISTORY"
                     saldo_actual = float(latest_hist["equity"])
                     last_update = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True).to_pydatetime()
                 elif latest_series is not None:
                     source = "SERIE_CSV_DEGRADED"
                     saldo_actual = float(latest_series["equity"])
                     last_update = pd.to_datetime(latest_series["timestamp"], errors="coerce", utc=True).to_pydatetime()
-                if master is not None and not live_fresh and source != "SIN_DATOS_REALES":
+                if master is not None and not live_fresh and source != "SIN DATOS REALES":
                     warnings.append("Live stale descartado como saldo principal")
-            if source == "SIN_DATOS_REALES":
-                warnings.append("saldo real del maestro no disponible")
         elif not observed.empty:
             source = "OBSERVADO_FALLBACK"
             saldo_actual = float(observed["equity"].iloc[-1])
@@ -1106,12 +1104,12 @@ class DataEngine:
                 warnings.append("DEGRADED: observado de emergencia")
             else:
                 warnings.append("saldo real del maestro no disponible")
-        if view != "REAL" and source == "SIN_DATOS_REALES" and not observed.empty:
+        if source == "SIN DATOS REALES" and not observed.empty:
             source = "OBSERVADO_FALLBACK"
             saldo_actual = float(observed["equity"].iloc[-1])
             last_update = observed["timestamp"].iloc[-1]
             real_series = observed
-        if view != "REAL" and source == "SIN_DATOS_REALES" and not estimated.empty:
+        if source == "SIN DATOS REALES" and not estimated.empty:
             source = "ESTIMADO_EMERGENCIA"
             saldo_actual = float(estimated["equity"].iloc[-1])
             last_update = estimated["timestamp"].iloc[-1]
