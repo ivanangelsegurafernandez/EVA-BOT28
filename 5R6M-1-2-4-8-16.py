@@ -36,7 +36,7 @@ import os, csv, time, random, asyncio, json, re
 from collections import deque
 from unicodedata import normalize
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 import sys
 import shutil
@@ -2199,6 +2199,7 @@ def _ensure_dir(p):
         print(f"⚠️ Falló creación de dir {p}: {e}")
 
 def _atomic_write(path: str, text: str):
+    _ensure_dir(os.path.dirname(path) or ".")
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
@@ -2213,18 +2214,16 @@ def path_orden(bot: str) -> str:
 SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
 SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
-SALDO_LIVE_SHARED_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))))
-SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_LIVE_HISTORY_SHARED_PATH", os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE))))
-SALDO_SERIES_CSV_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_SERIES_CSV_PATH", os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_SERIES_CSV_FILE))))
+SALDO_FEED_DIR = os.path.abspath(os.path.expanduser(os.getenv("SALDO_FEED_DIR", os.path.join(os.path.expanduser("~"), "saldo_feed_5r6m"))))
+SALDO_LIVE_SHARED_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(SALDO_FEED_DIR, SALDO_LIVE_FILE))))
+SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_LIVE_HISTORY_SHARED_PATH", os.path.join(SALDO_FEED_DIR, SALDO_LIVE_HISTORY_FILE))))
+SALDO_SERIES_CSV_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_SERIES_CSV_PATH", os.path.join(SALDO_FEED_DIR, SALDO_SERIES_CSV_FILE))))
 
 def _saldo_feed_targets() -> dict:
-    local_live = os.path.abspath(os.path.join(script_dir, SALDO_LIVE_FILE))
-    local_hist = os.path.abspath(os.path.join(script_dir, SALDO_LIVE_HISTORY_FILE))
-    local_csv = os.path.abspath(os.path.join(script_dir, SALDO_SERIES_CSV_FILE))
     return {
-        "live": [local_live, SALDO_LIVE_SHARED_PATH],
-        "history": [local_hist, SALDO_LIVE_HISTORY_SHARED_PATH],
-        "series": [local_csv, SALDO_SERIES_CSV_PATH],
+        "live": [SALDO_LIVE_SHARED_PATH],
+        "history": [SALDO_LIVE_HISTORY_SHARED_PATH],
+        "series": [SALDO_SERIES_CSV_PATH],
     }
 
 def _append_line_safe(path: str, line: str):
@@ -2301,40 +2300,34 @@ def _append_series_csv_if_new(path: str, ts_iso: str, val: float, source: str):
 def _update_saldo_monitor_feed(valor_saldo: float):
     try:
         val = float(valor_saldo)
-    except Exception:
-        return
-    now = float(time.time())
-    ts_iso = datetime.now(timezone.utc).isoformat()
-    payload_live = {
-        "saldo_real": val,
-        "equity": val,
-        "balance": val,
-        "timestamp": ts_iso,
-        "ts": now,
-        "source": "MAESTRO_5R6M",
-    }
-    payload_hist = {
-        "timestamp": ts_iso,
-        "equity": val,
-        "saldo_real": val,
-        "balance": val,
-        "source": "MAESTRO_5R6M",
-    }
-    for p in dict.fromkeys(_saldo_feed_targets()["live"]):
-        try:
+        now = float(time.time())
+        ts_iso = datetime.now(timezone.utc).isoformat()
+        payload_live = {
+            "saldo_real": val,
+            "equity": val,
+            "balance": val,
+            "timestamp": ts_iso,
+            "ts": now,
+            "source": "MAESTRO_5R6M",
+        }
+        payload_hist = {
+            "timestamp": ts_iso,
+            "equity": val,
+            "saldo_real": val,
+            "balance": val,
+            "source": "MAESTRO_5R6M",
+        }
+        for p in dict.fromkeys(_saldo_feed_targets()["live"]):
             _atomic_write(p, json.dumps(payload_live, ensure_ascii=False))
-        except Exception:
-            pass
-    for p in dict.fromkeys(_saldo_feed_targets()["history"]):
-        try:
+        for p in dict.fromkeys(_saldo_feed_targets()["history"]):
             _append_line_safe(p, json.dumps(payload_hist, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-    for p in dict.fromkeys(_saldo_feed_targets()["series"]):
-        try:
+        for p in dict.fromkeys(_saldo_feed_targets()["series"]):
             _append_series_csv_if_new(p, ts_iso, val, "MAESTRO_5R6M")
-        except Exception:
-            pass
+        print(f"[SALDO FEED][OK] saldo={val:.2f} ts={ts_iso}")
+        return True
+    except Exception as e:
+        print(f"[SALDO FEED][ERROR] {e}")
+        return False
 # === /SALDO LIVE FEED ===
 
 # === LXV_SYNC_COLUMN: sincronización de ronda/columna maestro↔bots ===
@@ -15898,10 +15891,7 @@ async def obtener_saldo_real():
             if "balance" in resp:
                 saldo_real = f"{resp['balance']['balance']:.2f}"
                 ULTIMA_ACT_SALDO = time.time()
-                try:
-                    _update_saldo_monitor_feed(float(resp["balance"]["balance"]))
-                except Exception:
-                    pass
+                _update_saldo_monitor_feed(float(resp["balance"]["balance"]))
     except Exception as e:
         print(f"⚠️ Error obteniendo saldo: {e}")
 
