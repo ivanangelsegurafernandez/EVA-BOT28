@@ -2282,6 +2282,11 @@ SYNC_ROUND_DIR = "sync_round"
 SYNC_ROUND_STATE_PATH = os.path.join(SYNC_ROUND_DIR, "state.json")
 TTL_ACK_SYNC_ROUND_S = 300.0
 ACK_SYNC_ROUND_FUTURE_DRIFT_S = 20.0
+LXV_SYNC_ROUND_FAILSAFE_ENABLE = True
+LXV_SYNC_ROUND_MAX_WAIT_S = 240.0
+LXV_SYNC_BOT_STALE_S = 120.0
+LXV_SYNC_PENDING_MAX_WAIT_S = 240.0
+LXV_SYNC_MIN_CLOSED_FOR_EVAL = 4
 _SYNC_ROUND_LAST_ANNOUNCED = None
 _SYNC_ROUND_LAST_CLOSED_COUNT = {}
 _LXV_LAST_EMITTED_ROUND = 0
@@ -2321,6 +2326,7 @@ def _sync_round_bootstrap_state(force: bool = False):
         "completed": False,
         "status": "running",
         "reason": "boot",
+        "started_at": time.time(),
         "ts": time.time(),
     }
     _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
@@ -2425,6 +2431,12 @@ def _sync_round_tick_maestro():
         released_round = max(1, int(st.get("released_round", round_id) or round_id))
     except Exception:
         released_round = round_id
+    try:
+        started_at = float(st.get("started_at", 0.0) or 0.0)
+    except Exception:
+        started_at = 0.0
+    if started_at <= 0.0:
+        started_at = float(time.time())
 
     expected = st.get("expected_bots")
     if not isinstance(expected, list) or not expected:
@@ -2490,12 +2502,35 @@ def _sync_round_tick_maestro():
         }
 
     n_closed = len(closed)
+    missing = [b for b in expected if b not in closed]
+    now_ts = float(time.time())
+    wait_s = max(0.0, now_ts - float(started_at))
+    stale_ignored = []
+    if bool(LXV_SYNC_ROUND_FAILSAFE_ENABLE) and missing:
+        for bot in missing:
+            ack_bot = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
+            st_bot = estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}
+            last_seen = float(ack_bot.get("last_seen_ts", st_bot.get("sync_last_seen_ts", st_bot.get("last_seen_ts", 0.0))) or 0.0)
+            ack_ts_any = float(ack_bot.get("ts", 0.0) or 0.0)
+            pending = bool(st_bot.get("pending_contract_resolution", False) or ack_bot.get("pending_contract_resolution", False))
+            pending_since = float(st_bot.get("pending_since_ts", 0.0) or 0.0)
+            pending_old = bool(pending and pending_since > 0 and (now_ts - pending_since) >= float(LXV_SYNC_PENDING_MAX_WAIT_S))
+            stale_seen = bool(last_seen > 0 and (now_ts - last_seen) >= float(LXV_SYNC_BOT_STALE_S))
+            stale_ack = bool(ack_ts_any > 0 and (now_ts - ack_ts_any) >= float(TTL_ACK_SYNC_ROUND_S))
+            timed_out = bool(wait_s >= float(LXV_SYNC_ROUND_MAX_WAIT_S))
+            if stale_seen or stale_ack or pending_old or timed_out:
+                stale_ignored.append(bot)
+
+    effective_expected = [b for b in expected if b not in stale_ignored] if stale_ignored else list(expected)
+    effective_need = max(1, len(effective_expected))
     prev_n = int(_SYNC_ROUND_LAST_CLOSED_COUNT.get(round_id, -1))
     if n_closed != prev_n:
         _SYNC_ROUND_LAST_CLOSED_COUNT[round_id] = n_closed
         agregar_evento(f"🧩 LXV_SYNC_COLUMN cierres ronda #{round_id}: {n_closed}/{len(expected)}.")
 
-    completed = bool(n_closed >= len(expected))
+    completed_normal = bool(n_closed >= len(expected))
+    completed_failsafe = bool(stale_ignored and n_closed >= effective_need)
+    completed = bool(completed_normal or completed_failsafe)
     next_round = round_id + 1 if completed else round_id
     next_released = max(released_round, next_round if completed else released_round)
 
@@ -2503,19 +2538,29 @@ def _sync_round_tick_maestro():
         "round_id": next_round if completed else round_id,
         "released_round": next_released,
         "expected_bots": expected,
+        "expected_bots_effective": effective_expected,
         "closed_bots": closed,
         "completed": completed,
-        "status": "released" if completed else "waiting_closures",
-        "reason": "all_bots_closed" if completed else "waiting_bots",
+        "status": "released_failsafe" if completed_failsafe else ("released" if completed else "waiting_closures"),
+        "reason": "failsafe_stale_or_timeout" if completed_failsafe else ("all_bots_closed" if completed else "waiting_bots"),
+        "bots_missing": missing,
+        "bots_stale_ignored": stale_ignored,
+        "round_wait_s": float(wait_s),
+        "started_at": float(time.time()) if completed else float(started_at),
         "ts": time.time(),
     }
     _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
 
     if completed:
+        if completed_failsafe and stale_ignored:
+            agregar_evento(f"🟠 LXV_SYNC_COLUMN failsafe: liberando ronda #{round_id} sin {stale_ignored} por stale/timeout.")
         agregar_evento(f"✅ LXV_SYNC_COLUMN columna/ronda #{round_id} COMPLETA.")
         agregar_evento(f"🚀 LXV_SYNC_COLUMN ronda #{next_round} LIBERADA.")
         snapshot = _lxv_round_snapshot(round_id, closed)
-        pick, patron, motivo = _lxv_evaluar_columna(round_id, snapshot)
+        if len(snapshot) < int(LXV_SYNC_MIN_CLOSED_FOR_EVAL):
+            pick, patron, motivo = None, f"{len([x for x in snapshot if x.get('resultado') == 'GANANCIA'])}V/{len([x for x in snapshot if x.get('resultado') == 'PÉRDIDA'])}X", "masa mínima insuficiente para evaluar LXV_REAL"
+        else:
+            pick, patron, motivo = _lxv_evaluar_columna(round_id, snapshot)
         if pick:
             bot_pick = str(pick.get("bot"))
             ciclo_pick = int(pick.get("ciclo", estado_bots.get(bot_pick, {}).get("ciclo_actual", 1)) or 1)

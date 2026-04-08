@@ -624,7 +624,10 @@ def _extract_close_snapshot(velas, n: int = 20):
                 c = v
             try:
                 cf = float(c)
-                closes.append(cf if math.isfinite(cf) else None)
+                if math.isfinite(cf):
+                    closes.append(cf)
+                else:
+                    closes.append(None)
             except Exception:
                 closes.append(None)
         while len(closes) < int(n):
