@@ -102,6 +102,13 @@ OBSERVED_TAIL_BYTES = int(os.getenv("OBSERVED_TAIL_BYTES", str(256 * 1024)))
 ESTIMATED_REFRESH_SECONDS = int(os.getenv("ESTIMATED_REFRESH_SECONDS", "30"))
 MASTER_LIVE_STALE_SECONDS = int(os.getenv("MASTER_LIVE_STALE_SECONDS", "90"))
 MASTER_DELTA_WARN_USD = float(os.getenv("MASTER_DELTA_WARN_USD", "1.0"))
+REAL_CANONICAL_SOURCES = {
+    "MAESTRO_5R6M",
+    "MAESTRO_LIVE",
+    "MAESTRO_HISTORY",
+    "MAESTRO_HISTORY_DEGRADED",
+    "MAESTRO_SERIES_CANONICAL",
+}
 
 def _main_window_seconds() -> int:
     """
@@ -309,6 +316,34 @@ class DataEngine:
         self._series_lock_warn_ts: float = 0.0
         self._series_repair_sig: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
         self._series_ensure_notice_once: Optional[str] = None
+        self._last_series_filter_stats: Dict[str, int] = {"valid": 0, "discarded": 0}
+
+    @staticmethod
+    def _normalize_source_label(source: Optional[str]) -> str:
+        s = str(source or "").strip().upper()
+        if not s:
+            return ""
+        if s == "FUENTE_SALDO":
+            return ""
+        return s
+
+    def _is_canonical_real_source(self, source: Optional[str]) -> bool:
+        src = self._normalize_source_label(source)
+        return bool(src) and src in REAL_CANONICAL_SOURCES
+
+    def _source_rank(self, source: Optional[str]) -> int:
+        src = self._normalize_source_label(source)
+        if src == "MAESTRO_5R6M":
+            return 5
+        if src == "MAESTRO_LIVE":
+            return 4
+        if src == "MAESTRO_HISTORY":
+            return 3
+        if src == "MAESTRO_HISTORY_DEGRADED":
+            return 2
+        if src == "MAESTRO_SERIES_CANONICAL":
+            return 1
+        return 0
 
     @staticmethod
     def _sig(paths: List[Path]) -> Tuple:
@@ -401,21 +436,15 @@ class DataEngine:
 
     def _read_last_series_row(self, path: Path) -> Optional[Tuple[str, float, str]]:
         try:
-            if not path.exists() or path.stat().st_size <= 0:
+            d = self._normalize_saldo_series_csv(path)
+            if d.empty:
                 return None
-            lines = self._read_tail_lines(path, 32 * 1024)
-            for raw in reversed(lines):
-                row = [c.strip() for c in raw.split(",")]
-                if len(row) < 2:
-                    continue
-                if row[0].lower() in ("timestamp", "ts_utc"):
-                    continue
-                ts_iso = self._ts_utc_iso(row[0])
-                eq = self._normalize_equity_value(row[1])
-                if ts_iso is None or eq is None:
-                    continue
-                src = row[2] if len(row) >= 3 and row[2] else "MONITOR_BACKFILL"
-                return (ts_iso, eq, str(src))
+            row = d.iloc[-1]
+            ts_iso = self._ts_utc_iso(row.get("timestamp"))
+            eq = self._normalize_equity_value(row.get("equity"))
+            src = self._normalize_source_label(row.get("source")) or "MAESTRO_SERIES_CANONICAL"
+            if ts_iso is not None and eq is not None:
+                return (ts_iso, eq, src)
         except Exception:
             return None
         return None
@@ -453,26 +482,30 @@ class DataEngine:
                     os.fsync(fh.fileno())
                 return f"{SALDO_SERIES_CSV_FILE} sin contenido; cabecera restaurada en {path}"
             head = [c.strip().lower() for c in lines[0].split(",")]
-            valid_header = len(head) >= 2 and head[0] in ("timestamp", "ts_utc") and head[1] in ("equity", "saldo_real")
+            is_basic_header = len(head) >= 3 and head[0] in ("timestamp", "ts_utc") and head[1] == "equity"
+            is_extended_header = ("ts_epoch" in head and "ts_iso" in head and "saldo_real" in head and "fuente_saldo" in head)
+            valid_header = is_basic_header or is_extended_header
             if valid_header:
                 return None
-            rescued: List[Tuple[str, float, str]] = []
-            for raw in lines:
-                row = [c.strip() for c in raw.split(",")]
-                if len(row) < 2:
-                    continue
-                if row[0].lower() in ("timestamp", "ts_utc"):
-                    continue
-                ts_iso = self._ts_utc_iso(row[0])
-                eq = self._normalize_equity_value(row[1])
-                if ts_iso is None or eq is None:
-                    continue
-                src = row[2] if len(row) >= 3 and row[2] else "SERIES_RESCUE"
-                rescued.append((ts_iso, eq, src))
+            normalized = self._normalize_saldo_series_csv(path)
+            valid_n = int(len(normalized))
+            discarded_n = int(self._last_series_filter_stats.get("discarded", 0))
+            if normalized.empty:
+                return f"{SALDO_SERIES_CSV_FILE} recreado limpio tras corrupción de cabecera/contenido"
             tmp = path.with_suffix(path.suffix + ".repair.tmp")
+            bak = path.with_suffix(path.suffix + ".repair.bak")
+            try:
+                os.replace(path, bak)
+            except Exception:
+                bak = None
             with tmp.open("w", encoding="utf-8", newline="") as fh:
                 fh.write("timestamp,equity,source\n")
-                for ts_iso, eq, src in rescued:
+                for _, row in normalized.iterrows():
+                    ts_iso = self._ts_utc_iso(row.get("timestamp"))
+                    eq = self._normalize_equity_value(row.get("equity"))
+                    src = self._normalize_source_label(row.get("source")) or "MAESTRO_SERIES_CANONICAL"
+                    if ts_iso is None or eq is None:
+                        continue
                     fh.write(f"{ts_iso},{eq:.8f},{src}\n")
                 fh.flush()
                 os.fsync(fh.fileno())
@@ -482,9 +515,12 @@ class DataEngine:
                 self._series_repair_sig[key] = (int(st.st_mtime_ns), int(st.st_size))
             except Exception:
                 self._series_repair_sig[key] = (None, None)
-            if rescued:
-                return f"{SALDO_SERIES_CSV_FILE} reparado de forma conservadora (rescatadas {len(rescued)} filas)"
-            return f"{SALDO_SERIES_CSV_FILE} recreado limpio tras corrupción de cabecera/contenido"
+            if bak is not None:
+                return (
+                    f"Series CSV saneado: {valid_n} filas válidas conservadas / {discarded_n} descartadas "
+                    f"(backup: {bak})"
+                )
+            return f"Series CSV saneado: {valid_n} filas válidas conservadas / {discarded_n} descartadas"
         except Exception as e:
             return f"No se pudo reparar {SALDO_SERIES_CSV_FILE} en {path}: {e}"
         finally:
@@ -499,7 +535,9 @@ class DataEngine:
         eq = self._normalize_equity_value(equity)
         if ts_iso is None or eq is None:
             return None
-        src = str(source or "MONITOR_BACKFILL").strip() or "MONITOR_BACKFILL"
+        src = self._normalize_source_label(source)
+        if not self._is_canonical_real_source(src):
+            return f"Bloqueadas filas source={src or 'VACIO'} para saldo REAL"
         fp = (ts_iso, f"{eq:.8f}")
         if self._series_last_fingerprint == fp:
             return None
@@ -573,16 +611,11 @@ class DataEngine:
             eq = self._normalize_equity_value(row.get("equity"))
             if ts_iso and eq is not None:
                 return (ts_iso, eq, "MAESTRO_HISTORY")
-        if not series_csv.empty:
-            row = series_csv.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "SERIE_CSV_DEGRADED")
         ts_iso = self._ts_utc_iso(last_update)
         eq = self._normalize_equity_value(saldo_actual)
-        if ts_iso and eq is not None and source in ("MAESTRO_LIVE", "MAESTRO_HISTORY", "SERIE_CSV_DEGRADED"):
-            return (ts_iso, eq, source)
+        src = self._normalize_source_label(source)
+        if ts_iso and eq is not None and self._is_canonical_real_source(src):
+            return (ts_iso, eq, src)
         return None
 
     def _cached(self, key: str, sig: Tuple):
@@ -744,8 +777,14 @@ class DataEngine:
                     warnings.append(repair_msg)
                 d = self._normalize_saldo_series_csv(p)
                 if d.empty:
+                    discarded_n = int(self._last_series_filter_stats.get("discarded", 0))
+                    if discarded_n > 0:
+                        warnings.append(f"REAL filtrado: descartadas {discarded_n} filas degradadas del series_csv")
                     continue
-                d = d.sort_values("timestamp").drop_duplicates(subset=["timestamp", "equity"], keep="last")
+                d = d.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+                discarded_n = int(self._last_series_filter_stats.get("discarded", 0))
+                if discarded_n > 0:
+                    warnings.append(f"REAL filtrado: descartadas {discarded_n} filas degradadas del series_csv")
                 last_ts = pd.to_datetime(d["timestamp"].iloc[-1], errors="coerce", utc=True)
                 if pd.isna(last_ts):
                     continue
@@ -768,58 +807,91 @@ class DataEngine:
             if msg:
                 warnings.append(msg)
         err = " | ".join(warnings[-3:]) if warnings else None
-        return self._store_cache("series_csv", sig, (pd.DataFrame(columns=["timestamp", "equity"]), err, None))
+        return self._store_cache("series_csv", sig, (pd.DataFrame(columns=["timestamp", "equity", "source"]), err, None))
 
     def _normalize_saldo_series_csv(self, path: Path) -> pd.DataFrame:
-        rows: List[Tuple[datetime, float]] = []
+        rows: List[Tuple[datetime, float, str]] = []
+        discarded = 0
         with path.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
             reader = csv.reader(fh)
+            headers: List[str] = []
             for raw in reader:
                 if not raw:
                     continue
                 row = [str(c).strip() for c in raw]
                 if not row:
                     continue
-                if row[0].lower() in ("ts_utc", "timestamp"):
+                low0 = row[0].lower()
+                if not headers and any(("timestamp" in c.lower() or "ts_iso" in c.lower() or "ts_epoch" in c.lower()) for c in row):
+                    headers = [c.strip().lower() for c in row]
                     continue
-                ts_utc = None
-                epoch = None
-                saldo_real = None
-                equity = None
-                if len(row) >= 8:
-                    ts_utc, _ts_lima, epoch, saldo_real, equity = row[0], row[1], row[2], row[3], row[4]
-                elif len(row) == 3:
-                    ts_utc, c1, c2 = row[0], row[1], row[2]
-                    epoch_probe = pd.to_numeric(c1, errors="coerce")
-                    if np.isfinite(epoch_probe) and float(epoch_probe) >= 1_000_000_000:
-                        # formato torcido: timestamp,epoch,equity
-                        epoch = c1
-                        equity = c2
-                        saldo_real = c2
+                if low0 in ("ts_utc", "timestamp", "ts_epoch"):
+                    continue
+                payload = {}
+                if headers and len(headers) >= len(row):
+                    payload = {headers[i]: row[i] for i in range(len(row))}
+                ts_iso_raw = payload.get("ts_iso") or payload.get("timestamp") or payload.get("ts_utc")
+                epoch_raw = payload.get("ts_epoch") or payload.get("epoch")
+                saldo_real_raw = payload.get("saldo_real")
+                saldo_total_raw = payload.get("saldo_total")
+                equity_raw = payload.get("equity")
+                source_raw = payload.get("fuente_saldo") or payload.get("source")
+
+                if not payload:
+                    if len(row) == 3:
+                        ts_iso_raw, c1, c2 = row[0], row[1], row[2]
+                        epoch_probe = pd.to_numeric(c1, errors="coerce")
+                        if np.isfinite(epoch_probe) and float(epoch_probe) >= 1_000_000_000:
+                            epoch_raw = c1
+                            equity_raw = c2
+                            saldo_real_raw = c2
+                            source_raw = "MAESTRO_HISTORY_DEGRADED"
+                        else:
+                            equity_raw = c1
+                            saldo_real_raw = c1
+                            source_raw = c2
+                    elif len(row) >= 10:
+                        epoch_raw = row[0]
+                        ts_iso_raw = row[1]
+                        saldo_real_raw = row[6] if len(row) > 6 else None
+                        saldo_total_raw = row[8] if len(row) > 8 else None
+                        source_raw = row[9] if len(row) > 9 else None
+                    elif len(row) >= 4:
+                        ts_iso_raw, epoch_raw, saldo_real_raw = row[0], row[1], row[2]
+                        equity_raw = row[3] if len(row) >= 4 else None
+                        source_raw = row[4] if len(row) >= 5 else "MAESTRO_HISTORY_DEGRADED"
                     else:
-                        # formato sano: timestamp,equity,source
-                        equity = c1
-                        saldo_real = c1
-                elif len(row) >= 4:
-                    ts_utc, epoch, saldo_real = row[0], row[1], row[2]
-                    equity = saldo_real
-                else:
-                    continue
-                ts = pd.to_datetime(ts_utc, errors="coerce", utc=True)
+                        discarded += 1
+                        continue
+
+                ts = pd.to_datetime(ts_iso_raw, errors="coerce", utc=True)
                 if pd.isna(ts):
-                    ts = pd.to_datetime(pd.to_numeric(epoch, errors="coerce"), unit="s", errors="coerce", utc=True)
+                    ts = pd.to_datetime(pd.to_numeric(epoch_raw, errors="coerce"), unit="s", errors="coerce", utc=True)
                 if pd.isna(ts):
+                    discarded += 1
                     continue
-                eq = pd.to_numeric(equity, errors="coerce")
+                eq = pd.to_numeric(saldo_real_raw, errors="coerce")
                 if not np.isfinite(eq):
-                    eq = pd.to_numeric(saldo_real, errors="coerce")
+                    eq = pd.to_numeric(equity_raw, errors="coerce")
+                if not np.isfinite(eq) and CUENTA_OBJETIVO == "REAL":
+                    eq = pd.to_numeric(saldo_total_raw, errors="coerce")
                 if not np.isfinite(eq):
+                    discarded += 1
                     continue
-                rows.append((ts.to_pydatetime(), float(eq)))
+                src = self._normalize_source_label(source_raw) or "MAESTRO_SERIES_CANONICAL"
+                if not self._is_canonical_real_source(src):
+                    discarded += 1
+                    continue
+                rows.append((ts.to_pydatetime(), float(eq), src))
         if not rows:
-            return pd.DataFrame(columns=["timestamp", "equity"])
-        out = pd.DataFrame(rows, columns=["timestamp", "equity"])
-        out = out.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+            self._last_series_filter_stats = {"valid": 0, "discarded": discarded}
+            return pd.DataFrame(columns=["timestamp", "equity", "source"])
+        out = pd.DataFrame(rows, columns=["timestamp", "equity", "source"])
+        out["source_rank"] = out["source"].map(self._source_rank).fillna(0).astype(int)
+        out = out.sort_values(["timestamp", "source_rank", "equity"], ascending=[True, False, False])
+        out = out.drop_duplicates(subset=["timestamp"], keep="first")
+        out = out.sort_values("timestamp")
+        self._last_series_filter_stats = {"valid": int(len(out)), "discarded": int(discarded)}
         return out.reset_index(drop=True)
 
     def _check_history_growth(self, path: Path, valid_rows: int) -> Optional[str]:
@@ -988,8 +1060,8 @@ class DataEngine:
         hist, hist_msg, hist_path_used, hist_growth_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None, None)
         series_csv, series_msg, series_path_used = self._read_saldo_series_csv() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None)
         real_primary_ok = view == "REAL" and (master is not None or not hist.empty or not series_csv.empty)
-        observed = self._parse_observed(view) if (view != "REAL" or not real_primary_ok) else pd.DataFrame(columns=["timestamp", "equity"])
-        estimated = self._build_estimated(view) if (view != "REAL" or not real_primary_ok) else self._est_last_value.get(view, pd.DataFrame(columns=["timestamp", "equity"]))
+        observed = self._parse_observed(view) if view != "REAL" else pd.DataFrame(columns=["timestamp", "equity"])
+        estimated = self._build_estimated(view) if view != "REAL" else self._est_last_value.get(view, pd.DataFrame(columns=["timestamp", "equity"]))
 
         if master_msg and view == "REAL":
             warnings.append(master_msg)
@@ -1048,18 +1120,27 @@ class DataEngine:
         if view == "REAL":
             frames = []
             if not hist.empty:
-                frames.append(hist[["timestamp", "equity"]].copy())
+                h2 = hist[["timestamp", "equity"]].copy()
+                h2["source"] = "MAESTRO_HISTORY"
+                frames.append(h2)
             if not series_csv.empty:
-                frames.append(series_csv[["timestamp", "equity"]].copy())
+                s2 = series_csv[["timestamp", "equity"]].copy()
+                s2["source"] = series_csv["source"] if "source" in series_csv.columns else "MAESTRO_SERIES_CANONICAL"
+                frames.append(s2)
             if master is not None:
                 mv, mts = master
-                frames.append(pd.DataFrame([{"timestamp": mts, "equity": mv}]))
+                frames.append(pd.DataFrame([{"timestamp": mts, "equity": mv, "source": "MAESTRO_LIVE"}]))
             if frames:
                 real_series = pd.concat(frames, ignore_index=True)
                 real_series["timestamp"] = pd.to_datetime(real_series["timestamp"], errors="coerce", utc=True)
                 real_series["equity"] = pd.to_numeric(real_series["equity"], errors="coerce")
                 real_series = real_series.dropna(subset=["timestamp", "equity"])
-                real_series = real_series.sort_values("timestamp").drop_duplicates(subset=["timestamp", "equity"], keep="last")
+                if "source" not in real_series.columns:
+                    real_series["source"] = "MAESTRO_SERIES_CANONICAL"
+                real_series["source"] = real_series["source"].map(self._normalize_source_label)
+                real_series["source_rank"] = real_series["source"].map(self._source_rank).fillna(0).astype(int)
+                real_series = real_series.sort_values(["timestamp", "source_rank"], ascending=[True, False]).drop_duplicates(subset=["timestamp"], keep="first")
+                real_series = real_series.drop(columns=["source_rank"], errors="ignore")
                 real_series = real_series.reset_index(drop=True)
 
             live_fresh = False
@@ -1073,6 +1154,7 @@ class DataEngine:
                 source = "MAESTRO_LIVE"
                 saldo_actual = mv
                 last_update = mts
+                warnings.append("REAL principal = MAESTRO_LIVE")
             else:
                 latest_hist = None if hist.empty else hist.iloc[-1]
                 latest_series = None if series_csv.empty else series_csv.iloc[-1]
@@ -1082,12 +1164,16 @@ class DataEngine:
                     source = "MAESTRO_HISTORY"
                     saldo_actual = float(latest_hist["equity"])
                     last_update = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True).to_pydatetime()
+                    warnings.append("REAL principal = MAESTRO_HISTORY")
                 elif latest_series is not None:
-                    source = "SERIE_CSV_DEGRADED"
+                    source = self._normalize_source_label(latest_series.get("source")) or "MAESTRO_SERIES_CANONICAL"
                     saldo_actual = float(latest_series["equity"])
                     last_update = pd.to_datetime(latest_series["timestamp"], errors="coerce", utc=True).to_pydatetime()
-                if master is not None and not live_fresh and source != "SIN DATOS REALES":
+                    warnings.append(f"REAL principal = {source}")
+                if master is not None and not live_fresh and source != "SIN_DATOS_REALES":
                     warnings.append("Live stale descartado como saldo principal")
+            if source == "SIN_DATOS_REALES":
+                warnings.append("SIN_DATOS_REALES: no hay fuente canónica de saldo real")
         elif not observed.empty:
             source = "OBSERVADO_FALLBACK"
             saldo_actual = float(observed["equity"].iloc[-1])
@@ -1104,12 +1190,12 @@ class DataEngine:
                 warnings.append("DEGRADED: observado de emergencia")
             else:
                 warnings.append("saldo real del maestro no disponible")
-        if source == "SIN DATOS REALES" and not observed.empty:
+        if source == "SIN_DATOS_REALES" and view != "REAL" and not observed.empty:
             source = "OBSERVADO_FALLBACK"
             saldo_actual = float(observed["equity"].iloc[-1])
             last_update = observed["timestamp"].iloc[-1]
             real_series = observed
-        if source == "SIN DATOS REALES" and not estimated.empty:
+        if source == "SIN_DATOS_REALES" and view != "REAL" and not estimated.empty:
             source = "ESTIMADO_EMERGENCIA"
             saldo_actual = float(estimated["equity"].iloc[-1])
             last_update = estimated["timestamp"].iloc[-1]
