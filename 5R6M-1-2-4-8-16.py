@@ -2213,18 +2213,16 @@ def path_orden(bot: str) -> str:
 SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
 SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
-SALDO_LIVE_SHARED_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))))
-SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_LIVE_HISTORY_SHARED_PATH", os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE))))
-SALDO_SERIES_CSV_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_SERIES_CSV_PATH", os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_SERIES_CSV_FILE))))
+SALDO_FEED_DIR = os.path.abspath(os.path.expanduser(os.getenv("SALDO_FEED_DIR", os.path.join(os.path.expanduser("~"), "saldo_feed_5r6m"))))
+SALDO_LIVE_SHARED_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(SALDO_FEED_DIR, SALDO_LIVE_FILE))))
+SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_LIVE_HISTORY_SHARED_PATH", os.path.join(SALDO_FEED_DIR, SALDO_LIVE_HISTORY_FILE))))
+SALDO_SERIES_CSV_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_SERIES_CSV_PATH", os.path.join(SALDO_FEED_DIR, SALDO_SERIES_CSV_FILE))))
 
 def _saldo_feed_targets() -> dict:
-    local_live = os.path.abspath(os.path.join(script_dir, SALDO_LIVE_FILE))
-    local_hist = os.path.abspath(os.path.join(script_dir, SALDO_LIVE_HISTORY_FILE))
-    local_csv = os.path.abspath(os.path.join(script_dir, SALDO_SERIES_CSV_FILE))
     return {
-        "live": [local_live, SALDO_LIVE_SHARED_PATH],
-        "history": [local_hist, SALDO_LIVE_HISTORY_SHARED_PATH],
-        "series": [local_csv, SALDO_SERIES_CSV_PATH],
+        "live": [SALDO_LIVE_SHARED_PATH],
+        "history": [SALDO_LIVE_HISTORY_SHARED_PATH],
+        "series": [SALDO_SERIES_CSV_PATH],
     }
 
 def _append_line_safe(path: str, line: str):
