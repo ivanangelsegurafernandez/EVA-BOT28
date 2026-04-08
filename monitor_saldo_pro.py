@@ -316,7 +316,7 @@ class DataEngine:
         return tuple(sig)
 
     def _master_live_candidates(self) -> List[Path]:
-        cands: List[Path] = [Path(SALDO_LIVE_SHARED_PATH).expanduser()]
+        cands: List[Path] = [Path(SALDO_LIVE_SHARED_PATH).expanduser(), self.base_dir / SALDO_LIVE_FILE]
         if SALDO_LIVE_PATH:
             custom = Path(SALDO_LIVE_PATH).expanduser()
             cands.append(custom / SALDO_LIVE_FILE if custom.is_dir() else custom)

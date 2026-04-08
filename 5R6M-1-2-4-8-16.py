@@ -272,6 +272,8 @@ IA_METRIC_THRESHOLD = AUTO_REAL_THR_MIN
 # Mantiene lock de un solo bot en REAL y ciclo martingala global en HUD.
 REAL_CLASSIC_GATE = True
 MODO_PURIFICACION_REAL = True  # Llave maestra: bypassea toda promoción/activación REAL sin apagar IA/HUD.
+LXV_SYNC_REAL_ROUTE_ENABLE = True
+LXV_SYNC_REAL_SOURCE = "LXV_SYNC"
 
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
@@ -622,6 +624,9 @@ def _pattern_v1_log_bot(bot: str, pattern_score: float, bonus_dual: float, penal
 def _purificacion_real_activa() -> bool:
     """Llave maestra centralizada para apagar capa REAL sin romper flujo IA/HUD."""
     try:
+        route_src = str(globals().get("_REAL_ROUTE_SOURCE", "") or "").strip().upper()
+        if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and route_src == str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper():
+            return False
         return bool(globals().get("MODO_PURIFICACION_REAL", False))
     except Exception:
         return False
@@ -1259,6 +1264,10 @@ estado_bots = {
         "ia_pattern_col_bonus": 0.0,
         "ia_pattern_col_penal": 0.0,
         "ia_pattern_col_delta": 0.0,
+        "sync_wait": False,
+        "last_sync_round": 1,
+        "last_seen_ts": 0.0,
+        "estado_visual": "ACTIVO",
     }
     for bot in BOT_NAMES
 }
@@ -2200,6 +2209,384 @@ def path_orden(bot: str) -> str:
     _ensure_dir(ORDEN_DIR)
     return os.path.join(ORDEN_DIR, f"{bot}.json")
 
+# === SALDO LIVE FEED (maestro -> monitor_saldo_pro) ===
+SALDO_LIVE_FILE = "saldo_real_live.json"
+SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
+SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
+SALDO_LIVE_SHARED_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))))
+SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_LIVE_HISTORY_SHARED_PATH", os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE))))
+SALDO_SERIES_CSV_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_SERIES_CSV_PATH", os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_SERIES_CSV_FILE))))
+
+def _saldo_feed_targets() -> dict:
+    local_live = os.path.abspath(os.path.join(script_dir, SALDO_LIVE_FILE))
+    local_hist = os.path.abspath(os.path.join(script_dir, SALDO_LIVE_HISTORY_FILE))
+    local_csv = os.path.abspath(os.path.join(script_dir, SALDO_SERIES_CSV_FILE))
+    return {
+        "live": [local_live, SALDO_LIVE_SHARED_PATH],
+        "history": [local_hist, SALDO_LIVE_HISTORY_SHARED_PATH],
+        "series": [local_csv, SALDO_SERIES_CSV_PATH],
+    }
+
+def _append_line_safe(path: str, line: str):
+    try:
+        _ensure_dir(os.path.dirname(path) or ".")
+    except Exception:
+        pass
+    tmp_lock = f"{os.path.basename(path)}.lock"
+    with file_lock_required(tmp_lock, timeout=2.0, stale_after=20.0) as got:
+        if not got:
+            return
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+
+def _update_saldo_monitor_feed(valor_saldo: float):
+    try:
+        val = float(valor_saldo)
+    except Exception:
+        return
+    now = float(time.time())
+    ts_iso = datetime.now(timezone.utc).isoformat()
+    payload_live = {
+        "saldo_real": val,
+        "equity": val,
+        "balance": val,
+        "timestamp": ts_iso,
+        "ts": now,
+        "source": "MAESTRO_5R6M",
+    }
+    payload_hist = {"timestamp": ts_iso, "equity": val, "source": "MAESTRO_5R6M"}
+    csv_line = f"{ts_iso},{val:.2f},MAESTRO_5R6M\n"
+    for p in dict.fromkeys(_saldo_feed_targets()["live"]):
+        try:
+            _atomic_write(p, json.dumps(payload_live, ensure_ascii=False))
+        except Exception:
+            pass
+    for p in dict.fromkeys(_saldo_feed_targets()["history"]):
+        try:
+            _append_line_safe(p, json.dumps(payload_hist, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+    for p in dict.fromkeys(_saldo_feed_targets()["series"]):
+        try:
+            if not os.path.exists(p):
+                _append_line_safe(p, "timestamp,equity,source\n")
+            _append_line_safe(p, csv_line)
+        except Exception:
+            pass
+# === /SALDO LIVE FEED ===
+
+# === LXV_SYNC_COLUMN: sincronización de ronda/columna maestro↔bots ===
+SYNC_ROUND_DIR = "sync_round"
+SYNC_ROUND_STATE_PATH = os.path.join(SYNC_ROUND_DIR, "state.json")
+TTL_ACK_SYNC_ROUND_S = 300.0
+ACK_SYNC_ROUND_FUTURE_DRIFT_S = 20.0
+LXV_SYNC_ROUND_FAILSAFE_ENABLE = True
+LXV_SYNC_ROUND_MAX_WAIT_S = 240.0
+LXV_SYNC_BOT_STALE_S = 120.0
+LXV_SYNC_PENDING_MAX_WAIT_S = 240.0
+LXV_SYNC_MIN_CLOSED_FOR_EVAL = 4
+_SYNC_ROUND_LAST_ANNOUNCED = None
+_SYNC_ROUND_LAST_CLOSED_COUNT = {}
+_LXV_LAST_EMITTED_ROUND = 0
+_SYNC_PENDING_WARN_TS = {}
+_SYNC_STALE_WARN_TS = {}
+
+def _sync_round_ack_path(bot: str) -> str:
+    _ensure_dir(SYNC_ROUND_DIR)
+    return os.path.join(SYNC_ROUND_DIR, f"{bot}.json")
+
+def _sync_round_safe_read_json(path: str):
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+def _sync_round_write_json_atomic(path: str, payload: dict) -> bool:
+    try:
+        _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2))
+        return True
+    except Exception:
+        return False
+
+def _sync_round_bootstrap_state(force: bool = False):
+    _ensure_dir(SYNC_ROUND_DIR)
+    if (not force) and os.path.exists(SYNC_ROUND_STATE_PATH):
+        return
+    payload = {
+        "round_id": 1,
+        "released_round": 1,
+        "expected_bots": list(BOT_NAMES),
+        "closed_bots": {},
+        "completed": False,
+        "status": "running",
+        "reason": "boot",
+        "started_at": time.time(),
+        "ts": time.time(),
+    }
+    _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+
+def _sync_round_apply_visual_heartbeat(bot: str) -> None:
+    """
+    Mantiene señal visual de vida/standby sin releer CSV completo.
+    """
+    try:
+        if bot not in BOT_NAMES:
+            return
+        st = estado_bots.get(bot, {})
+        if not isinstance(st, dict):
+            return
+        ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
+        gstate = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+        round_id = int(gstate.get("round_id", 1) or 1)
+        released = int(gstate.get("released_round", 1) or 1)
+        wait_flag = bool(ack.get("sync_wait", False))
+        wait_round = int(ack.get("round_id", 0) or 0)
+        waiting_release = int(ack.get("waiting_release_round", wait_round + 1) or (wait_round + 1))
+        active_wait = bool(wait_flag and wait_round == round_id and released < waiting_release)
+        st["sync_wait"] = active_wait
+        st["last_sync_round"] = wait_round if wait_round > 0 else round_id
+        st["last_seen_ts"] = float(ack.get("last_seen_ts", time.time()) or time.time())
+        st["estado_visual"] = "STANDBY_RONDA" if active_wait else st.get("estado_visual", "ACTIVO")
+        # Alias visuales para evitar incompatibilidades de nombres en HUD/diagnóstico
+        st["sync_round_id"] = int(wait_round if wait_round > 0 else round_id)
+        st["sync_released_round"] = int(released)
+        st["sync_last_seen_ts"] = float(st.get("last_seen_ts", time.time()) or time.time())
+        st["sync_estado_visual"] = str(st.get("estado_visual", "ACTIVO"))
+        if active_wait:
+            last_update_time[bot] = time.time()
+    except Exception:
+        pass
+
+def _lxv_round_snapshot(round_id: int, closed: dict) -> list[dict]:
+    out = []
+    for bot in BOT_NAMES:
+        c = closed.get(bot)
+        if not isinstance(c, dict):
+            continue
+        st = estado_bots.get(bot, {})
+        out.append({
+            "bot": bot,
+            "round_id": int(round_id),
+            "resultado": str(c.get("resultado", "")).upper().strip(),
+            "ciclo": int(c.get("ciclo", st.get("ciclo_actual", 1)) or 1),
+            "asset": c.get("asset"),
+            "ts": float(c.get("ts", 0.0) or 0.0),
+            "prob_ia_oper": st.get("prob_ia_oper"),
+            "prob_ia": st.get("prob_ia"),
+            "score_senal": st.get("ia_score_hibrido", st.get("ia_regime_score")),
+            "payout": c.get("payout"),
+            "winrate": st.get("porcentaje_exito"),
+        })
+    return out
+
+def _lxv_rank_key(item: dict) -> tuple:
+    def _num(v, default=-1e9):
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+    bot = str(item.get("bot", ""))
+    order_idx = BOT_NAMES.index(bot) if bot in BOT_NAMES else 999
+    return (
+        _num(item.get("prob_ia_oper"), -1e9),
+        _num(item.get("prob_ia"), -1e9),
+        _num(item.get("score_senal"), -1e9),
+        _num(item.get("payout"), -1e9),
+        _num(item.get("winrate"), -1e9),
+        _num(item.get("ts"), -1e9),
+        -float(order_idx),
+    )
+
+def _lxv_evaluar_columna(round_id: int, snapshot: list[dict]) -> tuple[dict | None, str, str]:
+    verdes = [x for x in snapshot if x.get("resultado") == "GANANCIA"]
+    rojos = [x for x in snapshot if x.get("resultado") == "PÉRDIDA"]
+    patron = f"{len(verdes)}V/{len(rojos)}X"
+    if len(verdes) == 5 and len(rojos) == 1:
+        pick = dict(rojos[0])
+        motivo = "5 verdes / 1 X (X única)"
+        return pick, patron, motivo
+    if len(verdes) == 4 and len(rojos) == 2:
+        ranked = sorted(rojos, key=_lxv_rank_key, reverse=True)
+        pick = dict(ranked[0]) if ranked else None
+        motivo = "4 verdes / 2 X (mayor peso: prob_ia_oper > prob_ia > score > payout > winrate > ts > BOT_NAMES)"
+        return pick, patron, motivo
+    return None, patron, "patrón no válido para LXV_REAL"
+
+def _sync_round_tick_maestro():
+    global _SYNC_ROUND_LAST_ANNOUNCED, _LXV_LAST_EMITTED_ROUND
+    _sync_round_bootstrap_state(force=False)
+    st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+
+    try:
+        round_id = max(1, int(st.get("round_id", 1) or 1))
+    except Exception:
+        round_id = 1
+    try:
+        released_round = max(1, int(st.get("released_round", round_id) or round_id))
+    except Exception:
+        released_round = round_id
+    try:
+        started_at = float(st.get("started_at", 0.0) or 0.0)
+    except Exception:
+        started_at = 0.0
+    if started_at <= 0.0:
+        started_at = float(time.time())
+
+    expected = st.get("expected_bots")
+    if not isinstance(expected, list) or not expected:
+        expected = list(BOT_NAMES)
+    expected = [b for b in expected if b in BOT_NAMES]
+    if not expected:
+        expected = list(BOT_NAMES)
+
+    if _SYNC_ROUND_LAST_ANNOUNCED != round_id:
+        agregar_evento(f"🧭 LXV_SYNC_COLUMN ronda #{round_id} iniciada ({len(expected)} bots esperados).")
+        _SYNC_ROUND_LAST_ANNOUNCED = round_id
+
+    closed = {}
+    now_ts = float(time.time())
+    for bot in expected:
+        ack = _sync_round_safe_read_json(_sync_round_ack_path(bot))
+        if not isinstance(ack, dict):
+            continue
+        st_bot = estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}
+        pending_flag = bool(st_bot.get("pending_contract_resolution", False) or ack.get("pending_contract_resolution", False))
+        if pending_flag:
+            now_p = float(time.time())
+            last_p = float(_SYNC_PENDING_WARN_TS.get(bot, 0.0) or 0.0)
+            if (now_p - last_p) >= 20.0:
+                _SYNC_PENDING_WARN_TS[bot] = now_p
+                agregar_evento(f"⏳ LXV_SYNC_COLUMN: {bot} pendiente por contrato incierto; no cuenta como cierre.")
+            continue
+        try:
+            ack_round = int(ack.get("round_id", 0) or 0)
+        except Exception:
+            continue
+        if ack_round != round_id:
+            continue
+        if str(ack.get("status", "")).lower().strip() != "closed":
+            continue
+        try:
+            ack_ts = float(ack.get("ts", 0.0) or 0.0)
+        except Exception:
+            continue
+        if ack_ts <= 0:
+            continue
+        if (now_ts - ack_ts) > float(TTL_ACK_SYNC_ROUND_S):
+            last_s = float(_SYNC_STALE_WARN_TS.get(bot, 0.0) or 0.0)
+            if (now_ts - last_s) >= 20.0:
+                _SYNC_STALE_WARN_TS[bot] = now_ts
+                agregar_evento(f"🧹 LXV_SYNC_COLUMN: ACK stale ignorado para {bot}.")
+            continue
+        if ack_ts > (now_ts + float(ACK_SYNC_ROUND_FUTURE_DRIFT_S)):
+            last_s = float(_SYNC_STALE_WARN_TS.get(bot, 0.0) or 0.0)
+            if (now_ts - last_s) >= 20.0:
+                _SYNC_STALE_WARN_TS[bot] = now_ts
+                agregar_evento(f"🧹 LXV_SYNC_COLUMN: ACK con timestamp futuro ignorado para {bot}.")
+            continue
+        res = str(ack.get("resultado", "")).upper().strip()
+        if res not in ("GANANCIA", "PÉRDIDA"):
+            continue
+        closed[bot] = {
+            "resultado": res,
+            "ts": float(ack.get("ts", 0.0) or 0.0),
+            "contract_id": ack.get("contract_id"),
+            "asset": ack.get("asset"),
+            "ciclo": ack.get("ciclo"),
+        }
+
+    n_closed = len(closed)
+    missing = [b for b in expected if b not in closed]
+    now_ts = float(time.time())
+    wait_s = max(0.0, now_ts - float(started_at))
+    stale_ignored = []
+    if bool(LXV_SYNC_ROUND_FAILSAFE_ENABLE) and missing:
+        for bot in missing:
+            ack_bot = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
+            st_bot = estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}
+            last_seen = float(ack_bot.get("last_seen_ts", st_bot.get("sync_last_seen_ts", st_bot.get("last_seen_ts", 0.0))) or 0.0)
+            ack_ts_any = float(ack_bot.get("ts", 0.0) or 0.0)
+            pending = bool(st_bot.get("pending_contract_resolution", False) or ack_bot.get("pending_contract_resolution", False))
+            pending_since = float(st_bot.get("pending_since_ts", 0.0) or 0.0)
+            pending_old = bool(pending and pending_since > 0 and (now_ts - pending_since) >= float(LXV_SYNC_PENDING_MAX_WAIT_S))
+            stale_seen = bool(last_seen > 0 and (now_ts - last_seen) >= float(LXV_SYNC_BOT_STALE_S))
+            stale_ack = bool(ack_ts_any > 0 and (now_ts - ack_ts_any) >= float(TTL_ACK_SYNC_ROUND_S))
+            timed_out = bool(wait_s >= float(LXV_SYNC_ROUND_MAX_WAIT_S))
+            if stale_seen or stale_ack or pending_old or timed_out:
+                stale_ignored.append(bot)
+
+    effective_expected = [b for b in expected if b not in stale_ignored] if stale_ignored else list(expected)
+    effective_need = max(1, len(effective_expected))
+    prev_n = int(_SYNC_ROUND_LAST_CLOSED_COUNT.get(round_id, -1))
+    if n_closed != prev_n:
+        _SYNC_ROUND_LAST_CLOSED_COUNT[round_id] = n_closed
+        agregar_evento(f"🧩 LXV_SYNC_COLUMN cierres ronda #{round_id}: {n_closed}/{len(expected)}.")
+
+    completed_normal = bool(n_closed >= len(expected))
+    completed_failsafe = bool(stale_ignored and n_closed >= effective_need)
+    completed = bool(completed_normal or completed_failsafe)
+    next_round = round_id + 1 if completed else round_id
+    next_released = max(released_round, next_round if completed else released_round)
+
+    payload = {
+        "round_id": next_round if completed else round_id,
+        "released_round": next_released,
+        "expected_bots": expected,
+        "expected_bots_effective": effective_expected,
+        "closed_bots": closed,
+        "completed": completed,
+        "status": "released_failsafe" if completed_failsafe else ("released" if completed else "waiting_closures"),
+        "reason": "failsafe_stale_or_timeout" if completed_failsafe else ("all_bots_closed" if completed else "waiting_bots"),
+        "bots_missing": missing,
+        "bots_stale_ignored": stale_ignored,
+        "round_wait_s": float(wait_s),
+        "started_at": float(time.time()) if completed else float(started_at),
+        "ts": time.time(),
+    }
+    _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+
+    if completed:
+        if completed_failsafe and stale_ignored:
+            agregar_evento(f"🟠 LXV_SYNC_COLUMN failsafe: liberando ronda #{round_id} sin {stale_ignored} por stale/timeout.")
+        agregar_evento(f"✅ LXV_SYNC_COLUMN columna/ronda #{round_id} COMPLETA.")
+        agregar_evento(f"🚀 LXV_SYNC_COLUMN ronda #{next_round} LIBERADA.")
+        snapshot = _lxv_round_snapshot(round_id, closed)
+        if len(snapshot) < int(LXV_SYNC_MIN_CLOSED_FOR_EVAL):
+            pick, patron, motivo = None, f"{len([x for x in snapshot if x.get('resultado') == 'GANANCIA'])}V/{len([x for x in snapshot if x.get('resultado') == 'PÉRDIDA'])}X", "masa mínima insuficiente para evaluar LXV_REAL"
+        else:
+            pick, patron, motivo = _lxv_evaluar_columna(round_id, snapshot)
+        if pick:
+            bot_pick = str(pick.get("bot"))
+            ciclo_pick = int(pick.get("ciclo", estado_bots.get(bot_pick, {}).get("ciclo_actual", 1)) or 1)
+            agregar_evento(f"🧠 LXV columna #{round_id}: {patron} → candidato REAL {bot_pick} ({motivo}).")
+            if int(_LXV_LAST_EMITTED_ROUND or 0) != int(round_id):
+                ok_emit = emitir_real_autorizado(bot_pick, ciclo_pick, source=LXV_SYNC_REAL_SOURCE)
+                _LXV_LAST_EMITTED_ROUND = int(round_id) if ok_emit else int(_LXV_LAST_EMITTED_ROUND or 0)
+                if ok_emit:
+                    agregar_evento(f"🚨 LXV_SYNC REAL emitido: ronda #{round_id} -> {bot_pick} ciclo #{ciclo_pick}.")
+                else:
+                    agregar_evento(f"⚠️ LXV_SYNC REAL no emitido en ronda #{round_id} (lock/purificación/estado).")
+        else:
+            agregar_evento(f"ℹ️ LXV columna #{round_id}: {patron} → {motivo}.")
+        # Higiene mínima: baja "sync_wait" en bots ya contabilizados
+        for bot in closed.keys():
+            try:
+                ack_path = _sync_round_ack_path(bot)
+                ack_cur = _sync_round_safe_read_json(ack_path) or {}
+                if isinstance(ack_cur, dict):
+                    ack_cur["sync_wait"] = False
+                    ack_cur["last_seen_ts"] = time.time()
+                    _sync_round_write_json_atomic(ack_path, ack_cur)
+            except Exception:
+                pass
+# === /LXV_SYNC_COLUMN ===
+
 # === PATCH: REAL INMEDIATO EN HUD AL EMITIR ORDEN (sin esperar compra) ===
 # Objetivo:
 # - Al emitir una ORDEN manual (bot+ciclo), reservar REAL y mostrarlo YA en HUD.
@@ -2528,6 +2915,24 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
             pass
     return ok
 # === FIN PATCH REAL INMEDIATO ===
+
+def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool:
+    """
+    Ruta única de emisión REAL cuando LXV_SYNC_REAL_ROUTE_ENABLE está activo.
+    Conserva la infraestructura existente (orden_real/token/HUD), pero restringe la decisión.
+    """
+    src = str(source or "LEGACY").strip().upper()
+    allow_src = str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper()
+    if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and src != allow_src:
+        agregar_evento(f"🧊 REAL legacy congelado: source={src} bloqueado (solo {allow_src}).")
+        return False
+    prev_src = globals().get("_REAL_ROUTE_SOURCE", None)
+    globals()["_REAL_ROUTE_SOURCE"] = src
+    try:
+        return bool(escribir_orden_real(bot, int(ciclo)))
+    finally:
+        globals()["_REAL_ROUTE_SOURCE"] = prev_src
+
 # === IA ACK (handshake maestro→bot: confirma que el PRE-TRADE ya fue evaluado) ===
 IA_ACK_DIR = "ia_ack"
 _LAST_IA_ACK_HEARTBEAT_TS = 0.0
@@ -13311,7 +13716,7 @@ def forzar_real_manual(bot: str, ciclo: int):
                 pass
 
 
-        if not escribir_orden_real(bot, ciclo):
+        if not emitir_real_autorizado(bot, ciclo, source="MANUAL"):
             agregar_evento(f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL.")
             return
 
@@ -15175,6 +15580,12 @@ async def cargar_datos_bot(bot, token_actual):
         # Gate rápido (opcional): si el archivo no creció, salimos sin leer todo el CSV
         actual = contar_filas_csv(bot)
         if actual <= snapshot:
+            try:
+                _sync_round_apply_visual_heartbeat(bot)
+            except NameError:
+                pass
+            except Exception:
+                pass
             return
 
         df = pd.read_csv(ruta, encoding="utf-8", on_bad_lines="skip")
@@ -15427,6 +15838,10 @@ async def obtener_saldo_real():
             if "balance" in resp:
                 saldo_real = f"{resp['balance']['balance']:.2f}"
                 ULTIMA_ACT_SALDO = time.time()
+                try:
+                    _update_saldo_monitor_feed(float(resp["balance"]["balance"]))
+                except Exception:
+                    pass
     except Exception as e:
         print(f"⚠️ Error obteniendo saldo: {e}")
 
@@ -15790,6 +16205,7 @@ async def main():
 
         set_etapa("BOOT_04", "Sincronizando HUD con CSV")
         # Pasada inicial para sincronizar HUD con CSV existentes
+        _sync_round_bootstrap_state(force=False)
         token_actual_loop = "--"  # Dummy para carga inicial
         for bot in BOT_NAMES:
             await cargar_datos_bot(bot, token_actual_loop)
@@ -15831,6 +16247,7 @@ async def main():
                     REAL_LOCK_MISMATCH_SINCE = 0.0
                 # Heartbeat: mantiene ACK alineado al HUD aunque no entren filas nuevas ese tick.
                 refrescar_ia_ack_desde_hud(intervalo_s=1.0)
+                _sync_round_tick_maestro()
 
                 try:
                     last_a = globals().get("_IA_BOOT_STALE_AUDIT_TS", 0.0) or 0.0
@@ -16295,6 +16712,12 @@ async def main():
                         elif decision_final == EMBUDO_FINAL_REAL_MICRO:
                             candidatos = candidatos[:1]
 
+                        # LXV como ruta única de decisión REAL: el embudo legacy queda en telemetría.
+                        if bool(LXV_SYNC_REAL_ROUTE_ENABLE):
+                            if candidatos and _print_once("lxv-route-only", ttl=20.0):
+                                agregar_evento("🧊 Modo LXV_SYNC_REAL: legado REAL en telemetría (sin emisión).")
+                            candidatos = []
+
                         # ==================== AUTO-PRESELECCIÓN (MODO MANUAL) ====================
                         # Si la IA detecta señal y tú estás en manual, preselecciona el mejor bot y abre la ventana
                         # para que solo elijas el ciclo (1..MAX_CICLOS) dentro del tiempo.
@@ -16370,7 +16793,7 @@ async def main():
                                     if owner_prev and owner_prev != mejor_bot and ciclo_auto > 1:
                                         cerrar_por_fin_de_ciclo(owner_prev, f"Handoff rotación C{ciclo_auto}→{mejor_bot}")
 
-                                    ok_real = escribir_orden_real(mejor_bot, ciclo_auto)
+                                    ok_real = emitir_real_autorizado(mejor_bot, ciclo_auto, source="IA_AUTO")
                                     if ok_real:
                                         if estado_real == "SHADOW":
                                             try:
