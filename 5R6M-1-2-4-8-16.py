@@ -2199,6 +2199,7 @@ def _ensure_dir(p):
         print(f"⚠️ Falló creación de dir {p}: {e}")
 
 def _atomic_write(path: str, text: str):
+    _ensure_dir(os.path.dirname(path) or ".")
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
