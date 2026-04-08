@@ -567,12 +567,6 @@ class MonitorSaldoApp:
         self.lock_path = SCRIPT_DIR / f"{DB_FILENAME}.lock"
         self.legacy_db_path = SCRIPT_DIR / LEGACY_DB_FILENAME
         self.active_source_path: Optional[Path] = None
-        self.skip_counts = {"sin_cambio": 0, "duplicada_exacta": 0, "otros": 0}
-        self.skip_window_total = 0
-        self.total_skips = 0
-        self.total_writes = 0
-        self.last_skip_flush_ts = time.time()
-        self.last_write_ts = 0.0
 
         repair = ensure_db_header_or_repair(self.db_path, legacy_candidates=[self.legacy_db_path])
         print(f"[DB SALDO][OK] usando db propia: {self.db_path.name}")
@@ -646,39 +640,6 @@ class MonitorSaldoApp:
     def _on_close(self):
         self.stop_evt.set()
         self.root.after(200, self.root.destroy)
-
-    def _register_skip(self, reason: str):
-        key = reason if reason in self.skip_counts else "otros"
-        self.skip_counts[key] += 1
-        self.skip_window_total += 1
-        self.total_skips += 1
-
-    def _flush_skip_summary(self, force: bool = False):
-        now = time.time()
-        has_skips = self.skip_window_total > 0
-        should_emit = has_skips and (force or self.skip_window_total >= 10 or (now - self.last_skip_flush_ts) >= 15.0)
-        if not should_emit:
-            return
-        print(
-            "[DB SALDO][SKIP-RESUMEN] "
-            f"sin_cambio={self.skip_counts['sin_cambio']} "
-            f"duplicada_exacta={self.skip_counts['duplicada_exacta']} "
-            f"otros={self.skip_counts['otros']} "
-            f"ventana={self.skip_window_total} total_skips={self.total_skips}"
-        )
-        self.skip_counts = {"sin_cambio": 0, "duplicada_exacta": 0, "otros": 0}
-        self.skip_window_total = 0
-        self.last_skip_flush_ts = now
-
-    def _log_write(self, sample: SaldoSample):
-        self.total_writes += 1
-        self.last_write_ts = sample.ts_epoch
-        saldo_txt = "--" if sample.saldo is None else f"{sample.saldo:,.2f}"
-        ts = _fmt_lima(sample.ts_epoch)
-        print(
-            f"[DB SALDO][WRITE #{self.total_writes}] "
-            f"saldo={saldo_txt} fuente={sample.fuente} ts={ts} db={self.db_path.name}"
-        )
 
     def aplicar_escala_manual(self):
         try:
@@ -764,13 +725,8 @@ class MonitorSaldoApp:
                     self._flush_skip_summary(force=True)
                     self.series.append(sample)
                     self.last_saved = sample
-                    self._log_write(sample)
                 elif reason in {"duplicada_exacta", "sin_cambio"}:
-                    self._register_skip(reason)
-                    self._flush_skip_summary(force=False)
-                elif reason != "sin_saldo":
-                    self._register_skip("otros")
-                    self._flush_skip_summary(force=False)
+                    print(f"[DB SALDO][SKIP] muestra duplicada ({reason})")
 
                 status = "OK"
                 if sample.observacion == "stale":
