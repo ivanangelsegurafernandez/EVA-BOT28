@@ -162,6 +162,18 @@ def _fmt_local_ts(ts_obj) -> str:
     return "--"
 
 
+def _fmt_file_mtime(path_obj: Optional[Path]) -> str:
+    if path_obj is None:
+        return "--"
+    try:
+        if not Path(path_obj).exists():
+            return "--"
+        ts = datetime.fromtimestamp(Path(path_obj).stat().st_mtime, tz=timezone.utc)
+        return _fmt_local_ts(ts)
+    except Exception:
+        return "--"
+
+
 def _sanitize_series_for_plot(s: pd.DataFrame) -> pd.DataFrame:
     if s is None or s.empty:
         return pd.DataFrame(columns=["timestamp", "equity"])
@@ -1069,6 +1081,14 @@ class DataEngine:
             warnings.append(f"Monitor {MONITOR_VERSION} · id={MONITOR_BUILD_ID}")
             warnings.append(f"Ruta live usada: {live_path_used if live_path_used else SALDO_LIVE_SHARED_PATH}")
             warnings.append(f"Ruta history usada: {hist_path_used if hist_path_used else SALDO_LIVE_HISTORY_SHARED_PATH}")
+            live_exists = bool(live_path_used and Path(live_path_used).exists())
+            live_mtime = _fmt_file_mtime(Path(live_path_used) if live_path_used else None)
+            live_ts = _fmt_local_ts(master[1]) if master is not None else "--"
+            live_saldo = _fmt_money(float(master[0])) if master is not None else "--"
+            warnings.append(
+                f"Diag live: exists={'yes' if live_exists else 'no'} mtime={live_mtime} "
+                f"saldo={live_saldo} ts={live_ts}"
+            )
             if series_msg:
                 warnings.append(series_msg)
             warnings.append(f"Ruta series usada: {series_path_used if series_path_used else series_target_path}")
@@ -1198,6 +1218,8 @@ class DataEngine:
             warnings.append("Usando estimado en emergencia")
         if view == "REAL":
             warnings.append(f"Fuente real efectiva usada: {source}")
+            if source != "MAESTRO_LIVE" and master is not None:
+                warnings.append("Diag: live descartado por stale/prioridad temporal")
 
         real_points = int(len(real_series))
         if real_points == 0:
@@ -1632,26 +1654,22 @@ class DashboardWindow(QtWidgets.QMainWindow):
             elif not current_valid and self.last_good_snapshot is None:
                 status = "NO DATA"
 
+            # FAST-PATH UI principal (saldo + badge): nunca debe caer por errores accesorios.
             effective_saldo = snap.saldo_actual if _is_valid_number(snap.saldo_actual) else self.last_good_saldo
             if _is_valid_number(effective_saldo):
                 self.lbl_big.setText(_fmt_money(float(effective_saldo)))
             else:
                 self.lbl_big.setText("--")
-
-            effective_last_update = snap.last_update if snap.last_update else self.last_good_last_update
-            last = effective_last_update.astimezone(DISPLAY_TZ).strftime("%H:%M:%S") if effective_last_update else "--"
-
             raw_src = snap.source.upper().strip()
             effective_src = raw_src if current_valid else ((self.last_good_source or raw_src).upper().strip() if self.last_good_source or raw_src else "--")
-            source_label = f"FUENTE: {effective_src} · {status}"
-            self.lbl_source.setText(source_label)
+            self.lbl_source.setText(f"FUENTE: {effective_src} · {status}")
             if status == "NO DATA":
                 self.lbl_source.setObjectName("BadgeBad"); self.lbl_big.setStyleSheet("color:#ffb9b9;")
             elif status == "STALE":
                 self.lbl_source.setObjectName("BadgeWarn"); self.lbl_big.setStyleSheet("color:#ffe9b8;")
             elif status == "DEGRADED":
                 self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
-            elif effective_src == "MAESTRO_LIVE":
+            elif effective_src in ("MAESTRO_LIVE", "MAESTRO_5R6M"):
                 self.lbl_source.setObjectName("BadgeMaster"); self.lbl_big.setStyleSheet("color:#72f8b1;")
             elif effective_src in ("MAESTRO_HISTORY_DEGRADED", "SERIE_CSV_DEGRADED"):
                 self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
@@ -1661,6 +1679,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_source.setObjectName("BadgeNeutral"); self.lbl_big.setStyleSheet("color:#d8e7ff;")
             self.lbl_source.style().unpolish(self.lbl_source); self.lbl_source.style().polish(self.lbl_source)
 
+            effective_last_update = snap.last_update if snap.last_update else self.last_good_last_update
+            last = effective_last_update.astimezone(DISPLAY_TZ).strftime("%H:%M:%S") if effective_last_update else "--"
+
             main_scale = "--"
             main_y0, main_y1 = 0.0, 0.0
             series_map = {
@@ -1669,49 +1690,55 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 "hour": snap.series_hours,
                 "day": snap.series_days,
             }
-            for key, series in (
-                ("main", series_map["main"]),
-                ("min", series_map["min"]),
-                ("hour", series_map["hour"]),
-                ("day", series_map["day"]),
-            ):
-                try:
-                    use_series = _sanitize_series_for_plot(series)
-                    if use_series.empty and key in self._last_plot_series and not self._last_plot_series[key].empty:
-                        use_series = self._last_plot_series[key]
-                        if status in ("STALE", "DEGRADED"):
-                            snap.warnings.append(f"Mostrando última serie válida en panel {key}")
-                    elif not use_series.empty:
-                        self._last_plot_series[key] = use_series
-                    scale_info, py0, py1 = self._update_plot_state(self.plot_states[key], use_series)
-                    if key == "main":
-                        main_scale = scale_info
-                        main_y0, main_y1 = py0, py1
-                except Exception as plot_err:
-                    snap.warnings.append(f"plot {key} con error: {plot_err}")
-                    self._throttled_warn(f"plot:{key}", f"Error en gráfico {key}: {plot_err}")
-            visible = _sanitize_series_for_plot(series_map["main"])
-            if visible.empty and "main" in self._last_plot_series:
-                visible = self._last_plot_series["main"]
-            n_visible = int(len(visible))
-            if n_visible >= 1:
-                first = float(visible["equity"].iloc[0])
-                last_v = float(visible["equity"].iloc[-1])
-                delta = last_v - first
-                pct = (delta / first * 100.0) if abs(first) > 1e-12 else 0.0
-                compact_delta = f"{delta:+,.2f} USD ({pct:+.2f}%)"
-            else:
-                compact_delta = "--"
-            if n_visible >= 1:
-                min_v = float(visible["equity"].min())
-                max_v = float(visible["equity"].max())
-                first_v = float(visible["equity"].iloc[0])
-                last_v = float(visible["equity"].iloc[-1])
-                dd = min_v - max_v
-                amp_pct = ((max_v - min_v) / first_v * 100.0) if abs(first_v) > 1e-12 else 0.0
-                self.lbl_stats.setText(
-                    f"VIS | first={first_v:,.2f} last={last_v:,.2f} max={max_v:,.2f} min={min_v:,.2f} "
-                    f"drawdown={dd:,.2f} rango={max_v-min_v:,.2f} amp={amp_pct:.2f}% pts={n_visible}"
+            try:
+                for key, series in (
+                    ("main", series_map["main"]),
+                    ("min", series_map["min"]),
+                    ("hour", series_map["hour"]),
+                    ("day", series_map["day"]),
+                ):
+                    try:
+                        use_series = _sanitize_series_for_plot(series)
+                        if use_series.empty and key in self._last_plot_series and not self._last_plot_series[key].empty:
+                            use_series = self._last_plot_series[key]
+                            if status in ("STALE", "DEGRADED"):
+                                snap.warnings.append(f"Mostrando última serie válida en panel {key}")
+                        elif not use_series.empty:
+                            self._last_plot_series[key] = use_series
+                        scale_info, py0, py1 = self._update_plot_state(self.plot_states[key], use_series)
+                        if key == "main":
+                            main_scale = scale_info
+                            main_y0, main_y1 = py0, py1
+                    except Exception as plot_err:
+                        snap.warnings.append(f"plot {key} con error: {plot_err}")
+                        self._throttled_warn(f"plot:{key}", f"Error en gráfico {key}: {plot_err}")
+                visible = _sanitize_series_for_plot(series_map["main"])
+                if visible.empty and "main" in self._last_plot_series:
+                    visible = self._last_plot_series["main"]
+                n_visible = int(len(visible))
+                if n_visible >= 1:
+                    first = float(visible["equity"].iloc[0])
+                    last_v = float(visible["equity"].iloc[-1])
+                    delta = last_v - first
+                    pct = (delta / first * 100.0) if abs(first) > 1e-12 else 0.0
+                    compact_delta = f"{delta:+,.2f} USD ({pct:+.2f}%)"
+                else:
+                    compact_delta = "--"
+                if n_visible >= 1:
+                    min_v = float(visible["equity"].min())
+                    max_v = float(visible["equity"].max())
+                    first_v = float(visible["equity"].iloc[0])
+                    last_v = float(visible["equity"].iloc[-1])
+                    dd = min_v - max_v
+                    amp_pct = ((max_v - min_v) / first_v * 100.0) if abs(first_v) > 1e-12 else 0.0
+                    self.lbl_stats.setText(
+                        f"VIS | first={first_v:,.2f} last={last_v:,.2f} max={max_v:,.2f} min={min_v:,.2f} "
+                        f"drawdown={dd:,.2f} rango={max_v-min_v:,.2f} amp={amp_pct:.2f}% pts={n_visible}"
+                    )
+                else:
+                    self.lbl_stats.setText("STATS VIS: --")
+                self.lbl_meta_compact.setText(
+                    f"{snap.now.strftime('%H:%M:%S %Z')} · última {last} · pts {n_visible} · Δvis {compact_delta}"
                 )
             else:
                 self.lbl_stats.setText("STATS VIS: --")
