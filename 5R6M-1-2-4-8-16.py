@@ -2241,6 +2241,63 @@ def _append_line_safe(path: str, line: str):
             f.flush()
             os.fsync(f.fileno())
 
+def _read_last_nonempty_line(path: str) -> str:
+    try:
+        if (not os.path.exists(path)) or os.path.getsize(path) <= 0:
+            return ""
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            start = max(0, size - 8192)
+            fh.seek(start, os.SEEK_SET)
+            chunk = fh.read().decode("utf-8", errors="ignore")
+        lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
+        return lines[-1] if lines else ""
+    except Exception:
+        return ""
+
+def _ensure_series_header_if_needed(path: str):
+    try:
+        _ensure_dir(os.path.dirname(path) or ".")
+        if (not os.path.exists(path)) or os.path.getsize(path) <= 0:
+            _append_line_safe(path, "timestamp,equity,source\n")
+            return
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            first = (fh.readline() or "").strip().lower()
+        if ("timestamp" not in first) or ("equity" not in first):
+            bak = f"{path}.bak"
+            try:
+                os.replace(path, bak)
+            except Exception:
+                pass
+            _append_line_safe(path, "timestamp,equity,source\n")
+            if os.path.exists(bak):
+                try:
+                    with open(bak, "r", encoding="utf-8", errors="ignore") as bf:
+                        for raw in bf:
+                            row = raw.strip()
+                            if not row:
+                                continue
+                            cols = [c.strip() for c in row.split(",")]
+                            if len(cols) < 2 or cols[0].lower() in ("timestamp", "ts_utc"):
+                                continue
+                            _append_line_safe(path, f"{cols[0]},{cols[1]},{(cols[2] if len(cols) >= 3 else 'MAESTRO_5R6M')}\n")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+def _append_series_csv_if_new(path: str, ts_iso: str, val: float, source: str):
+    try:
+        _ensure_series_header_if_needed(path)
+        line = f"{ts_iso},{float(val):.2f},{source}\n"
+        last = _read_last_nonempty_line(path)
+        if last and (last == line.strip()):
+            return
+        _append_line_safe(path, line)
+    except Exception:
+        pass
+
 def _update_saldo_monitor_feed(valor_saldo: float):
     try:
         val = float(valor_saldo)
@@ -2257,7 +2314,6 @@ def _update_saldo_monitor_feed(valor_saldo: float):
         "source": "MAESTRO_5R6M",
     }
     payload_hist = {"timestamp": ts_iso, "equity": val, "source": "MAESTRO_5R6M"}
-    csv_line = f"{ts_iso},{val:.2f},MAESTRO_5R6M\n"
     for p in dict.fromkeys(_saldo_feed_targets()["live"]):
         try:
             _atomic_write(p, json.dumps(payload_live, ensure_ascii=False))
@@ -2270,9 +2326,7 @@ def _update_saldo_monitor_feed(valor_saldo: float):
             pass
     for p in dict.fromkeys(_saldo_feed_targets()["series"]):
         try:
-            if not os.path.exists(p):
-                _append_line_safe(p, "timestamp,equity,source\n")
-            _append_line_safe(p, csv_line)
+            _append_series_csv_if_new(p, ts_iso, val, "MAESTRO_5R6M")
         except Exception:
             pass
 # === /SALDO LIVE FEED ===
