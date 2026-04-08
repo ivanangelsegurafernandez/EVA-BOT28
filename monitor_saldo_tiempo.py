@@ -682,13 +682,39 @@ class MonitorSaldoApp:
                 t.set_color("#f5f5f5")
         self.ax.grid(True, color="#2f2f2f", alpha=0.6, linewidth=0.8)
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S", tz=LIMA_TZ))
+        self.ax.tick_params(axis="x", rotation=18)
 
         self.canvas = FigureCanvasTkAgg(fig, master=root)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        self.canvas.mpl_connect("motion_notify_event", self._on_plot_hover)
+        self._xs_num: List[float] = []
+        self._ys_live: List[float] = []
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         threading.Thread(target=self.loop_muestreo, daemon=True).start()
         self.root.after(500, self.actualizar_grafica)
+
+    def _on_plot_hover(self, event):
+        if event.inaxes != self.ax or not self._xs_num or not self._ys_live:
+            if self.crosshair_v.get_visible() or self.crosshair_h.get_visible() or self.crosshair_txt.get_visible():
+                self.crosshair_v.set_visible(False)
+                self.crosshair_h.set_visible(False)
+                self.crosshair_txt.set_visible(False)
+                self.canvas.draw_idle()
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        idx = min(range(len(self._xs_num)), key=lambda i: abs(self._xs_num[i] - float(event.xdata)))
+        x_num = self._xs_num[idx]
+        y_val = self._ys_live[idx]
+        dt = mdates.num2date(x_num, tz=LIMA_TZ).strftime("%H:%M:%S")
+        self.crosshair_v.set_xdata([x_num, x_num])
+        self.crosshair_h.set_ydata([y_val, y_val])
+        self.crosshair_txt.set_text(f"{dt} | {y_val:,.2f}")
+        self.crosshair_v.set_visible(True)
+        self.crosshair_h.set_visible(True)
+        self.crosshair_txt.set_visible(True)
+        self.canvas.draw_idle()
 
     def _on_close(self):
         self.stop_evt.set()
@@ -879,9 +905,25 @@ class MonitorSaldoApp:
         ma_long = moving_avg(ys, 20)
 
         self.line_main.set_data(xs, ys)
-        self.line_ma_short.set_data(xs, ma_short)
-        self.line_ma_long.set_data(xs, ma_long)
+        if bool(self.show_ma_short.get()):
+            self.line_ma_short.set_data(xs, ma_short)
+            self.line_ma_short.set_visible(True)
+        else:
+            self.line_ma_short.set_visible(False)
+        if bool(self.show_ma_long.get()):
+            self.line_ma_long.set_data(xs, ma_long)
+            self.line_ma_long.set_visible(True)
+        else:
+            self.line_ma_long.set_visible(False)
         self.marker_last.set_data([xs[-1]], [ys[-1]])
+        self.last_price_line.set_ydata([ys[-1], ys[-1]])
+        y_min, y_max = min(ys), max(ys)
+        self.range_low_line.set_ydata([y_min, y_min])
+        self.range_high_line.set_ydata([y_max, y_max])
+        self.last_value_annot.xy = (xs[-1], ys[-1])
+        self.last_value_annot.set_text(f"  {ys[-1]:,.2f}  ")
+        self._xs_num = mdates.date2num(xs).tolist()
+        self._ys_live = list(ys)
 
         self.ax.relim()
         self.ax.autoscale_view()
