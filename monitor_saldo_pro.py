@@ -100,6 +100,8 @@ CAPITAL_BASE_USD = float(os.getenv("CAPITAL_BASE_USD", "0") or "0")
 MIN_X_SPAN_SECONDS = 20.0
 OBSERVED_TAIL_BYTES = int(os.getenv("OBSERVED_TAIL_BYTES", str(256 * 1024)))
 ESTIMATED_REFRESH_SECONDS = int(os.getenv("ESTIMATED_REFRESH_SECONDS", "30"))
+MASTER_LIVE_STALE_SECONDS = int(os.getenv("MASTER_LIVE_STALE_SECONDS", "90"))
+MASTER_DELTA_WARN_USD = float(os.getenv("MASTER_DELTA_WARN_USD", "1.0"))
 
 def _main_window_seconds() -> int:
     """
@@ -324,40 +326,52 @@ class DataEngine:
         if SALDO_LIVE_PATH:
             custom = Path(SALDO_LIVE_PATH).expanduser()
             cands.append(custom / SALDO_LIVE_FILE if custom.is_dir() else custom)
-        out: List[Path] = []
-        seen = set()
-        for p in cands:
-            k = str(p)
-            if k not in seen:
-                seen.add(k)
-                out.append(p)
-        return out
+        return self._sort_candidates_by_freshness(cands)
 
     def _master_history_candidates(self) -> List[Path]:
         cands: List[Path] = [Path(SALDO_LIVE_HISTORY_SHARED_PATH).expanduser()]
         for p in self._master_live_candidates():
             cands.append(p.parent / SALDO_LIVE_HISTORY_FILE)
-        out: List[Path] = []
-        seen = set()
-        for p in cands:
-            k = str(p)
-            if k not in seen:
-                seen.add(k)
-                out.append(p)
-        return out
+        return self._sort_candidates_by_freshness(cands)
 
     def _master_series_candidates(self) -> List[Path]:
         cands: List[Path] = [Path(SALDO_SERIES_CSV_PATH).expanduser()]
         for p in self._master_live_candidates():
             cands.append(p.parent / SALDO_SERIES_CSV_FILE)
-        out: List[Path] = []
+        return self._sort_candidates_by_freshness(cands)
+
+    def _sort_candidates_by_freshness(self, cands: List[Path]) -> List[Path]:
+        uniq: List[Path] = []
         seen = set()
         for p in cands:
             k = str(p)
-            if k not in seen:
-                seen.add(k)
-                out.append(p)
-        return out
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(p)
+
+        def _rank(path: Path) -> Tuple[int, int, int, str]:
+            try:
+                st = path.stat()
+                mtime_ns = int(st.st_mtime_ns)
+                exists_rank = 1
+            except Exception:
+                mtime_ns = -1
+                exists_rank = 0
+            try:
+                base_pref = 1 if path.parent.resolve() == self.base_dir.resolve() else 0
+            except Exception:
+                base_pref = 0
+            return (exists_rank, mtime_ns, base_pref, str(path))
+
+        return sorted(uniq, key=_rank, reverse=True)
+
+    @staticmethod
+    def _path_mtime_ns(path: Path) -> int:
+        try:
+            return int(path.stat().st_mtime_ns)
+        except Exception:
+            return -1
 
     @staticmethod
     def _ts_utc_iso(ts_obj) -> Optional[str]:
@@ -1001,21 +1015,21 @@ class DataEngine:
         observed: pd.DataFrame,
         estimated: Optional[pd.DataFrame] = None,
     ) -> Optional[Tuple[str, float, str]]:
-        if not hist.empty:
-            row = hist.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "MAESTRO_HISTORY")
         if master is not None:
             mv, mts = master
             ts_iso = self._ts_utc_iso(mts)
             eq = self._normalize_equity_value(mv)
             if ts_iso and eq is not None:
                 return (ts_iso, eq, "MAESTRO_LIVE")
+        if not hist.empty:
+            row = hist.iloc[-1]
+            ts_iso = self._ts_utc_iso(row.get("timestamp"))
+            eq = self._normalize_equity_value(row.get("equity"))
+            if ts_iso and eq is not None:
+                return (ts_iso, eq, "MAESTRO_HIST")
         ts_iso = self._ts_utc_iso(last_update)
         eq = self._normalize_equity_value(saldo_actual)
-        if ts_iso and eq is not None and source in ("MAESTRO", "SERIE_CSV"):
+        if ts_iso and eq is not None and source in ("MAESTRO_LIVE", "MAESTRO_HIST", "SERIE_CSV"):
             return (ts_iso, eq, source)
         if not observed.empty:
             row = observed.iloc[-1]
@@ -1225,21 +1239,21 @@ class DataEngine:
         observed: pd.DataFrame,
         estimated: Optional[pd.DataFrame] = None,
     ) -> Optional[Tuple[str, float, str]]:
-        if not hist.empty:
-            row = hist.iloc[-1]
-            ts_iso = self._ts_utc_iso(row.get("timestamp"))
-            eq = self._normalize_equity_value(row.get("equity"))
-            if ts_iso and eq is not None:
-                return (ts_iso, eq, "MAESTRO_HISTORY")
         if master is not None:
             mv, mts = master
             ts_iso = self._ts_utc_iso(mts)
             eq = self._normalize_equity_value(mv)
             if ts_iso and eq is not None:
                 return (ts_iso, eq, "MAESTRO_LIVE")
+        if not hist.empty:
+            row = hist.iloc[-1]
+            ts_iso = self._ts_utc_iso(row.get("timestamp"))
+            eq = self._normalize_equity_value(row.get("equity"))
+            if ts_iso and eq is not None:
+                return (ts_iso, eq, "MAESTRO_HIST")
         ts_iso = self._ts_utc_iso(last_update)
         eq = self._normalize_equity_value(saldo_actual)
-        if ts_iso and eq is not None and source in ("MAESTRO", "SERIE_CSV"):
+        if ts_iso and eq is not None and source in ("MAESTRO_LIVE", "MAESTRO_HIST", "SERIE_CSV"):
             return (ts_iso, eq, source)
         if not observed.empty:
             row = observed.iloc[-1]
@@ -1291,22 +1305,39 @@ class DataEngine:
 
         found_any = False
         warnings: List[str] = []
+        best_live: Optional[Tuple[float, datetime, Path, int]] = None
         for p in paths:
             if not p.exists():
                 continue
             found_any = True
             try:
                 obj = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
-                v = _safe_float(obj.get("saldo_real"), default=np.nan)
+                v = _safe_float(
+                    obj.get("saldo_real", obj.get("equity", obj.get("balance"))),
+                    default=np.nan,
+                )
                 if not np.isfinite(v):
                     warnings.append(f"{SALDO_LIVE_FILE} inválido en {'ruta compartida' if str(p)==SALDO_LIVE_SHARED_PATH else p}")
                     continue
                 ts = pd.to_datetime(obj.get("timestamp"), errors="coerce", utc=True)
                 if pd.isna(ts):
+                    ts = pd.to_datetime(pd.to_numeric(obj.get("ts"), errors="coerce"), unit="s", errors="coerce", utc=True)
+                if pd.isna(ts):
                     ts = pd.to_datetime(p.stat().st_mtime, unit="s", utc=True)
-                return self._store_cache("live", sig, ((float(v), ts.to_pydatetime()), None, p))
+                if pd.isna(ts):
+                    continue
+                cand = (float(v), ts.to_pydatetime(), p, self._path_mtime_ns(p))
+                if best_live is None:
+                    best_live = cand
+                else:
+                    _bv, bts, bp, bmt = best_live
+                    if (cand[1], cand[3], str(cand[2])) > (bts, bmt, str(bp)):
+                        best_live = cand
             except Exception as e:
                 warnings.append(f"{SALDO_LIVE_FILE} inválido en {'ruta compartida' if str(p)==SALDO_LIVE_SHARED_PATH else p}: {e}")
+        if best_live is not None:
+            v, ts, p, _mt = best_live
+            return self._store_cache("live", sig, ((float(v), ts), None, p))
 
         msg = f"{SALDO_LIVE_FILE} no encontrado en ruta compartida: {SALDO_LIVE_SHARED_PATH}"
         if found_any:
@@ -1323,6 +1354,7 @@ class DataEngine:
             return cached
 
         warnings: List[str] = []
+        best_hist: Optional[Tuple[pd.DataFrame, Path, datetime, int]] = None
         for p in paths:
             if not p.exists():
                 continue
@@ -1351,10 +1383,22 @@ class DataEngine:
                 if rows:
                     d = pd.DataFrame(rows, columns=["timestamp", "equity"]).sort_values("timestamp")
                     d = d.drop_duplicates(subset=["timestamp", "equity"], keep="last")
-                    growth_msg = self._check_history_growth(p, len(d))
-                    return self._store_cache("hist", sig, (d, None, p, growth_msg))
+                    last_ts = pd.to_datetime(d["timestamp"].iloc[-1], errors="coerce", utc=True)
+                    if pd.isna(last_ts):
+                        continue
+                    cand = (d, p, last_ts.to_pydatetime(), self._path_mtime_ns(p))
+                    if best_hist is None:
+                        best_hist = cand
+                    else:
+                        _bd, bp, bts, bmt = best_hist
+                        if (cand[2], cand[3], str(cand[1])) > (bts, bmt, str(bp)):
+                            best_hist = cand
             except Exception as e:
                 warnings.append(f"{SALDO_LIVE_HISTORY_FILE} inválido en {'ruta compartida' if str(p)==SALDO_LIVE_HISTORY_SHARED_PATH else p}: {e}")
+        if best_hist is not None:
+            d, p, _lts, _mt = best_hist
+            growth_msg = self._check_history_growth(p, len(d))
+            return self._store_cache("hist", sig, (d, None, p, growth_msg))
 
         msg = f"Sin histórico real: no se encontró {SALDO_LIVE_HISTORY_FILE} en ruta compartida: {SALDO_LIVE_HISTORY_SHARED_PATH}"
         if warnings:
@@ -1373,6 +1417,7 @@ class DataEngine:
             return cached
         warnings: List[str] = []
         found_any = False
+        best_series: Optional[Tuple[pd.DataFrame, Path, datetime, int]] = None
         for p in paths:
             if not p.exists():
                 continue
@@ -1385,10 +1430,22 @@ class DataEngine:
                 if d.empty:
                     continue
                 d = d.sort_values("timestamp").drop_duplicates(subset=["timestamp", "equity"], keep="last")
-                warn_msg = " | ".join(warnings[-3:]) if warnings else None
-                return self._store_cache("series_csv", sig, (d, warn_msg, p))
+                last_ts = pd.to_datetime(d["timestamp"].iloc[-1], errors="coerce", utc=True)
+                if pd.isna(last_ts):
+                    continue
+                cand = (d, p, last_ts.to_pydatetime(), self._path_mtime_ns(p))
+                if best_series is None:
+                    best_series = cand
+                else:
+                    _bd, bp, bts, bmt = best_series
+                    if (cand[2], cand[3], str(cand[1])) > (bts, bmt, str(bp)):
+                        best_series = cand
             except Exception as e:
                 warnings.append(f"{SALDO_SERIES_CSV_FILE} inválido en {p}: {e}")
+        if best_series is not None:
+            d, p, _lts, _mt = best_series
+            warn_msg = " | ".join(warnings[-3:]) if warnings else None
+            return self._store_cache("series_csv", sig, (d, warn_msg, p))
         if not found_any:
             primary = Path(SALDO_SERIES_CSV_PATH).expanduser()
             msg = self._ensure_series_csv_exists(primary)
@@ -1596,7 +1653,7 @@ class DataEngine:
         master, master_msg, live_path_used = self._read_master_live() if view == "REAL" else (None, None, None)
         hist, hist_msg, hist_path_used, hist_growth_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None, None)
         series_csv, series_msg, series_path_used = self._read_saldo_series_csv() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None)
-        real_primary_ok = view == "REAL" and (not hist.empty or master is not None or not series_csv.empty)
+        real_primary_ok = view == "REAL" and (master is not None or not hist.empty or not series_csv.empty)
         observed = self._parse_observed(view) if (view != "REAL" or not real_primary_ok) else pd.DataFrame(columns=["timestamp", "equity"])
         estimated = self._build_estimated(view) if (view != "REAL" or not real_primary_ok) else self._est_last_value.get(view, pd.DataFrame(columns=["timestamp", "equity"]))
 
@@ -1626,49 +1683,101 @@ class DataEngine:
                 warnings.append(hist_growth_msg)
             if real_primary_ok:
                 warnings.append("Modo FAST-PATH REAL: fuentes auxiliares en lazy")
+            if master is not None:
+                mv_live, mts_live = master
+                live_age_sec = max(0.0, (_now().astimezone(timezone.utc) - mts_live.astimezone(timezone.utc)).total_seconds())
+                if live_age_sec > float(MASTER_LIVE_STALE_SECONDS):
+                    warnings.append(f"DEGRADED: live MAESTRO stale ({live_age_sec:.0f}s > {MASTER_LIVE_STALE_SECONDS}s)")
+                if not hist.empty:
+                    hts = pd.to_datetime(hist["timestamp"].iloc[-1], errors="coerce", utc=True)
+                    if not pd.isna(hts):
+                        newer_by = (hts.to_pydatetime() - mts_live.astimezone(timezone.utc)).total_seconds()
+                        if newer_by > 2.0:
+                            warnings.append(f"Incoherencia: histórico más nuevo que live por {newer_by:.1f}s")
+                    hdelta = abs(float(hist["equity"].iloc[-1]) - float(mv_live))
+                    if hdelta >= float(MASTER_DELTA_WARN_USD):
+                        warnings.append(f"Desfase live↔hist: {hdelta:.2f} USD")
+                if not series_csv.empty:
+                    sts = pd.to_datetime(series_csv["timestamp"].iloc[-1], errors="coerce", utc=True)
+                    if not pd.isna(sts):
+                        newer_by = (sts.to_pydatetime() - mts_live.astimezone(timezone.utc)).total_seconds()
+                        if newer_by > 2.0:
+                            warnings.append(f"Incoherencia: series CSV más nueva que live por {newer_by:.1f}s")
+                    sdelta = abs(float(series_csv["equity"].iloc[-1]) - float(mv_live))
+                    if sdelta >= float(MASTER_DELTA_WARN_USD):
+                        warnings.append(f"Desfase live↔series: {sdelta:.2f} USD")
 
         source = "SIN DATOS REALES"
         saldo_actual: Optional[float] = None
         last_update: Optional[datetime] = None
         real_series = pd.DataFrame(columns=["timestamp", "equity"])
+        live_ts = master[1].astimezone(timezone.utc) if master is not None else None
+        hist_last_ts = pd.to_datetime(hist["timestamp"].iloc[-1], errors="coerce", utc=True) if not hist.empty else pd.NaT
+        series_last_ts = pd.to_datetime(series_csv["timestamp"].iloc[-1], errors="coerce", utc=True) if not series_csv.empty else pd.NaT
+        fresh_live_ok = False
+        if master is not None and live_ts is not None:
+            live_age_sec = max(0.0, (_now().astimezone(timezone.utc) - live_ts).total_seconds())
+            fresh_live_ok = live_age_sec <= float(MASTER_LIVE_STALE_SECONDS)
+        live_superseded = False
+        refresh_guard_s = max(2.0, float(REFRESH_SEGUNDOS) * 2.0)
+        if master is not None and live_ts is not None:
+            if (not pd.isna(hist_last_ts)) and (hist_last_ts.to_pydatetime() - live_ts).total_seconds() > refresh_guard_s:
+                live_superseded = True
+            if (not pd.isna(series_last_ts)) and (series_last_ts.to_pydatetime() - live_ts).total_seconds() > refresh_guard_s:
+                live_superseded = True
+        effective_live_ok = bool(fresh_live_ok and not live_superseded)
+        if master is not None and not effective_live_ok:
+            warnings.append("live descartado como saldo principal (stale o superado por histórico/series)")
 
-        if view == "REAL" and not hist.empty:
-            source = "MAESTRO"
-            real_series = hist.copy()
+        if view == "REAL":
+            combined_parts: List[pd.DataFrame] = []
+            if not hist.empty:
+                combined_parts.append(hist[["timestamp", "equity"]].copy())
+            if not series_csv.empty:
+                combined_parts.append(series_csv[["timestamp", "equity"]].copy())
             if master is not None:
                 mv, mts = master
-                saldo_actual = mv
-                last_update = mts
-                real_series = pd.concat([real_series, pd.DataFrame([{"timestamp": mts, "equity": mv}])], ignore_index=True)
+                combined_parts.append(pd.DataFrame([{"timestamp": mts, "equity": mv}]))
+            if combined_parts:
+                real_series = pd.concat(combined_parts, ignore_index=True)
+                real_series = _sanitize_series_for_plot(real_series)
                 real_series = real_series.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
-            else:
-                saldo_actual = float(real_series["equity"].iloc[-1])
-                last_update = real_series["timestamp"].iloc[-1]
-        elif master is not None:
+
+        if effective_live_ok and master is not None:
             mv, mts = master
-            source = "MAESTRO"
+            source = "MAESTRO_LIVE"
             saldo_actual = mv
             last_update = mts
-            real_series = pd.DataFrame([{"timestamp": mts, "equity": mv}])
-        elif view == "REAL" and not series_csv.empty:
-            source = "SERIE_CSV"
-            saldo_actual = float(series_csv["equity"].iloc[-1])
-            last_update = series_csv["timestamp"].iloc[-1]
-            real_series = series_csv
+        elif view == "REAL" and (not hist.empty or not series_csv.empty):
+            use_hist = False
+            if not hist.empty and series_csv.empty:
+                use_hist = True
+            elif not hist.empty and not series_csv.empty:
+                use_hist = pd.to_datetime(hist["timestamp"].iloc[-1], errors="coerce", utc=True) >= pd.to_datetime(series_csv["timestamp"].iloc[-1], errors="coerce", utc=True)
+            if use_hist:
+                source = "MAESTRO_HIST"
+                saldo_actual = float(hist["equity"].iloc[-1])
+                last_update = hist["timestamp"].iloc[-1]
+            else:
+                source = "SERIE_CSV"
+                saldo_actual = float(series_csv["equity"].iloc[-1])
+                last_update = series_csv["timestamp"].iloc[-1]
+            warnings.append(f"DEGRADED: saldo principal desde {source}")
         elif not observed.empty:
-            source = "OBSERVADO"
+            source = "OBSERVADO_FALLBACK"
             saldo_actual = float(observed["equity"].iloc[-1])
             last_update = observed["timestamp"].iloc[-1]
             real_series = observed
+            warnings.append("DEGRADED: usando observed fallback")
+        elif estimated is not None and not estimated.empty:
+            source = "ESTIMADO_EMERGENCIA"
+            saldo_actual = float(estimated["equity"].iloc[-1])
+            last_update = estimated["timestamp"].iloc[-1]
+            real_series = estimated
+            warnings.append("DEGRADED: usando estimado de emergencia")
         else:
-            live_real = self._parse_observed("REAL") if view == "REAL" else self._parse_observed(view)
-            if not live_real.empty:
-                source = "LIVE"
-                saldo_actual = float(live_real["equity"].iloc[-1])
-                last_update = live_real["timestamp"].iloc[-1]
-                real_series = pd.DataFrame([live_real.iloc[-1]])
-            else:
-                warnings.append("saldo real del maestro no disponible")
+            warnings.append("saldo real del maestro no disponible")
+        warnings.append(f"Fuente efectiva REAL: {source}")
 
         real_points = int(len(real_series))
         if real_points == 0:
@@ -2355,7 +2464,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             status = "OK"
             if not current_valid and self.last_good_snapshot is not None:
                 status = "STALE"
-            elif current_valid and self.view == "REAL" and snap.source in ("SERIE_CSV", "OBSERVADO", "LIVE"):
+            elif current_valid and self.view == "REAL" and snap.source in ("MAESTRO_HIST", "SERIE_CSV", "OBSERVADO_FALLBACK", "ESTIMADO_EMERGENCIA"):
                 status = "DEGRADED"
             elif not current_valid and self.last_good_snapshot is None:
                 status = "NO DATA"
@@ -2379,13 +2488,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_source.setObjectName("BadgeWarn"); self.lbl_big.setStyleSheet("color:#ffe9b8;")
             elif status == "DEGRADED":
                 self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
-            elif effective_src == "MAESTRO":
+            elif effective_src == "MAESTRO_LIVE":
                 self.lbl_source.setObjectName("BadgeMaster"); self.lbl_big.setStyleSheet("color:#72f8b1;")
-            elif effective_src in ("OBSERVADO", "MAESTRO_HIST", "SERIE_CSV"):
+            elif effective_src in ("MAESTRO_HIST", "SERIE_CSV", "OBSERVADO_FALLBACK"):
                 self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
             elif effective_src == "LIVE":
                 self.lbl_source.setObjectName("BadgeLive"); self.lbl_big.setStyleSheet("color:#9ef7d8;")
-            elif effective_src in ("ESTIMADO", "SIN DATOS REALES"):
+            elif effective_src in ("ESTIMADO", "ESTIMADO_EMERGENCIA", "SIN DATOS REALES"):
                 self.lbl_source.setObjectName("BadgeBad"); self.lbl_big.setStyleSheet("color:#ffb9b9;")
             else:
                 self.lbl_source.setObjectName("BadgeNeutral"); self.lbl_big.setStyleSheet("color:#d8e7ff;")

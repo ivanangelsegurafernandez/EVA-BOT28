@@ -2313,7 +2313,13 @@ def _update_saldo_monitor_feed(valor_saldo: float):
         "ts": now,
         "source": "MAESTRO_5R6M",
     }
-    payload_hist = {"timestamp": ts_iso, "equity": val, "source": "MAESTRO_5R6M"}
+    payload_hist = {
+        "timestamp": ts_iso,
+        "equity": val,
+        "saldo_real": val,
+        "balance": val,
+        "source": "MAESTRO_5R6M",
+    }
     for p in dict.fromkeys(_saldo_feed_targets()["live"]):
         try:
             _atomic_write(p, json.dumps(payload_live, ensure_ascii=False))
