@@ -2214,10 +2214,18 @@ def path_orden(bot: str) -> str:
 SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
 SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
-SALDO_FEED_DIR = os.path.abspath(os.path.expanduser(os.getenv("SALDO_FEED_DIR", os.path.join(os.path.expanduser("~"), "saldo_feed_5r6m"))))
-SALDO_LIVE_SHARED_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(SALDO_FEED_DIR, SALDO_LIVE_FILE))))
-SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_LIVE_HISTORY_SHARED_PATH", os.path.join(SALDO_FEED_DIR, SALDO_LIVE_HISTORY_FILE))))
-SALDO_SERIES_CSV_PATH = os.path.abspath(os.path.expanduser(os.getenv("SALDO_SERIES_CSV_PATH", os.path.join(SALDO_FEED_DIR, SALDO_SERIES_CSV_FILE))))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_SALDO_LIVE_PATH = os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE)
+SALDO_LIVE_SHARED_PATH = os.path.abspath(
+    os.path.expanduser(os.getenv("SALDO_LIVE_SHARED_PATH", _DEFAULT_SALDO_LIVE_PATH))
+)
+_DEFAULT_SALDO_HISTORY_PATH = os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE)
+SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(
+    os.path.expanduser(os.getenv("SALDO_LIVE_HISTORY_SHARED_PATH", _DEFAULT_SALDO_HISTORY_PATH))
+)
+SALDO_SERIES_CSV_PATH = os.path.abspath(
+    os.path.expanduser(os.getenv("SALDO_SERIES_CSV_PATH", os.path.join(SCRIPT_DIR, SALDO_SERIES_CSV_FILE)))
+)
 
 def _saldo_feed_targets() -> dict:
     return {
@@ -2323,6 +2331,9 @@ def _update_saldo_monitor_feed(valor_saldo: float):
             _append_line_safe(p, json.dumps(payload_hist, ensure_ascii=False) + "\n")
         for p in dict.fromkeys(_saldo_feed_targets()["series"]):
             _append_series_csv_if_new(p, ts_iso, val, "MAESTRO_5R6M")
+        print(f"[SALDO LIVE] destino: {SALDO_LIVE_SHARED_PATH}")
+        print(f"[SALDO HIST] destino: {SALDO_LIVE_HISTORY_SHARED_PATH}")
+        print(f"[SALDO CSV] destino: {SALDO_SERIES_CSV_PATH}")
         print(f"[SALDO FEED][OK] saldo={val:.2f} ts={ts_iso}")
         return True
     except Exception as e:
