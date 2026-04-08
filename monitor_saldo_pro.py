@@ -927,20 +927,25 @@ class DataEngine:
             live_age_sec = max(0.0, (_now().astimezone(timezone.utc) - mts_live.astimezone(timezone.utc)).total_seconds())
             live_fresh = live_age_sec <= float(MASTER_LIVE_STALE_SECONDS)
 
-        if master is not None and live_fresh:
-            mv, mts = master
-            live_source = self._normalize_source_label(self._last_master_live_source) or "MAESTRO_LIVE"
-            return (live_source, float(mv), mts, [f"REAL principal = {live_source}"])
-
         latest_hist = None if hist.empty else hist.iloc[-1]
         latest_series = None if series_csv.empty else series_csv.iloc[-1]
-        hts = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True) if latest_hist is not None else pd.NaT
-        sts = pd.to_datetime(latest_series["timestamp"], errors="coerce", utc=True) if latest_series is not None else pd.NaT
-        if latest_hist is not None and (pd.isna(sts) or (not pd.isna(hts) and hts >= sts)):
+        if latest_hist is not None:
             source = "MAESTRO_HISTORY"
             saldo_actual = float(latest_hist["equity"])
             last_update = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True).to_pydatetime()
             warnings.append("REAL principal = MAESTRO_HISTORY")
+        elif master is not None and live_fresh:
+            mv, mts = master
+            source = self._normalize_source_label(self._last_master_live_source) or "MAESTRO_LIVE"
+            saldo_actual = float(mv)
+            last_update = mts
+            warnings.append(f"REAL principal = {source}")
+        elif master is not None:
+            mv, mts = master
+            source = self._normalize_source_label(self._last_master_live_source) or "MAESTRO_LIVE"
+            saldo_actual = float(mv)
+            last_update = mts
+            warnings.append(f"REAL principal = {source} (stale)")
         elif latest_series is not None:
             source = self._normalize_source_label(latest_series.get("source")) or "MAESTRO_SERIES_CANONICAL"
             saldo_actual = float(latest_series["equity"])
