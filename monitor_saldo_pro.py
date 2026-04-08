@@ -329,6 +329,8 @@ class DataEngine:
         self._series_repair_sig: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
         self._series_ensure_notice_once: Optional[str] = None
         self._last_series_filter_stats: Dict[str, int] = {"valid": 0, "discarded": 0}
+        self._last_master_live_source: str = "MAESTRO_LIVE"
+        self._last_live_diag_lines: List[str] = []
 
     @staticmethod
     def _normalize_source_label(source: Optional[str]) -> str:
@@ -662,12 +664,19 @@ class DataEngine:
         sig = self._sig(paths)
         cached = self._cached("live", sig)
         if cached is not None:
+            if isinstance(cached, tuple) and len(cached) >= 3 and cached[2] is not None:
+                # conserva source maestro detectado previamente si ya existe.
+                self._last_master_live_source = self._normalize_source_label(self._last_master_live_source) or "MAESTRO_LIVE"
             return cached
 
         found_any = False
         best_live: Optional[Tuple[float, datetime, Path, int]] = None
+        best_live_source = "MAESTRO_LIVE"
         warnings: List[str] = []
+        diag_lines: List[str] = []
         for p in paths:
+            exists = p.exists()
+            diag_lines.append(f"[MONITOR][REAL] live_candidate={p} exists={'yes' if exists else 'no'} mtime={_fmt_file_mtime(p if exists else None)}")
             if not p.exists():
                 continue
             found_any = True
@@ -713,17 +722,25 @@ class DataEngine:
                     ts = pd.to_datetime(p.stat().st_mtime, unit="s", utc=True)
                 if pd.isna(ts):
                     continue
+                src_obj = self._normalize_source_label(obj.get("source")) or "MAESTRO_LIVE"
+                diag_lines.append(
+                    f"[MONITOR][REAL] live_read={p} ts={_fmt_local_ts(ts.to_pydatetime())} balance={_fmt_money(float(v))} source={src_obj}"
+                )
                 cand = (float(v), ts.to_pydatetime(), p, self._path_mtime_ns(p))
                 if best_live is None:
                     best_live = cand
+                    best_live_source = src_obj
                 else:
                     _bv, bts, bp, bmt = best_live
                     if (cand[1], cand[3], str(cand[2])) > (bts, bmt, str(bp)):
                         best_live = cand
+                        best_live_source = src_obj
             except Exception as e:
                 warnings.append(f"{SALDO_LIVE_FILE} inválido en {'ruta compartida' if str(p)==SALDO_LIVE_SHARED_PATH else p}: {e}")
+        self._last_live_diag_lines = diag_lines[-6:]
         if best_live is not None:
             v, ts, p, _mt = best_live
+            self._last_master_live_source = best_live_source
             return self._store_cache("live", sig, ((float(v), ts), None, p))
 
         msg = f"{SALDO_LIVE_FILE} no encontrado en ruta compartida: {SALDO_LIVE_SHARED_PATH}"
@@ -864,7 +881,8 @@ class DataEngine:
             frames.append(s2)
         if master is not None:
             mv, mts = master
-            frames.append(pd.DataFrame([{"timestamp": mts, "equity": mv, "source": "MAESTRO_LIVE"}]))
+            live_source = self._normalize_source_label(self._last_master_live_source) or "MAESTRO_LIVE"
+            frames.append(pd.DataFrame([{"timestamp": mts, "equity": mv, "source": live_source}]))
         if not frames:
             return pd.DataFrame(columns=["timestamp", "equity", "source"])
         real_series = pd.concat(frames, ignore_index=True)
@@ -897,7 +915,8 @@ class DataEngine:
 
         if master is not None and live_fresh:
             mv, mts = master
-            return ("MAESTRO_LIVE", float(mv), mts, ["REAL principal = MAESTRO_LIVE"])
+            live_source = self._normalize_source_label(self._last_master_live_source) or "MAESTRO_LIVE"
+            return (live_source, float(mv), mts, [f"REAL principal = {live_source}"])
 
         latest_hist = None if hist.empty else hist.iloc[-1]
         latest_series = None if series_csv.empty else series_csv.iloc[-1]
@@ -1205,6 +1224,7 @@ class DataEngine:
             warnings.append(f"Monitor {MONITOR_VERSION} · id={MONITOR_BUILD_ID}")
             warnings.append(f"Ruta live usada: {live_path_used if live_path_used else SALDO_LIVE_SHARED_PATH}")
             warnings.append(f"Ruta history usada: {hist_path_used if hist_path_used else SALDO_LIVE_HISTORY_SHARED_PATH}")
+            warnings.extend(self._last_live_diag_lines[-3:])
             live_exists = bool(live_path_used and Path(live_path_used).exists())
             live_mtime = _fmt_file_mtime(Path(live_path_used) if live_path_used else None)
             hist_mtime = _fmt_file_mtime(Path(hist_path_used) if hist_path_used else None)
