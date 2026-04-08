@@ -9,16 +9,19 @@ import os
 import sys
 import time
 import uuid
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from collections import deque
+
 try:
     from PyQt5 import QtCore, QtWidgets
 except Exception as exc:
-    raise RuntimeError("PyQt5 no está disponible. Instálalo con: pip install PyQt5 matplotlib") from exc
+    raise RuntimeError(
+        "PyQt5 no está disponible. Instálalo con: pip install PyQt5 matplotlib"
+    ) from exc
 
 import matplotlib
 
@@ -27,18 +30,14 @@ import matplotlib.dates as mdates
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
+
 # ==============================
 # Constantes de configuración
 # ==============================
 POLL_INTERVAL_MS = 1000
 SAVE_MIN_INTERVAL_S = 5.0
 FREEZE_THRESHOLD_S = 20.0
-LAST_GOOD_LIVE_TTL_S = 15.0
 LOG_THROTTLE_S = 8.0
-
-LIVE_JSON_MAX_AGE_S = 20.0
-HISTORY_JSONL_MAX_AGE_S = 25.0
-SERIES_CSV_MAX_AGE_S = 60.0
 
 CSV_MONITOR_FILE = "saldo_muestras_monitor.csv"
 CSV_COLUMNS = [
@@ -48,8 +47,6 @@ CSV_COLUMNS = [
     "delta_abs",
     "delta_pct",
     "fuente",
-    "fuente_grafica",
-    "estado_feed",
     "latencia_seg",
     "muestra_valida",
     "sesion_id",
@@ -70,7 +67,6 @@ SOURCE_LABELS = {
     "live": "JSON_LIVE",
     "history": "JSONL_HISTORY",
     "series": "CSV_SERIES",
-    "none": "SIN_FUENTE",
 }
 
 
@@ -78,22 +74,10 @@ SOURCE_LABELS = {
 class FeedSample:
     saldo_real: Optional[float]
     ts_feed_epoch: Optional[float]
-    source_kind: str
+    source_kind: Optional[str]
     source_path: Optional[Path]
-    valid_numeric: bool
-    fresh_for_ui: bool
-    fresh_for_plot: bool
-    note: str
-
-
-@dataclass
-class DiscoverResult:
-    ui_sample: Optional[FeedSample]
-    plot_sample: Optional[FeedSample]
-    live_sample: FeedSample
-    history_sample: FeedSample
-    series_sample: FeedSample
-    ui_status: str
+    valid: bool
+    note: str = ""
 
 
 @dataclass
@@ -104,8 +88,6 @@ class MonitorSample:
     delta_abs: Optional[float]
     delta_pct: Optional[float]
     fuente: str
-    fuente_grafica: str
-    estado_feed: str
     latencia_seg: Optional[float]
     muestra_valida: int
     sesion_id: str
@@ -129,7 +111,7 @@ class AtomicAppendCSV:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists() and self.path.stat().st_size > 0:
             return
-        self.append_row({col: col for col in self.columns})
+        self.append_row({col: col for col in self.columns}, is_header=True)
 
     def _acquire_lock(self, timeout: float = 1.8, retry_s: float = 0.05) -> bool:
         start = time.monotonic()
@@ -152,12 +134,15 @@ class AtomicAppendCSV:
         except Exception:
             pass
 
-    def append_row(self, row: dict[str, Any]) -> bool:
+    def append_row(self, row: dict[str, Any], is_header: bool = False) -> bool:
         if not self._acquire_lock():
             return False
         try:
-            vals = ["" if row.get(c) is None else str(row.get(c)) for c in self.columns]
-            line = ",".join(self._escape_csv(v) for v in vals) + "\n"
+            values = []
+            for c in self.columns:
+                v = row.get(c, "")
+                values.append("" if v is None else str(v))
+            line = ",".join(self._escape_csv(v) for v in values) + "\n"
             with open(self.path, "a", encoding="utf-8", newline="") as f:
                 f.write(line)
                 f.flush()
@@ -175,61 +160,33 @@ class AtomicAppendCSV:
 
 class FeedReader:
     def __init__(self, base_dir: Path):
-        home_feed = Path(os.path.expanduser("~")) / "saldo_feed_5r6m"
-        self.home_feed = home_feed
         self.base_dir = base_dir
-
-        # Prioridad: feed compartido del maestro primero.
-        # Para live, preferimos exclusivamente home_feed salvo ausencia total.
+        home_feed = Path(os.path.expanduser("~")) / "saldo_feed_5r6m"
         self.candidates = {
-            "live": [home_feed / LIVE_JSON_NAME, base_dir / LIVE_JSON_NAME],
-            "history": [home_feed / HIST_JSONL_NAME, base_dir / HIST_JSONL_NAME],
-            "series": [home_feed / SERIES_CSV_NAME, base_dir / SERIES_CSV_NAME],
+            "live": [base_dir / LIVE_JSON_NAME, home_feed / LIVE_JSON_NAME],
+            "history": [base_dir / HIST_JSONL_NAME, home_feed / HIST_JSONL_NAME],
+            "series": [base_dir / SERIES_CSV_NAME, home_feed / SERIES_CSV_NAME],
         }
         self.file_offsets: dict[Path, int] = {}
 
-    def discover_best_source(self, now_epoch: float) -> DiscoverResult:
-        live = self._read_live_json(now_epoch)
-        history = self._read_history_jsonl(now_epoch)
-        series = self._read_series_csv(now_epoch)
+    def discover_best_source(self) -> FeedSample:
+        live = self._read_live_json()
+        if live.valid and live.saldo_real is not None:
+            return live
 
-        # UI: SOLO live fresco o history fresco como respaldo temporal.
-        ui_sample: Optional[FeedSample] = None
-        status = "SIN LIVE"
-        if live.valid_numeric and live.fresh_for_ui:
-            ui_sample = live
-            status = "LIVE OK"
-        elif history.valid_numeric and history.fresh_for_ui:
-            ui_sample = history
-            status = "HISTORY OK"
-        elif live.valid_numeric and (not live.fresh_for_ui):
-            status = "LIVE STALE"
-        elif history.valid_numeric and (not history.fresh_for_ui):
-            status = "HISTORY STALE"
+        hist = self._read_history_jsonl()
+        if hist.valid and hist.saldo_real is not None:
+            return hist
 
-        # Plot: live/history/series (series solo gráfica)
-        plot_sample = self._choose_plot_sample(live, history, series)
+        series = self._read_series_csv()
+        if series.valid and series.saldo_real is not None:
+            return series
 
-        return DiscoverResult(
-            ui_sample=ui_sample,
-            plot_sample=plot_sample,
-            live_sample=live,
-            history_sample=history,
-            series_sample=series,
-            ui_status=status,
-        )
-
-    def _choose_plot_sample(self, live: FeedSample, history: FeedSample, series: FeedSample) -> Optional[FeedSample]:
-        candidates = [s for s in (live, history, series) if s.valid_numeric and s.fresh_for_plot]
-        if candidates:
-            candidates.sort(key=lambda x: (x.ts_feed_epoch or 0.0), reverse=True)
-            return candidates[0]
-
-        candidates = [s for s in (live, history, series) if s.valid_numeric]
-        if candidates:
-            candidates.sort(key=lambda x: (x.ts_feed_epoch or 0.0), reverse=True)
-            return candidates[0]
-        return None
+        if live.source_path and live.source_path.exists():
+            return live
+        if hist.source_path and hist.source_path.exists():
+            return hist
+        return series
 
     def _find_existing(self, kind: str) -> Optional[Path]:
         for p in self.candidates[kind]:
@@ -237,28 +194,22 @@ class FeedReader:
                 return p
         return None
 
-    def _read_live_json(self, now_epoch: float) -> FeedSample:
+    def _read_live_json(self) -> FeedSample:
         p = self._find_existing("live")
         if not p:
-            return FeedSample(None, None, "live", None, False, False, False, "live no encontrado")
-
+            return FeedSample(None, None, "live", None, False, "live no encontrado")
         payload = self._safe_read_json(p)
         if payload is None:
-            return FeedSample(None, self._mtime_epoch(p), "live", p, False, False, False, "live corrupto/incompleto")
-
+            return FeedSample(None, None, "live", p, False, "live corrupto/incompleto")
         saldo = self._extract_balance(payload)
         ts = self._extract_timestamp(payload, p)
         valid = self._is_valid_balance(saldo)
-        age = self._age_s(now_epoch, ts)
-        fresh_ui = valid and (age is not None) and age <= LIVE_JSON_MAX_AGE_S
-        fresh_plot = valid and (age is not None) and age <= SERIES_CSV_MAX_AGE_S
+        return FeedSample(saldo if valid else None, ts, "live", p, valid, "ok" if valid else "saldo inválido")
 
-        return FeedSample(saldo if valid else None, ts, "live", p, valid, fresh_ui, fresh_plot, "ok" if valid else "saldo inválido")
-
-    def _read_history_jsonl(self, now_epoch: float) -> FeedSample:
+    def _read_history_jsonl(self) -> FeedSample:
         p = self._find_existing("history")
         if not p:
-            return FeedSample(None, None, "history", None, False, False, False, "history no encontrado")
+            return FeedSample(None, None, "history", None, False, "history no encontrado")
 
         try:
             if p not in self.file_offsets:
@@ -272,7 +223,7 @@ class FeedReader:
 
         lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
         if not lines:
-            lines = self._tail_lines(p, max_lines=10)
+            lines = self._tail_lines(p, max_lines=8)
 
         for raw in reversed(lines):
             try:
@@ -282,43 +233,37 @@ class FeedReader:
             saldo = self._extract_balance(obj)
             ts = self._extract_timestamp(obj, p)
             valid = self._is_valid_balance(saldo)
-            if not valid:
-                continue
-            age = self._age_s(now_epoch, ts)
-            fresh_ui = (age is not None) and age <= HISTORY_JSONL_MAX_AGE_S
-            fresh_plot = (age is not None) and age <= SERIES_CSV_MAX_AGE_S
-            return FeedSample(saldo, ts, "history", p, True, fresh_ui, fresh_plot, "ok")
+            if valid:
+                return FeedSample(saldo, ts, "history", p, True, "ok")
 
-        return FeedSample(None, self._mtime_epoch(p), "history", p, False, False, False, "history sin muestra válida")
+        return FeedSample(None, self._mtime_epoch(p), "history", p, False, "history sin muestra válida")
 
-    def _read_series_csv(self, now_epoch: float) -> FeedSample:
+    def _read_series_csv(self) -> FeedSample:
         p = self._find_existing("series")
         if not p:
-            return FeedSample(None, None, "series", None, False, False, False, "series no encontrado")
+            return FeedSample(None, None, "series", None, False, "series no encontrado")
 
         lines = self._tail_lines(p, max_lines=12)
         if not lines:
-            return FeedSample(None, self._mtime_epoch(p), "series", p, False, False, False, "series vacío")
+            return FeedSample(None, self._mtime_epoch(p), "series", p, False, "series vacío")
 
         reader = csv.reader(lines)
         rows = [r for r in reader if r]
         for row in reversed(rows):
+            if not row:
+                continue
             row_low = [str(x).strip().lower() for x in row]
             if row_low and row_low[0] in ("timestamp", "ts_utc"):
                 continue
-            ts_raw = row[0] if len(row) > 0 else ""
+            ts_val = row[0] if len(row) > 0 else ""
             saldo_raw = row[1] if len(row) > 1 else None
             saldo = self._coerce_float(saldo_raw)
             valid = self._is_valid_balance(saldo)
-            if not valid:
-                continue
-            ts = self._parse_any_datetime(ts_raw) or self._mtime_epoch(p)
-            age = self._age_s(now_epoch, ts)
-            fresh_plot = (age is not None) and age <= SERIES_CSV_MAX_AGE_S
-            # Prohibido para UI, incluso fresco.
-            return FeedSample(saldo, ts, "series", p, True, False, fresh_plot, "series solo gráfica")
+            if valid:
+                ts_epoch = self._parse_any_datetime(ts_val) or self._mtime_epoch(p)
+                return FeedSample(saldo, ts_epoch, "series", p, True, "ok")
 
-        return FeedSample(None, self._mtime_epoch(p), "series", p, False, False, False, "series sin valor válido")
+        return FeedSample(None, self._mtime_epoch(p), "series", p, False, "series sin valor válido")
 
     @staticmethod
     def _tail_lines(path: Path, max_lines: int = 10) -> list[str]:
@@ -401,7 +346,9 @@ class FeedReader:
             if x is None:
                 return None
             v = float(str(x).strip())
-            return v if math.isfinite(v) else None
+            if math.isfinite(v):
+                return v
+            return None
         except Exception:
             return None
 
@@ -418,15 +365,6 @@ class FeedReader:
             return None
         return None
 
-    @staticmethod
-    def _age_s(now_epoch: float, ts_epoch: Optional[float]) -> Optional[float]:
-        if ts_epoch is None:
-            return None
-        age = now_epoch - ts_epoch
-        if age < 0:
-            return 0.0
-        return age
-
 
 class MonitorSaldoWindow(QtWidgets.QMainWindow):
     def __init__(self, base_dir: Path):
@@ -437,14 +375,12 @@ class MonitorSaldoWindow(QtWidgets.QMainWindow):
         self.csv_writer = AtomicAppendCSV(base_dir / CSV_MONITOR_FILE, CSV_COLUMNS)
 
         self.samples: list[MonitorSample] = []
-        self.ui_series = deque(maxlen=24 * 60 * 60)
-        self.plot_series = deque(maxlen=24 * 60 * 60)
+        self.series = deque(maxlen=24 * 60 * 60)
 
         self.last_saved_epoch: Optional[float] = None
         self.last_saved_balance: Optional[float] = None
         self.last_feed_change_epoch: Optional[float] = None
-        self.last_good_ui_sample: Optional[FeedSample] = None
-        self.last_good_ui_seen_epoch: Optional[float] = None
+        self.last_seen_feed_ts: Optional[float] = None
         self.last_log: dict[str, float] = {}
 
         self._build_ui()
@@ -452,7 +388,7 @@ class MonitorSaldoWindow(QtWidgets.QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("Monitor Saldo RT 5R6M - Nuevo")
-        self.resize(1520, 920)
+        self.resize(1500, 900)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -463,13 +399,11 @@ class MonitorSaldoWindow(QtWidgets.QMainWindow):
 
         self.lbl_saldo = QtWidgets.QLabel("--")
         self.lbl_saldo.setStyleSheet("font-size: 40px; font-weight: 700; color: #0B7D3E;")
-
-        self.lbl_estado = QtWidgets.QLabel("Estado feed: INICIANDO")
-        self.lbl_src_ui = QtWidgets.QLabel("Fuente saldo actual: --")
-        self.lbl_src_plot = QtWidgets.QLabel("Fuente gráficas: --")
+        self.lbl_estado = QtWidgets.QLabel("Estado: INICIANDO")
+        self.lbl_fuente = QtWidgets.QLabel("Fuente: --")
         self.lbl_hora = QtWidgets.QLabel("Hora local: --")
         self.lbl_muestras = QtWidgets.QLabel("Muestras: 0")
-        self.lbl_ultima = QtWidgets.QLabel("Última actualización feed: --")
+        self.lbl_ultima = QtWidgets.QLabel("Última actualización: --")
         self.lbl_delta = QtWidgets.QLabel("Δ abs: -- | Δ %: --")
         self.lbl_ind = QtWidgets.QLabel("Indicadores: --")
         self.lbl_stale = QtWidgets.QLabel("Segundos sin cambio: --")
@@ -477,14 +411,13 @@ class MonitorSaldoWindow(QtWidgets.QMainWindow):
         top_grid.addWidget(QtWidgets.QLabel("Saldo actual"), 0, 0)
         top_grid.addWidget(self.lbl_saldo, 1, 0, 1, 2)
         top_grid.addWidget(self.lbl_estado, 0, 2)
-        top_grid.addWidget(self.lbl_src_ui, 0, 3)
-        top_grid.addWidget(self.lbl_src_plot, 1, 2)
-        top_grid.addWidget(self.lbl_hora, 1, 3)
-        top_grid.addWidget(self.lbl_muestras, 2, 2)
-        top_grid.addWidget(self.lbl_ultima, 2, 3)
-        top_grid.addWidget(self.lbl_delta, 3, 2)
-        top_grid.addWidget(self.lbl_stale, 3, 3)
-        top_grid.addWidget(self.lbl_ind, 4, 2, 1, 2)
+        top_grid.addWidget(self.lbl_fuente, 0, 3)
+        top_grid.addWidget(self.lbl_hora, 1, 2)
+        top_grid.addWidget(self.lbl_muestras, 1, 3)
+        top_grid.addWidget(self.lbl_ultima, 2, 2)
+        top_grid.addWidget(self.lbl_delta, 2, 3)
+        top_grid.addWidget(self.lbl_stale, 3, 2)
+        top_grid.addWidget(self.lbl_ind, 3, 3)
 
         self.figure = Figure(figsize=(13, 8), constrained_layout=True)
         self.canvas = FigureCanvas(self.figure)
@@ -513,69 +446,33 @@ class MonitorSaldoWindow(QtWidgets.QMainWindow):
 
     def _tick(self) -> None:
         now = time.time()
-        result = self.reader.discover_best_source(now)
+        feed = self.reader.discover_best_source()
+        current_balance = feed.saldo_real
+        feed_ts = feed.ts_feed_epoch
 
-        self._log_source_health(result)
-
-        ui_sample = result.ui_sample
-        plot_sample = result.plot_sample
-
-        # Conservación corta del último live/history bueno para UI.
-        ui_used: Optional[FeedSample] = ui_sample
-        ui_status = result.ui_status
-        if ui_used and ui_used.valid_numeric:
-            self.last_good_ui_sample = ui_used
-            self.last_good_ui_seen_epoch = now
-        else:
-            ttl_ok = (
-                self.last_good_ui_sample is not None
-                and self.last_good_ui_seen_epoch is not None
-                and (now - self.last_good_ui_seen_epoch) <= LAST_GOOD_LIVE_TTL_S
-            )
-            if ttl_ok:
-                ui_used = self.last_good_ui_sample
-                ui_status = "STALE TTL"
-            else:
-                ui_used = None
-                if result.ui_status in ("LIVE STALE", "HISTORY STALE"):
-                    ui_status = "STALE"
-                else:
-                    ui_status = "SIN LIVE"
-                self._log_throttled(
-                    "ui_blocked",
-                    "SALDO UI BLOQUEADO POR FALTA DE LIVE/HISTORY FRESCO",
-                    logging.WARNING,
-                )
-
-        if plot_sample and plot_sample.valid_numeric and plot_sample.saldo_real is not None:
-            self._append_plot_point(now, plot_sample)
-
-        current_balance = ui_used.saldo_real if ui_used and ui_used.valid_numeric else None
-        feed_ts = ui_used.ts_feed_epoch if ui_used else None
-
-        valid_ui = current_balance is not None
-        if valid_ui:
+        valid = feed.valid and (current_balance is not None)
+        if valid:
             if self.last_saved_balance is None or abs(current_balance - self.last_saved_balance) > 1e-12:
                 self.last_feed_change_epoch = now
+            self.last_seen_feed_ts = feed_ts or now
 
-        metrics = self._calculate_metrics_for_value(current_balance, now)
-        should_save = self._should_save(valid_ui, current_balance, now)
+        metrics = self._calculate_metrics_for_value(current_balance, now) if valid else self._calculate_metrics_for_value(None, now)
+        should_save = self._should_save(valid, current_balance, now)
 
-        fuente_ui = self._format_source(ui_used)
-        fuente_plot = self._format_source(plot_sample)
+        fuente = SOURCE_LABELS.get(feed.source_kind or "", "SIN_FUENTE")
+        if feed.source_path:
+            fuente = f"{fuente}:{feed.source_path.name}"
+
         lat = (now - feed_ts) if feed_ts else None
-
         sample = MonitorSample(
             timestamp_iso=datetime.now(timezone.utc).isoformat(),
             timestamp_epoch=now,
             saldo_real=current_balance,
             delta_abs=metrics["delta_abs"],
             delta_pct=metrics["delta_pct"],
-            fuente=fuente_ui,
-            fuente_grafica=fuente_plot,
-            estado_feed=ui_status,
+            fuente=fuente,
             latencia_seg=lat,
-            muestra_valida=1 if valid_ui else 0,
+            muestra_valida=1 if valid else 0,
             sesion_id=self.session_id,
             media_1m=metrics["media_1m"],
             media_5m=metrics["media_5m"],
@@ -590,72 +487,15 @@ class MonitorSaldoWindow(QtWidgets.QMainWindow):
             ok = self.csv_writer.append_row(sample.__dict__)
             if ok:
                 self.samples.append(sample)
-                self.ui_series.append(sample)
+                self.series.append(sample)
                 self.last_saved_epoch = now
-                if valid_ui:
+                if valid:
                     self.last_saved_balance = current_balance
             else:
                 self._log_throttled("csv_write", "No se pudo escribir muestra (lock ocupado)", logging.WARNING)
 
-        self._refresh_panel(sample, ui_used, plot_sample, now)
+        self._refresh_panel(sample, feed, now)
         self._refresh_plots()
-
-    def _append_plot_point(self, now: float, feed_sample: FeedSample) -> None:
-        ms = MonitorSample(
-            timestamp_iso=datetime.now(timezone.utc).isoformat(),
-            timestamp_epoch=now,
-            saldo_real=feed_sample.saldo_real,
-            delta_abs=None,
-            delta_pct=None,
-            fuente="",
-            fuente_grafica=self._format_source(feed_sample),
-            estado_feed="PLOT",
-            latencia_seg=None,
-            muestra_valida=1 if feed_sample.saldo_real is not None else 0,
-            sesion_id=self.session_id,
-            media_1m=None,
-            media_5m=None,
-            media_15m=None,
-            min_1m=None,
-            max_1m=None,
-            pendiente_corta=None,
-            pendiente_media=None,
-        )
-        if not self.plot_series:
-            self.plot_series.append(ms)
-            return
-        last = self.plot_series[-1]
-        if (
-            last.saldo_real is not None
-            and ms.saldo_real is not None
-            and abs(last.saldo_real - ms.saldo_real) <= 1e-12
-            and (now - last.timestamp_epoch) < 1.0
-        ):
-            return
-        self.plot_series.append(ms)
-
-    @staticmethod
-    def _format_source(sample: Optional[FeedSample]) -> str:
-        if not sample:
-            return "SIN_FUENTE"
-        src = SOURCE_LABELS.get(sample.source_kind, sample.source_kind.upper())
-        if sample.source_path:
-            return f"{src}:{sample.source_path.name}"
-        return src
-
-    def _log_source_health(self, result: DiscoverResult) -> None:
-        if result.live_sample.valid_numeric and result.live_sample.fresh_for_ui:
-            self._log_throttled("live_ok", "LIVE OK", logging.INFO)
-        elif result.live_sample.valid_numeric:
-            self._log_throttled("live_stale", "LIVE STALE", logging.WARNING)
-
-        if result.history_sample.valid_numeric and result.history_sample.fresh_for_ui:
-            self._log_throttled("hist_ok", "HISTORY OK", logging.INFO)
-        elif result.history_sample.valid_numeric:
-            self._log_throttled("hist_stale", "HISTORY STALE", logging.WARNING)
-
-        if result.series_sample.valid_numeric:
-            self._log_throttled("series_plot", "SERIES SOLO GRAFICA", logging.INFO)
 
     def _should_save(self, valid: bool, value: Optional[float], now: float) -> bool:
         if self.last_saved_epoch is None:
@@ -675,7 +515,7 @@ class MonitorSaldoWindow(QtWidgets.QMainWindow):
         return False
 
     def _calculate_metrics_for_value(self, current_balance: Optional[float], now_epoch: float) -> dict[str, Optional[float]]:
-        valid_samples = [s for s in self.ui_series if s.muestra_valida == 1 and s.saldo_real is not None]
+        valid_samples = [s for s in self.series if s.muestra_valida == 1 and s.saldo_real is not None]
         prev = valid_samples[-1].saldo_real if valid_samples else None
 
         delta_abs = None
@@ -687,7 +527,8 @@ class MonitorSaldoWindow(QtWidgets.QMainWindow):
 
         def window_vals(seconds: int) -> list[float]:
             low = now_epoch - seconds
-            return [float(s.saldo_real) for s in valid_samples if s.timestamp_epoch >= low and s.saldo_real is not None]
+            vals = [s.saldo_real for s in valid_samples if s.timestamp_epoch >= low and s.saldo_real is not None]
+            return [float(v) for v in vals]
 
         vals_1m = window_vals(60)
         vals_5m = window_vals(300)
@@ -727,7 +568,8 @@ class MonitorSaldoWindow(QtWidgets.QMainWindow):
         xs = [s.timestamp_epoch - x0 for s in window]
         ys = [float(s.saldo_real) for s in window]
         n = len(xs)
-        sx, sy = sum(xs), sum(ys)
+        sx = sum(xs)
+        sy = sum(ys)
         sxx = sum(x * x for x in xs)
         sxy = sum(x * y for x, y in zip(xs, ys))
         denom = n * sxx - sx * sx
@@ -735,38 +577,30 @@ class MonitorSaldoWindow(QtWidgets.QMainWindow):
             return None
         return (n * sxy - sx * sy) / denom
 
-    def _detect_feed_state(self, now: float, sample: MonitorSample) -> str:
-        if sample.estado_feed in ("SIN LIVE", "STALE"):
-            return sample.estado_feed
+    def _detect_feed_state(self, now: float, sample: MonitorSample, feed: FeedSample) -> str:
         if sample.muestra_valida == 0:
-            return "SIN LIVE"
+            return "FALLBACK"
         if self.last_feed_change_epoch is None:
             return "ACTIVO"
         if now - self.last_feed_change_epoch > FREEZE_THRESHOLD_S:
             return "CONGELADO"
-        if sample.fuente.startswith("JSONL_HISTORY"):
+        if feed.source_kind != "live":
             return "FALLBACK"
         return "ACTIVO"
 
-    def _refresh_panel(self, sample: MonitorSample, ui_feed: Optional[FeedSample], plot_feed: Optional[FeedSample], now: float) -> None:
-        estado = self._detect_feed_state(now, sample)
+    def _refresh_panel(self, sample: MonitorSample, feed: FeedSample, now: float) -> None:
+        estado = self._detect_feed_state(now, sample, feed)
         saldo_txt = "--" if sample.saldo_real is None else f"{sample.saldo_real:,.2f}"
         self.lbl_saldo.setText(saldo_txt)
 
-        color = "#0B7D3E"
-        if estado in ("FALLBACK", "STALE TTL"):
-            color = "#B8860B"
-        elif estado in ("SIN LIVE", "STALE", "CONGELADO"):
-            color = "#C0392B"
-
+        color = "#0B7D3E" if estado == "ACTIVO" else ("#B8860B" if estado == "FALLBACK" else "#C0392B")
         self.lbl_estado.setText(f"Estado feed: {estado}")
         self.lbl_estado.setStyleSheet(f"font-size: 14px; font-weight: 700; color: {color};")
 
-        self.lbl_src_ui.setText(f"Fuente saldo actual: {sample.fuente}")
-        self.lbl_src_plot.setText(f"Fuente gráficas: {sample.fuente_grafica}")
+        self.lbl_fuente.setText(f"Fuente activa: {sample.fuente}")
         self.lbl_hora.setText(f"Hora local: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}")
         self.lbl_muestras.setText(f"Muestras guardadas: {len(self.samples)}")
-        self.lbl_ultima.setText(f"Última actualización feed: {self._fmt_ts(ui_feed.ts_feed_epoch if ui_feed else None)}")
+        self.lbl_ultima.setText(f"Última actualización feed: {self._fmt_ts(feed.ts_feed_epoch)}")
 
         d_abs = "--" if sample.delta_abs is None else f"{sample.delta_abs:+.2f}"
         d_pct = "--" if sample.delta_pct is None else f"{sample.delta_pct:+.4f}%"
@@ -793,9 +627,11 @@ class MonitorSaldoWindow(QtWidgets.QMainWindow):
 
         if estado == "CONGELADO":
             self._log_throttled("freeze", "Feed congelado (>20s sin cambios). Continúa en modo vigilancia.", logging.WARNING)
+        if sample.muestra_valida == 0:
+            self._log_throttled("invalid", f"Lectura no válida ({feed.note}). Se mantiene ejecución.", logging.WARNING)
 
     def _refresh_plots(self) -> None:
-        valid = [s for s in self.plot_series if s.muestra_valida == 1 and s.saldo_real is not None]
+        valid = [s for s in self.series if s.muestra_valida == 1 and s.saldo_real is not None]
         if not valid:
             self.canvas.draw_idle()
             return
