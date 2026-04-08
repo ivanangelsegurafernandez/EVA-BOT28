@@ -305,6 +305,7 @@ class DataEngine:
         self._obs_last_value: Dict[str, pd.DataFrame] = {}
         self._series_last_fingerprint: Optional[Tuple[str, str]] = None
         self._series_lock_warn_ts: float = 0.0
+        self._series_repair_sig: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
 
     @staticmethod
     def _sig(paths: List[Path]) -> Tuple:
@@ -412,8 +413,21 @@ class DataEngine:
         return None
 
     def _repair_series_csv_if_needed(self, path: Path) -> Optional[str]:
+        try:
+            st = path.stat()
+            sig = (int(st.st_mtime_ns), int(st.st_size))
+        except Exception:
+            sig = (None, None)
+        key = str(path)
+        if self._series_repair_sig.get(key) == sig:
+            return None
         created_msg = self._ensure_series_csv_exists(path)
         if created_msg:
+            try:
+                st = path.stat()
+                self._series_repair_sig[key] = (int(st.st_mtime_ns), int(st.st_size))
+            except Exception:
+                self._series_repair_sig[key] = (None, None)
             return created_msg
         try:
             if path.stat().st_size == 0:
@@ -455,11 +469,22 @@ class DataEngine:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
+            try:
+                st = path.stat()
+                self._series_repair_sig[key] = (int(st.st_mtime_ns), int(st.st_size))
+            except Exception:
+                self._series_repair_sig[key] = (None, None)
             if rescued:
                 return f"{SALDO_SERIES_CSV_FILE} reparado de forma conservadora (rescatadas {len(rescued)} filas)"
             return f"{SALDO_SERIES_CSV_FILE} recreado limpio tras corrupción de cabecera/contenido"
         except Exception as e:
             return f"No se pudo reparar {SALDO_SERIES_CSV_FILE} en {path}: {e}"
+        finally:
+            try:
+                st = path.stat()
+                self._series_repair_sig[key] = (int(st.st_mtime_ns), int(st.st_size))
+            except Exception:
+                self._series_repair_sig[key] = (None, None)
 
     def _append_series_sample_if_new(self, path: Path, ts, equity, source: str) -> Optional[str]:
         ts_iso = self._ts_utc_iso(ts)
@@ -525,6 +550,7 @@ class DataEngine:
         last_update,
         source: str,
         observed: pd.DataFrame,
+        estimated: Optional[pd.DataFrame] = None,
     ) -> Optional[Tuple[str, float, str]]:
         if not hist.empty:
             row = hist.iloc[-1]
@@ -548,6 +574,12 @@ class DataEngine:
             eq = self._normalize_equity_value(row.get("equity"))
             if ts_iso and eq is not None:
                 return (ts_iso, eq, "OBSERVADO_FALLBACK")
+        if estimated is not None and not estimated.empty:
+            row = estimated.iloc[-1]
+            ts_iso = self._ts_utc_iso(row.get("timestamp"))
+            eq = self._normalize_equity_value(row.get("equity"))
+            if ts_iso and eq is not None:
+                return (ts_iso, eq, "ESTIMADO_EMERGENCIA")
         return None
 
     def _cached(self, key: str, sig: Tuple):
@@ -660,7 +692,11 @@ class DataEngine:
         if cached is not None:
             return cached
         warnings: List[str] = []
+        found_any = False
         for p in paths:
+            if not p.exists():
+                continue
+            found_any = True
             try:
                 repair_msg = self._repair_series_csv_if_needed(p)
                 if repair_msg:
@@ -673,6 +709,11 @@ class DataEngine:
                 return self._store_cache("series_csv", sig, (d, warn_msg, p))
             except Exception as e:
                 warnings.append(f"{SALDO_SERIES_CSV_FILE} inválido en {p}: {e}")
+        if not found_any:
+            primary = Path(SALDO_SERIES_CSV_PATH).expanduser()
+            msg = self._ensure_series_csv_exists(primary)
+            if msg:
+                warnings.append(msg)
         err = " | ".join(warnings[-3:]) if warnings else None
         return self._store_cache("series_csv", sig, (pd.DataFrame(columns=["timestamp", "equity"]), err, None))
 
@@ -955,7 +996,7 @@ class DataEngine:
             warnings.append("No se puede trazar línea: se requieren al menos 2 puntos")
         if source == "SIN DATOS REALES" and not estimated.empty:
             warnings.append("Estimado CSV disponible solo como auxiliar")
-        if view == "REAL":
+        if view == "REAL" and master is None and hist.empty and source in ("OBSERVADO", "LIVE", "SIN DATOS REALES"):
             sample = self._extract_best_real_sample_for_persist(
                 hist=hist,
                 master=master,
@@ -963,6 +1004,7 @@ class DataEngine:
                 last_update=last_update,
                 source=source,
                 observed=observed,
+                estimated=estimated,
             )
             if sample is not None:
                 ts_iso, eq, src = sample

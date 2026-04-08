@@ -175,11 +175,12 @@ ACTIVOS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
 MARTINGALA_DEMO = [1, 2, 4, 8]
 MARTINGALA_REAL = [1, 2, 4, 8]
 VELAS = 20
-PAUSA_POST_OPERACION_S = 8  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
+PAUSA_POST_OPERACION_S = 2  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
 # ==================== VENTANA DE DECISIÓN IA ====================
 # Objetivo: dar tiempo al MAESTRO + humano para decidir pasar a REAL ANTES del BUY.
+# Ventana corta de decisión IA para evitar freno excesivo del ciclo.
 # (0 para desactivar)
-VENTANA_DECISION_IA_S = 30        # segundos (alineado con maestro)
+VENTANA_DECISION_IA_S = 6         # segundos (alineado con maestro)
 VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
 # === Filtro avanzado (sin cambiar 13 features) ===
 SCORE_MIN = 2.35            # score mínimo para aceptar un setup
@@ -346,28 +347,52 @@ def _sync_round_write_wait_heartbeat(round_id: int, next_round: int):
     payload["last_seen_ts"] = time.time()
     _sync_round_write_json_atomic(path, payload)
 
+
+def _sync_round_write_release_heartbeat(round_id: int, next_round: int):
+    path = _sync_round_ack_path()
+    prev = _sync_round_safe_read_json(path) or {}
+    payload = dict(prev) if isinstance(prev, dict) else {}
+    payload["bot"] = NOMBRE_BOT
+    payload["round_id"] = int(round_id)
+    payload["status"] = "closed"
+    payload["sync_wait"] = False
+    payload["waiting_release_round"] = int(next_round)
+    payload["last_seen_ts"] = time.time()
+    _sync_round_write_json_atomic(path, payload)
+
+
 async def _sync_round_wait_release(round_id: int) -> int:
     rid = max(1, int(round_id or 1))
     next_round = rid + 1
     print(Fore.YELLOW + Style.BRIGHT + f"⏸️ LXV_SYNC_COLUMN standby columna: {NOMBRE_BOT} ronda #{rid} esperando liberación #{next_round}...")
     estado_bot["sync_wait"] = True
+    last_hb_ts = 0.0
+    last_released = None
+    first_wait_tick = True
     while not stop_event.is_set():
         st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
         try:
             released = int(st.get("released_round", 1) or 1)
         except Exception:
             released = 1
+        now_ts = time.time()
+        should_write = first_wait_tick or (released != last_released) or ((now_ts - last_hb_ts) >= 2.0)
         if released >= next_round:
             estado_bot["sync_wait"] = False
-            _sync_round_write_wait_heartbeat(rid, next_round)
+            _sync_round_write_release_heartbeat(rid, next_round)
             print(Fore.GREEN + f"🔓 LXV_SYNC_COLUMN liberación detectada: ronda #{released} (bot {NOMBRE_BOT})")
             print(Fore.GREEN + Style.BRIGHT + f"▶️ LXV_SYNC_COLUMN salida standby: {NOMBRE_BOT} → ronda #{next_round}")
             return next_round
-        _sync_round_write_wait_heartbeat(rid, next_round)
+        if should_write:
+            _sync_round_write_wait_heartbeat(rid, next_round)
+            last_hb_ts = now_ts
+            last_released = released
+            first_wait_tick = False
         if _print_once(f"sync-standby-{rid}", ttl=6.0):
             print(Fore.CYAN + f"… standby columna {NOMBRE_BOT}: ronda #{rid}, released_round={released}")
-        await asyncio.sleep(0.35)
+        await asyncio.sleep(0.80)
     estado_bot["sync_wait"] = False
+    _sync_round_write_release_heartbeat(rid, next_round)
     return rid
 # === /LXV_SYNC_COLUMN ===
 
