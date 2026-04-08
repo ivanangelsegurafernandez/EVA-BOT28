@@ -821,105 +821,6 @@ class DataEngine:
         err = " | ".join(warnings[-3:]) if warnings else None
         return self._store_cache("series_csv", sig, (pd.DataFrame(columns=["timestamp", "equity", "source"]), err, None))
 
-    def _build_real_series(
-        self,
-        hist: pd.DataFrame,
-        series_csv: pd.DataFrame,
-        master: Optional[Tuple[float, datetime]],
-    ) -> pd.DataFrame:
-        frames: List[pd.DataFrame] = []
-        if not hist.empty:
-            h2 = hist[["timestamp", "equity"]].copy()
-            h2["source"] = "MAESTRO_HISTORY"
-            frames.append(h2)
-        if not series_csv.empty:
-            s2 = series_csv[["timestamp", "equity"]].copy()
-            s2["source"] = series_csv["source"] if "source" in series_csv.columns else "MAESTRO_SERIES_CANONICAL"
-            frames.append(s2)
-        if master is not None:
-            mv, mts = master
-            frames.append(pd.DataFrame([{"timestamp": mts, "equity": mv, "source": "MAESTRO_LIVE"}]))
-        if not frames:
-            return pd.DataFrame(columns=["timestamp", "equity", "source"])
-        real_series = pd.concat(frames, ignore_index=True)
-        real_series["timestamp"] = pd.to_datetime(real_series["timestamp"], errors="coerce", utc=True)
-        real_series["equity"] = pd.to_numeric(real_series["equity"], errors="coerce")
-        real_series = real_series.dropna(subset=["timestamp", "equity"])
-        if "source" not in real_series.columns:
-            real_series["source"] = "MAESTRO_SERIES_CANONICAL"
-        real_series["source"] = real_series["source"].map(self._normalize_source_label)
-        real_series["source_rank"] = real_series["source"].map(self._source_rank).fillna(0).astype(int)
-        real_series = real_series.sort_values(["timestamp", "source_rank"], ascending=[True, False]).drop_duplicates(subset=["timestamp"], keep="first")
-        return real_series.drop(columns=["source_rank"], errors="ignore").reset_index(drop=True)
-
-    def _select_real_effective_source(
-        self,
-        master: Optional[Tuple[float, datetime]],
-        hist: pd.DataFrame,
-        series_csv: pd.DataFrame,
-    ) -> Tuple[str, Optional[float], Optional[datetime], List[str]]:
-        warnings: List[str] = []
-        source = "SIN_DATOS_REALES"
-        saldo_actual: Optional[float] = None
-        last_update: Optional[datetime] = None
-
-        live_fresh = False
-        if master is not None:
-            _mv, mts_live = master
-            live_age_sec = max(0.0, (_now().astimezone(timezone.utc) - mts_live.astimezone(timezone.utc)).total_seconds())
-            live_fresh = live_age_sec <= float(MASTER_LIVE_STALE_SECONDS)
-
-        if master is not None and live_fresh:
-            mv, mts = master
-            return ("MAESTRO_LIVE", float(mv), mts, ["REAL principal = MAESTRO_LIVE"])
-
-        latest_hist = None if hist.empty else hist.iloc[-1]
-        latest_series = None if series_csv.empty else series_csv.iloc[-1]
-        hts = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True) if latest_hist is not None else pd.NaT
-        sts = pd.to_datetime(latest_series["timestamp"], errors="coerce", utc=True) if latest_series is not None else pd.NaT
-        if latest_hist is not None and (pd.isna(sts) or (not pd.isna(hts) and hts >= sts)):
-            source = "MAESTRO_HISTORY"
-            saldo_actual = float(latest_hist["equity"])
-            last_update = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True).to_pydatetime()
-            warnings.append("REAL principal = MAESTRO_HISTORY")
-        elif latest_series is not None:
-            source = self._normalize_source_label(latest_series.get("source")) or "MAESTRO_SERIES_CANONICAL"
-            saldo_actual = float(latest_series["equity"])
-            last_update = pd.to_datetime(latest_series["timestamp"], errors="coerce", utc=True).to_pydatetime()
-            warnings.append(f"REAL principal = {source}")
-        if master is not None and not live_fresh and source != "SIN_DATOS_REALES":
-            warnings.append("Live stale descartado como saldo principal")
-        if source == "SIN_DATOS_REALES":
-            warnings.append("SIN_DATOS_REALES: no hay fuente canónica de saldo real")
-        return (source, saldo_actual, last_update, warnings)
-
-    def _persist_real_if_valid(
-        self,
-        series_target_path: Path,
-        hist: pd.DataFrame,
-        master: Optional[Tuple[float, datetime]],
-        series_csv: pd.DataFrame,
-        saldo_actual: Optional[float],
-        last_update: Optional[datetime],
-        source: str,
-        observed: pd.DataFrame,
-        estimated: pd.DataFrame,
-    ) -> Optional[str]:
-        sample = self._extract_best_real_sample_for_persist(
-            hist=hist,
-            master=master,
-            series_csv=series_csv,
-            saldo_actual=saldo_actual,
-            last_update=last_update,
-            source=source,
-            observed=observed,
-            estimated=estimated,
-        )
-        if sample is None:
-            return None
-        ts_iso, eq, src = sample
-        return self._append_series_sample_if_new(series_target_path, ts_iso, eq, src)
-
     def _normalize_saldo_series_csv(self, path: Path) -> pd.DataFrame:
         rows: List[Tuple[datetime, float, str]] = []
         discarded = 0
@@ -1167,6 +1068,7 @@ class DataEngine:
         master, master_msg, live_path_used = self._read_master_live() if view == "REAL" else (None, None, None)
         hist, hist_msg, hist_path_used, hist_growth_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None, None)
         series_csv, series_msg, series_path_used = self._read_saldo_series_csv() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None)
+        real_primary_ok = view == "REAL" and (master is not None or not hist.empty or not series_csv.empty)
         observed = self._parse_observed(view) if view != "REAL" else pd.DataFrame(columns=["timestamp", "equity"])
         estimated = self._build_estimated(view) if view != "REAL" else self._est_last_value.get(view, pd.DataFrame(columns=["timestamp", "equity"]))
 
@@ -1231,13 +1133,62 @@ class DataEngine:
         real_series = pd.DataFrame(columns=["timestamp", "equity"])
 
         if view == "REAL":
-            real_series = self._build_real_series(hist=hist, series_csv=series_csv, master=master)
-            source, saldo_actual, last_update, select_warnings = self._select_real_effective_source(
-                master=master,
-                hist=hist,
-                series_csv=series_csv,
-            )
-            warnings.extend(select_warnings)
+            frames = []
+            if not hist.empty:
+                h2 = hist[["timestamp", "equity"]].copy()
+                h2["source"] = "MAESTRO_HISTORY"
+                frames.append(h2)
+            if not series_csv.empty:
+                s2 = series_csv[["timestamp", "equity"]].copy()
+                s2["source"] = series_csv["source"] if "source" in series_csv.columns else "MAESTRO_SERIES_CANONICAL"
+                frames.append(s2)
+            if master is not None:
+                mv, mts = master
+                frames.append(pd.DataFrame([{"timestamp": mts, "equity": mv, "source": "MAESTRO_LIVE"}]))
+            if frames:
+                real_series = pd.concat(frames, ignore_index=True)
+                real_series["timestamp"] = pd.to_datetime(real_series["timestamp"], errors="coerce", utc=True)
+                real_series["equity"] = pd.to_numeric(real_series["equity"], errors="coerce")
+                real_series = real_series.dropna(subset=["timestamp", "equity"])
+                if "source" not in real_series.columns:
+                    real_series["source"] = "MAESTRO_SERIES_CANONICAL"
+                real_series["source"] = real_series["source"].map(self._normalize_source_label)
+                real_series["source_rank"] = real_series["source"].map(self._source_rank).fillna(0).astype(int)
+                real_series = real_series.sort_values(["timestamp", "source_rank"], ascending=[True, False]).drop_duplicates(subset=["timestamp"], keep="first")
+                real_series = real_series.drop(columns=["source_rank"], errors="ignore")
+                real_series = real_series.reset_index(drop=True)
+
+            live_fresh = False
+            if master is not None:
+                _mv, mts_live = master
+                live_age_sec = max(0.0, (_now().astimezone(timezone.utc) - mts_live.astimezone(timezone.utc)).total_seconds())
+                live_fresh = live_age_sec <= float(MASTER_LIVE_STALE_SECONDS)
+
+            if master is not None and live_fresh:
+                mv, mts = master
+                source = "MAESTRO_LIVE"
+                saldo_actual = mv
+                last_update = mts
+                warnings.append("REAL principal = MAESTRO_LIVE")
+            else:
+                latest_hist = None if hist.empty else hist.iloc[-1]
+                latest_series = None if series_csv.empty else series_csv.iloc[-1]
+                hts = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True) if latest_hist is not None else pd.NaT
+                sts = pd.to_datetime(latest_series["timestamp"], errors="coerce", utc=True) if latest_series is not None else pd.NaT
+                if latest_hist is not None and (pd.isna(sts) or (not pd.isna(hts) and hts >= sts)):
+                    source = "MAESTRO_HISTORY"
+                    saldo_actual = float(latest_hist["equity"])
+                    last_update = pd.to_datetime(latest_hist["timestamp"], errors="coerce", utc=True).to_pydatetime()
+                    warnings.append("REAL principal = MAESTRO_HISTORY")
+                elif latest_series is not None:
+                    source = self._normalize_source_label(latest_series.get("source")) or "MAESTRO_SERIES_CANONICAL"
+                    saldo_actual = float(latest_series["equity"])
+                    last_update = pd.to_datetime(latest_series["timestamp"], errors="coerce", utc=True).to_pydatetime()
+                    warnings.append(f"REAL principal = {source}")
+                if master is not None and not live_fresh and source != "SIN_DATOS_REALES":
+                    warnings.append("Live stale descartado como saldo principal")
+            if source == "SIN_DATOS_REALES":
+                warnings.append("SIN_DATOS_REALES: no hay fuente canónica de saldo real")
         elif not observed.empty:
             source = "OBSERVADO_FALLBACK"
             saldo_actual = float(observed["equity"].iloc[-1])
@@ -1789,10 +1740,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_meta_compact.setText(
                     f"{snap.now.strftime('%H:%M:%S %Z')} · última {last} · pts {n_visible} · Δvis {compact_delta}"
                 )
-            except Exception as ui_err:
-                self._throttled_warn("ui-secondary", f"Error secundario de UI: {ui_err}")
-                if not self.lbl_meta_compact.text().strip():
-                    self.lbl_meta_compact.setText(f"{snap.now.strftime('%H:%M:%S %Z')} · última {last}")
+            else:
+                self.lbl_stats.setText("STATS VIS: --")
+            self.lbl_meta_compact.setText(
+                f"{snap.now.strftime('%H:%M:%S %Z')} · última {last} · pts {n_visible} · Δvis {compact_delta}"
+            )
 
             last_good_age = "--"
             if self.last_good_last_update is not None:
