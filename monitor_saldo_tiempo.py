@@ -30,7 +30,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import matplotlib.dates as mdates
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
 
@@ -656,7 +656,12 @@ class MonitorSaldoApp:
         self.manual_resume_in_progress = False
         self.reference_reset_ts = time.time()
         self.rearm_cooldown_until = 0.0
-        self.last_balance_for_delta: Optional[float] = self.series[0].saldo if self.series else None
+        self.last_balance_for_delta: Optional[float] = None
+        self.delta_reference_balance: Optional[float] = None
+        self._view_modes_cycle = ["1h", "6h", "12h", "24h", "7d", "all"]
+        self._pause_banner_visible = False
+        self._manual_view_active = False
+        self._pan_state: Optional[dict] = None
 
         # === Tema oscuro visual (sin tocar lógica) ===
         style = ttk.Style()
@@ -821,8 +826,15 @@ class MonitorSaldoApp:
 
         self.canvas = FigureCanvasTkAgg(fig, master=root)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        self.toolbar = NavigationToolbar2Tk(self.canvas, root, pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.pack(fill="x", padx=10, pady=(0, 4))
         if bool(ENABLE_PLOT_HOVER):
             self.canvas.mpl_connect("motion_notify_event", self._on_plot_hover)
+        self.canvas.mpl_connect("scroll_event", self._on_plot_scroll)
+        self.canvas.mpl_connect("button_press_event", self._on_plot_button_press)
+        self.canvas.mpl_connect("button_release_event", self._on_plot_button_release)
+        self.canvas.mpl_connect("motion_notify_event", self._on_plot_pan_motion)
         self._xs_num: List[float] = []
         self._ys_live: List[float] = []
 
@@ -865,6 +877,77 @@ class MonitorSaldoApp:
     def _on_close(self):
         self.stop_evt.set()
         self.root.after(200, self.root.destroy)
+
+    @staticmethod
+    def _event_has_modifier(event, token: str) -> bool:
+        key = str(getattr(event, "key", "") or "").lower()
+        return token in key
+
+    def _on_plot_scroll(self, event):
+        if event is None or event.inaxes != self.ax:
+            return
+        step_up = (getattr(event, "step", 0) or 0) > 0
+        if self._event_has_modifier(event, "control"):
+            if event.ydata is None:
+                return
+            y0, y1 = self.ax.get_ylim()
+            factor = 0.90 if step_up else 1.10
+            span = (y1 - y0) * factor
+            center = float(event.ydata)
+            self.ax.set_ylim(center - span / 2.0, center + span / 2.0)
+            self._manual_view_active = True
+            self.canvas.draw_idle()
+            return
+        if self._event_has_modifier(event, "shift"):
+            if event.xdata is None:
+                return
+            x0, x1 = self.ax.get_xlim()
+            factor = 0.90 if step_up else 1.10
+            span = (x1 - x0) * factor
+            center = float(event.xdata)
+            self.ax.set_xlim(center - span / 2.0, center + span / 2.0)
+            self._manual_view_active = True
+            self.canvas.draw_idle()
+            return
+        mode = self.view_mode.get()
+        idx = self._view_modes_cycle.index(mode) if mode in self._view_modes_cycle else 1
+        nxt = min(idx + 1, len(self._view_modes_cycle) - 1) if step_up else max(idx - 1, 0)
+        self._manual_view_active = False
+        self.view_mode.set(self._view_modes_cycle[nxt])
+        self.actualizar_grafica()
+
+    def _on_plot_button_press(self, event):
+        if event is None or event.inaxes != self.ax:
+            return
+        if bool(getattr(event, "dblclick", False)):
+            self._manual_view_active = False
+            self._pan_state = None
+            self.actualizar_grafica()
+            return
+        if int(getattr(event, "button", 0) or 0) == 1 and event.xdata is not None and event.ydata is not None:
+            self._pan_state = {
+                "x": float(event.xdata),
+                "y": float(event.ydata),
+                "xlim": tuple(self.ax.get_xlim()),
+                "ylim": tuple(self.ax.get_ylim()),
+            }
+
+    def _on_plot_pan_motion(self, event):
+        if not self._pan_state or event is None or event.inaxes != self.ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        dx = float(event.xdata) - float(self._pan_state["x"])
+        dy = float(event.ydata) - float(self._pan_state["y"])
+        x0, x1 = self._pan_state["xlim"]
+        y0, y1 = self._pan_state["ylim"]
+        self.ax.set_xlim(x0 - dx, x1 - dx)
+        self.ax.set_ylim(y0 - dy, y1 - dy)
+        self._manual_view_active = True
+        self.canvas.draw_idle()
+
+    def _on_plot_button_release(self, event):
+        self._pan_state = None
 
     def aplicar_escala_manual(self):
         try:
@@ -1025,12 +1108,15 @@ class MonitorSaldoApp:
         if current_balance is None:
             self.lbl_delta.config(text="Δ -- (--%)", foreground="#cfcfcf")
             return
-        if self.last_balance_for_delta is None:
+        ref_balance = self.delta_reference_balance
+        if ref_balance is None:
+            ref_balance = self.last_balance_for_delta
+        if ref_balance is None:
             self.last_balance_for_delta = float(current_balance)
             self.lbl_delta.config(text="Δ +0.00 (+0.00%)", foreground="#b4ffb4")
             return
-        delta = float(current_balance) - float(self.last_balance_for_delta)
-        pct = (delta / self.last_balance_for_delta * 100.0) if abs(self.last_balance_for_delta) > 1e-9 else 0.0
+        delta = float(current_balance) - float(ref_balance)
+        pct = (delta / ref_balance * 100.0) if abs(ref_balance) > 1e-9 else 0.0
         color = "#7bffb2" if delta >= 0 else "#ff9a9a"
         self.lbl_delta.config(text=f"Δ {delta:+,.2f} ({pct:+.2f}%)", foreground=color)
 
@@ -1160,7 +1246,9 @@ class MonitorSaldoApp:
 
     def _render_pause_banner(self):
         if self.protection_active:
-            self.pause_banner.pack(fill="x", pady=(0, 4))
+            if not self._pause_banner_visible:
+                self.pause_banner.pack(fill="x", pady=(0, 4))
+                self._pause_banner_visible = True
             now_ts = time.time()
             remain = 0
             if self.protection_resume_ts is not None:
@@ -1181,8 +1269,9 @@ class MonitorSaldoApp:
             if remain <= 0:
                 self._clear_master_pause(manual=False)
         else:
-            if self.pause_banner.winfo_manager():
+            if self._pause_banner_visible and self.pause_banner.winfo_manager():
                 self.pause_banner.pack_forget()
+                self._pause_banner_visible = False
             self.root.configure(bg="#0b0b0b")
             self.btn_manual_resume.state(["!disabled"])
 
@@ -1213,6 +1302,9 @@ class MonitorSaldoApp:
         if not window:
             window = samples[-1:]
         window.sort(key=lambda s: float(s.ts_epoch))
+        self.last_balance_for_delta = float(window[-2].saldo) if len(window) > 1 and window[-2].saldo is not None else None
+        self.delta_reference_balance = float(window[0].saldo) if window and window[0].saldo is not None else None
+        self._update_delta_label(float(window[-1].saldo) if window[-1].saldo is not None else None)
 
         xs = [datetime.fromtimestamp(s.ts_epoch, tz=LIMA_TZ) for s in window]
         ys = [float(s.saldo) for s in window if s.saldo is not None]
@@ -1254,9 +1346,14 @@ class MonitorSaldoApp:
         self._xs_num = mdates.date2num(xs).tolist()
         self._ys_live = list(ys)
 
+        prev_xlim = self.ax.get_xlim()
+        prev_ylim = self.ax.get_ylim()
         self.ax.relim()
         self.ax.autoscale_view()
         self._apply_y_scale(ys)
+        if self._manual_view_active:
+            self.ax.set_xlim(prev_xlim)
+            self.ax.set_ylim(prev_ylim)
         self.ax.set_title(f"Saldo REAL vs Tiempo · vista={mode}")
         self._render_pause_banner()
         self.canvas.draw_idle()
