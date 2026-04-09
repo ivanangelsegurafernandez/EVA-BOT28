@@ -751,6 +751,12 @@ class MonitorSaldoApp:
         ymax = max(ys)
 
         if mode == "AUTO":
+            if len(ys) <= 1 or abs(ymax - ymin) < 1e-9:
+                center = float(ys[-1])
+                half = max(abs(center) * 0.03, 0.7)
+                self.ax.set_ylim(center - half, center + half)
+                self.lbl_scale.config(text="ESCALA: AUTO")
+                return
             self.ax.relim()
             self.ax.autoscale_view()
             span = max(ymax - ymin, max(abs(ymax), 1.0) * 0.02, 0.5)
