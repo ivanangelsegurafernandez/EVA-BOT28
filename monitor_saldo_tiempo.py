@@ -58,9 +58,7 @@ SALDO_HISTORY_FILE = "saldo_real_live_history.jsonl"
 SCRIPT_DIR = Path(__file__).resolve().parent
 HOME_DIR = Path.home()
 LIMA_TZ = ZoneInfo("America/Lima")
-MASTER_PAUSE_STATE_PATH = Path(
-    os.path.abspath(os.path.expanduser(os.getenv("MAESTRO_PAUSE_STATE_PATH", str(SCRIPT_DIR / "maestro_pause_state.json"))))
-)
+MASTER_PAUSE_STATE_PATH = Path(os.path.expanduser(os.getenv("MAESTRO_PAUSE_STATE_PATH", str(SCRIPT_DIR / "maestro_pause_state.json"))))
 PROTECTION_DRAWDOWN_PCT = float(os.getenv("SALDO_MONITOR_PROTECTION_DRAWDOWN", "0.20"))
 PROTECTION_PAUSE_SECONDS = int(float(os.getenv("SALDO_MONITOR_PROTECTION_PAUSE_SECONDS", "1200")))
 
@@ -649,7 +647,6 @@ class MonitorSaldoApp:
         self.manual_max_y = 100.0
         self.last_valid_manual_range: Tuple[float, float] = (self.manual_min_y, self.manual_max_y)
         self.pause_state_path = MASTER_PAUSE_STATE_PATH
-        self.pause_path = self.pause_state_path
         self.protection_active = False
         self.protection_started_ts: Optional[float] = None
         self.protection_resume_ts: Optional[float] = None
@@ -1068,9 +1065,8 @@ class MonitorSaldoApp:
             "source": "monitor_saldo_tiempo.py",
             "reference_balance": float(self.protection_reference_balance),
             "trigger_balance": float(current_balance),
-            "drawdown_pct": float(PROTECTION_DRAWDOWN_PCT),
         }
-        _atomic_write_text(self.pause_path, json.dumps(payload, ensure_ascii=False, indent=2))
+        _atomic_write_text(self.pause_state_path, json.dumps(payload, ensure_ascii=False, indent=2))
         self.protection_active = True
         self.protection_started_ts = float(payload["started_ts"])
         self.protection_resume_ts = float(payload["resume_ts"])
@@ -1084,25 +1080,20 @@ class MonitorSaldoApp:
             f"resume={_fmt_lima(float(payload['resume_ts']))}"
         )
 
-    def _clear_pause_file(self, path: Path, clear_reason: str = ""):
-        now_ts = time.time()
-        payload = {
-            "paused": False,
-            "reason": str(clear_reason or ""),
-            "started_ts": 0,
-            "resume_ts": 0,
-            "duration_sec": 0,
-            "source": "monitor_saldo_tiempo.py",
-            "cleared_ts": float(now_ts),
-            "cleared_iso": datetime.fromtimestamp(now_ts, tz=LIMA_TZ).isoformat(),
-        }
-        _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
-
     def _clear_master_pause(self, manual: bool = False):
         now_ts = time.time()
         current_balance = self.last_valid.saldo if self.last_valid and self.last_valid.saldo is not None else None
-        clear_reason = "manual_resume" if manual else "expired"
-        self._clear_pause_file(self.pause_path, clear_reason=clear_reason)
+        payload = {
+            "paused": False,
+            "reason": "manual_resume" if manual else "auto_resume",
+            "started_ts": self.protection_started_ts if self.protection_started_ts is not None else now_ts,
+            "resume_ts": now_ts,
+            "duration_sec": 0,
+            "source": "monitor_saldo_tiempo.py",
+            "reference_balance": current_balance if self._valid_balance(current_balance) else self.protection_reference_balance,
+            "trigger_balance": self.protection_trigger_balance,
+        }
+        _atomic_write_text(self.pause_state_path, json.dumps(payload, ensure_ascii=False, indent=2))
         self.protection_active = False
         self.protection_started_ts = None
         self.protection_resume_ts = None
@@ -1118,10 +1109,6 @@ class MonitorSaldoApp:
             print("[PROTECTION][RESUME] reanudado manualmente")
         else:
             print("[PROTECTION][RESUME] pausa finalizada por tiempo")
-
-    def _auto_expire_pause(self):
-        if self.protection_active:
-            self._clear_master_pause(manual=False)
 
     def _manual_resume(self):
         if self.manual_resume_in_progress:
@@ -1139,14 +1126,13 @@ class MonitorSaldoApp:
                 self.btn_manual_resume.state(["!disabled"])
 
     def _load_existing_pause_state(self):
-        data = _safe_read_json(self.pause_path) or {}
+        data = _safe_read_json(self.pause_state_path) or {}
         if not bool(data.get("paused")):
             return
         now_ts = time.time()
         resume_ts = _to_float(data.get("resume_ts"))
         if resume_ts is not None and resume_ts <= now_ts:
-            self._clear_pause_file(self.pause_path, clear_reason="expired")
-            self.protection_active = False
+            self._clear_master_pause(manual=False)
             return
         self.protection_active = True
         self.protection_started_ts = _to_float(data.get("started_ts")) or now_ts
@@ -1160,7 +1146,7 @@ class MonitorSaldoApp:
             return
         if self.protection_active:
             if self.protection_resume_ts is not None and now_ts >= float(self.protection_resume_ts):
-                self._auto_expire_pause()
+                self._clear_master_pause(manual=False)
             return
 
         self._compute_reference_balance(float(current_balance))
@@ -1193,7 +1179,7 @@ class MonitorSaldoApp:
             self.root.configure(bg="#210808")
             self.btn_manual_resume.state(["!disabled"])
             if remain <= 0:
-                self._auto_expire_pause()
+                self._clear_master_pause(manual=False)
         else:
             if self.pause_banner.winfo_manager():
                 self.pause_banner.pack_forget()

@@ -2375,9 +2375,6 @@ def actualizar_pause_state_maestro():
             if reason == "manual_resume":
                 agregar_evento("✅ Pausa liberada manualmente desde monitor.")
                 print("✅ Pausa liberada manualmente desde monitor")
-            elif reason in ("expired", ""):
-                agregar_evento("✅ Pausa finalizada por tiempo.")
-                print("✅ Pausa finalizada por tiempo")
             else:
                 agregar_evento("✅ Pausa finalizada por tiempo.")
                 print("✅ Pausa finalizada por tiempo")
