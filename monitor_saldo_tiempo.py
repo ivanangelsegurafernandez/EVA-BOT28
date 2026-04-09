@@ -43,11 +43,13 @@ CSV_WRITE_RETRIES = int(os.getenv("SALDO_MONITOR_WRITE_RETRIES", "8"))
 CSV_WRITE_RETRY_SLEEP = float(os.getenv("SALDO_MONITOR_WRITE_RETRY_SLEEP", "0.15"))
 LOCK_RETRY_SLEEP = float(os.getenv("SALDO_MONITOR_LOCK_RETRY_SLEEP", "0.10"))
 DERIV_WS_URL = os.getenv("DERIV_WS_URL", "wss://ws.derivws.com/websockets/v3?app_id=1089")
+ENABLE_PLOT_HOVER = False
+DEBUG_LOGS = False
 
 SOURCE_SERIES_FILE = "saldo_real_series.csv"  # feed del maestro (solo lectura)
 DB_FILENAME = "saldo_monitor_db.csv"  # DB canónica del monitor (lectura/escritura)
 LEGACY_DB_FILENAME = "saldo_real_series.csv"  # histórico legacy del monitor
-DB_HEADERS = ["ts_epoch", "ts_iso", "saldo", "fuente", "maestro_activo", "observacion"]
+DB_HEADERS = ["ts_epoch", "ts_iso", "saldo", "fuente", "maestro_activo", "observacion", "source_ts_epoch", "source_ts_iso"]
 
 SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_HISTORY_FILE = "saldo_real_live_history.jsonl"
@@ -65,6 +67,8 @@ class SaldoSample:
     fuente: str
     maestro_activo: int
     observacion: str
+    source_ts_epoch: Optional[float] = None
+    source_ts_iso: Optional[str] = None
 
 
 @dataclass
@@ -236,7 +240,7 @@ async def _leer_saldo_deriv_ws() -> Optional[SaldoSample]:
             if saldo is None:
                 return None
             ts_epoch = time.time()
-            return SaldoSample(ts_epoch, _now_iso(), saldo, "fallback_deriv_ws", 0, "ok")
+            return SaldoSample(ts_epoch, _now_iso(), saldo, "fallback_deriv_ws", 0, "ok", None, None)
     except Exception:
         return None
 
@@ -252,9 +256,10 @@ def leer_saldo_desde_fuente(db_path: Path) -> Tuple[SaldoSample, Optional[Path]]
                 saldo = _extract_saldo(payload)
                 if saldo is None:
                     continue
-                ts_epoch = _extract_ts_epoch(payload) or now
-                obs = "ok" if now - ts_epoch <= SOURCE_STALE_SECONDS else "stale"
-                return SaldoSample(ts_epoch, _now_iso(), saldo, fuente, 1, obs), path
+                source_ts = _extract_ts_epoch(payload)
+                obs = "ok" if (source_ts is None or now - source_ts <= SOURCE_STALE_SECONDS) else "stale"
+                source_ts_iso = datetime.fromtimestamp(source_ts, tz=LIMA_TZ).isoformat() if isinstance(source_ts, (int, float)) else None
+                return SaldoSample(now, _now_iso(), saldo, fuente, 1, obs, source_ts, source_ts_iso), path
 
             if "history" in fuente:
                 line = _read_last_nonempty_line(path)
@@ -264,9 +269,10 @@ def leer_saldo_desde_fuente(db_path: Path) -> Tuple[SaldoSample, Optional[Path]]
                 saldo = _extract_saldo(payload)
                 if saldo is None:
                     continue
-                ts_epoch = _extract_ts_epoch(payload) or now
-                obs = "ok" if now - ts_epoch <= SOURCE_STALE_SECONDS else "stale"
-                return SaldoSample(ts_epoch, _now_iso(), saldo, fuente, 1, obs), path
+                source_ts = _extract_ts_epoch(payload)
+                obs = "ok" if (source_ts is None or now - source_ts <= SOURCE_STALE_SECONDS) else "stale"
+                source_ts_iso = datetime.fromtimestamp(source_ts, tz=LIMA_TZ).isoformat() if isinstance(source_ts, (int, float)) else None
+                return SaldoSample(now, _now_iso(), saldo, fuente, 1, obs, source_ts, source_ts_iso), path
 
             if "series" in fuente:
                 if not path.exists() or path.stat().st_size <= 0:
@@ -276,20 +282,21 @@ def leer_saldo_desde_fuente(db_path: Path) -> Tuple[SaldoSample, Optional[Path]]
                     continue
                 cols = [c.strip() for c in line.split(",")]
                 saldo = None
-                ts_epoch = now
+                source_ts = None
                 if len(cols) >= 2:
                     saldo = _to_float(cols[1])
                     try:
-                        ts_epoch = datetime.fromisoformat(cols[0].replace("Z", "+00:00")).timestamp()
+                        source_ts = datetime.fromisoformat(cols[0].replace("Z", "+00:00")).timestamp()
                     except Exception:
-                        ts_epoch = now
+                        source_ts = None
                 if saldo is None and len(cols) >= 3:
-                    ts_epoch = _to_float(cols[0]) or now
+                    source_ts = _to_float(cols[0])
                     saldo = _to_float(cols[2])
                 if saldo is None:
                     continue
-                obs = "ok" if now - ts_epoch <= SOURCE_STALE_SECONDS else "stale"
-                return SaldoSample(ts_epoch, _now_iso(), saldo, fuente, 1, obs), path
+                obs = "ok" if (source_ts is None or now - source_ts <= SOURCE_STALE_SECONDS) else "stale"
+                source_ts_iso = datetime.fromtimestamp(source_ts, tz=LIMA_TZ).isoformat() if isinstance(source_ts, (int, float)) else None
+                return SaldoSample(now, _now_iso(), saldo, fuente, 1, obs, source_ts, source_ts_iso), path
         except Exception:
             continue
 
@@ -297,7 +304,7 @@ def leer_saldo_desde_fuente(db_path: Path) -> Tuple[SaldoSample, Optional[Path]]
     if ws_sample is not None:
         return ws_sample, None
 
-    return SaldoSample(now, _now_iso(), None, "sin_fuente", 0, "sin_datos"), None
+    return SaldoSample(now, _now_iso(), None, "sin_fuente", 0, "sin_datos", None, None), None
 
 
 # =========================
@@ -319,7 +326,9 @@ def _normalize_monitor_row(row: Dict[str, str]) -> Optional[SaldoSample]:
     fuente = (row.get("fuente") or "db").strip() or "db"
     maestro_activo = int(_to_float(row.get("maestro_activo")) or 0)
     observacion = (row.get("observacion") or "hist").strip() or "hist"
-    return SaldoSample(ts_epoch, ts_iso, saldo, fuente, maestro_activo, observacion)
+    source_ts_epoch = _to_float(row.get("source_ts_epoch"))
+    source_ts_iso = (row.get("source_ts_iso") or "").strip() or None
+    return SaldoSample(ts_epoch, ts_iso, saldo, fuente, maestro_activo, observacion, source_ts_epoch, source_ts_iso)
 
 
 def _parse_legacy_line(line: str) -> Optional[SaldoSample]:
@@ -339,7 +348,9 @@ def _parse_legacy_line(line: str) -> Optional[SaldoSample]:
                 "saldo": cols[2],
                 "fuente": cols[3],
                 "maestro_activo": cols[4],
-                "observacion": ",".join(cols[5:]),
+                "observacion": cols[5],
+                "source_ts_epoch": cols[6] if len(cols) >= 7 else "",
+                "source_ts_iso": cols[7] if len(cols) >= 8 else "",
             }
         )
 
@@ -355,7 +366,7 @@ def _parse_legacy_line(line: str) -> Optional[SaldoSample]:
             return None
         fuente = cols[2] if len(cols) >= 3 else "legacy_series"
         ts_iso = datetime.fromtimestamp(ts_epoch, tz=LIMA_TZ).isoformat()
-        return SaldoSample(ts_epoch, ts_iso, saldo, fuente or "legacy_series", 1, "migrado_legacy")
+        return SaldoSample(ts_epoch, ts_iso, saldo, fuente or "legacy_series", 1, "migrado_legacy", ts_epoch, ts_iso)
 
     return None
 
@@ -411,6 +422,8 @@ def reparar_y_migrar_db_saldo(db_path: Path, legacy_candidates: List[Path]) -> D
                     s.fuente,
                     str(s.maestro_activo),
                     s.observacion,
+                    "" if s.source_ts_epoch is None else f"{float(s.source_ts_epoch):.3f}",
+                    s.source_ts_iso or "",
                 ]
             )
         fh.flush()
@@ -487,6 +500,9 @@ def _release_lock(lock_path: Path, fd: Optional[int]) -> None:
 def anexar_muestra_csv(db_path: Path, sample: SaldoSample, last_saved: Optional[SaldoSample], lock_path: Path) -> Tuple[bool, str]:
     if sample.saldo is None:
         return False, "sin_saldo"
+    if last_saved is not None and sample.ts_epoch <= float(last_saved.ts_epoch):
+        sample.ts_epoch = float(last_saved.ts_epoch) + 0.001
+        sample.ts_iso = datetime.fromtimestamp(sample.ts_epoch, tz=LIMA_TZ).isoformat()
 
     should_write = last_saved is None
     if not should_write and last_saved is not None:
@@ -512,6 +528,8 @@ def anexar_muestra_csv(db_path: Path, sample: SaldoSample, last_saved: Optional[
         sample.fuente,
         str(sample.maestro_activo),
         sample.observacion,
+        "" if sample.source_ts_epoch is None else f"{float(sample.source_ts_epoch):.3f}",
+        sample.source_ts_iso or "",
     ]
 
     for _ in range(CSV_WRITE_RETRIES):
@@ -563,6 +581,7 @@ class MonitorSaldoApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Monitor saldo vs tiempo (5R6M)")
+        self.root.configure(bg="#0b0b0b")
         self.db_path = SCRIPT_DIR / DB_FILENAME
         self.lock_path = SCRIPT_DIR / f"{DB_FILENAME}.lock"
         self.legacy_db_path = SCRIPT_DIR / LEGACY_DB_FILENAME
@@ -581,8 +600,15 @@ class MonitorSaldoApp:
         print(f"[DB SALDO][CARGA] filas en DB: {len(self.series)} | db_path={self.db_path}")
         self.last_saved: Optional[SaldoSample] = self.series[-1] if self.series else None
         self.last_valid: Optional[SaldoSample] = self.last_saved
+        self.skip_counts = {"sin_cambio": 0, "duplicada_exacta": 0}
+        self.last_skip_summary_ts = 0.0
+        self.skip_summary_every_s = 60.0
+        self.debug_logs = bool(DEBUG_LOGS)
         self.stop_evt = threading.Event()
         self.view_mode = tk.StringVar(value="15m")
+        self.last_status = "OK"
+        self.show_ma_short = tk.BooleanVar(value=True)
+        self.show_ma_long = tk.BooleanVar(value=True)
 
         self.scale_mode = tk.StringVar(value="AUTO")
         self.min_y_var = tk.StringVar(value="0")
@@ -591,51 +617,164 @@ class MonitorSaldoApp:
         self.manual_max_y = 100.0
         self.last_valid_manual_range: Tuple[float, float] = (self.manual_min_y, self.manual_max_y)
 
-        self.lbl_saldo = ttk.Label(root, text="--", font=("Segoe UI", 24, "bold"))
-        self.lbl_saldo.pack(anchor="w", padx=10, pady=6)
+        # === Tema oscuro visual (sin tocar lógica) ===
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure(".", background="#101010", foreground="#f5f5f5")
+        style.configure("Dark.TFrame", background="#101010")
+        style.configure("DarkPanel.TFrame", background="#151515")
+        style.configure("Dark.TLabel", background="#101010", foreground="#f5f5f5")
+        style.configure("Muted.TLabel", background="#101010", foreground="#cfcfcf")
+        style.configure("Scale.TLabel", background="#101010", foreground="#8ad8ff")
+        style.configure("Dark.TRadiobutton", background="#151515", foreground="#f5f5f5")
+        style.map(
+            "Dark.TRadiobutton",
+            background=[("active", "#1b1b1b"), ("selected", "#1b1b1b")],
+            foreground=[("disabled", "#777777"), ("active", "#f5f5f5"), ("selected", "#8ad8ff")],
+        )
+        style.configure("Dark.TCheckbutton", background="#151515", foreground="#f5f5f5")
+        style.map(
+            "Dark.TCheckbutton",
+            background=[("active", "#1b1b1b"), ("selected", "#1b1b1b")],
+            foreground=[("disabled", "#777777"), ("active", "#f5f5f5"), ("selected", "#8ad8ff")],
+        )
+        style.configure("Dark.TButton", background="#222222", foreground="#f5f5f5", borderwidth=1, focusthickness=0)
+        style.map("Dark.TButton", background=[("active", "#2f2f2f"), ("pressed", "#1d1d1d")])
+        style.configure("Dark.TEntry", fieldbackground="#171717", foreground="#f5f5f5")
 
-        self.lbl_status = ttk.Label(root, text="Estado: iniciando...")
-        self.lbl_status.pack(anchor="w", padx=10)
+        header = ttk.Frame(root, style="Dark.TFrame")
+        header.pack(fill="x", padx=8, pady=(4, 1))
 
-        controls = ttk.Frame(root)
-        controls.pack(fill="x", padx=10, pady=6)
+        status_band = ttk.Frame(header, style="DarkPanel.TFrame")
+        status_band.pack(fill="x", pady=(0, 2))
+        self.lbl_status = ttk.Label(status_band, text="Estado: iniciando...", style="Muted.TLabel", anchor="center")
+        self.lbl_status.pack(fill="x", padx=10, pady=(3, 2))
+
+        saldo_band = ttk.Frame(header, style="DarkPanel.TFrame")
+        saldo_band.pack(fill="x", pady=(0, 3))
+        self.lbl_saldo = ttk.Label(
+            saldo_band,
+            text="--",
+            font=("Segoe UI", 96, "bold"),
+            style="Dark.TLabel",
+            anchor="center",
+            justify="center",
+        )
+        self.lbl_saldo.pack(fill="x", padx=10, pady=(3, 4))
+
+        controls = ttk.Frame(header, style="DarkPanel.TFrame")
+        controls.pack(fill="x", padx=0, pady=(0, 2))
         for txt, val in (("5 min", "5m"), ("15 min", "15m"), ("1 hora", "1h"), ("Todo", "all")):
-            ttk.Radiobutton(controls, text=txt, value=val, variable=self.view_mode, command=self.actualizar_grafica).pack(side="left", padx=4)
+            ttk.Radiobutton(
+                controls, text=txt, value=val, variable=self.view_mode, command=self.actualizar_grafica, style="Dark.TRadiobutton"
+            ).pack(side="left", padx=4, pady=1)
+        ttk.Checkbutton(
+            controls, text="MM corta", variable=self.show_ma_short, command=self.actualizar_grafica, style="Dark.TCheckbutton"
+        ).pack(side="right", padx=(2, 8), pady=1)
+        ttk.Checkbutton(
+            controls, text="MM lenta", variable=self.show_ma_long, command=self.actualizar_grafica, style="Dark.TCheckbutton"
+        ).pack(side="right", padx=2, pady=1)
 
-        scale_controls = ttk.Frame(root)
-        scale_controls.pack(fill="x", padx=10, pady=4)
-        ttk.Label(scale_controls, text="Escala Y:").pack(side="left", padx=(0, 6))
-        ttk.Radiobutton(scale_controls, text="AUTO", value="AUTO", variable=self.scale_mode, command=self.actualizar_grafica).pack(side="left", padx=3)
-        ttk.Radiobutton(scale_controls, text="MANUAL", value="MANUAL", variable=self.scale_mode, command=self.actualizar_grafica).pack(side="left", padx=3)
-        ttk.Label(scale_controls, text="Min Y").pack(side="left", padx=(12, 4))
-        ttk.Entry(scale_controls, textvariable=self.min_y_var, width=10).pack(side="left", padx=2)
-        ttk.Label(scale_controls, text="Max Y").pack(side="left", padx=(8, 4))
-        ttk.Entry(scale_controls, textvariable=self.max_y_var, width=10).pack(side="left", padx=2)
-        ttk.Button(scale_controls, text="Aplicar escala", command=self.aplicar_escala_manual).pack(side="left", padx=8)
-        ttk.Button(scale_controls, text="Reset auto", command=self.reset_auto_scale).pack(side="left", padx=4)
+        scale_controls = ttk.Frame(header, style="DarkPanel.TFrame")
+        scale_controls.pack(fill="x", padx=0, pady=(0, 1))
+        ttk.Label(scale_controls, text="Escala Y:", style="Dark.TLabel").pack(side="left", padx=(6, 6), pady=1)
+        ttk.Radiobutton(scale_controls, text="AUTO", value="AUTO", variable=self.scale_mode, command=self.actualizar_grafica, style="Dark.TRadiobutton").pack(side="left", padx=3, pady=1)
+        ttk.Radiobutton(scale_controls, text="MANUAL", value="MANUAL", variable=self.scale_mode, command=self.actualizar_grafica, style="Dark.TRadiobutton").pack(side="left", padx=3, pady=1)
+        ttk.Label(scale_controls, text="Min Y", style="Dark.TLabel").pack(side="left", padx=(12, 4), pady=1)
+        ttk.Entry(scale_controls, textvariable=self.min_y_var, width=10, style="Dark.TEntry").pack(side="left", padx=2, pady=1)
+        ttk.Label(scale_controls, text="Max Y", style="Dark.TLabel").pack(side="left", padx=(8, 4), pady=1)
+        ttk.Entry(scale_controls, textvariable=self.max_y_var, width=10, style="Dark.TEntry").pack(side="left", padx=2, pady=1)
+        ttk.Button(scale_controls, text="Aplicar escala", command=self.aplicar_escala_manual, style="Dark.TButton").pack(side="left", padx=8, pady=1)
+        ttk.Button(scale_controls, text="Reset auto", command=self.reset_auto_scale, style="Dark.TButton").pack(side="left", padx=4, pady=1)
 
-        self.lbl_scale = ttk.Label(root, text="ESCALA: AUTO")
-        self.lbl_scale.pack(anchor="w", padx=10, pady=(0, 4))
+        self.lbl_scale = ttk.Label(header, text="ESCALA: AUTO", style="Scale.TLabel", anchor="center")
+        self.lbl_scale.pack(fill="x", padx=10, pady=(0, 2))
 
         fig = Figure(figsize=(10, 5), dpi=100)
         self.ax = fig.add_subplot(111)
-        self.ax.set_title("Saldo REAL vs Tiempo")
-        self.ax.set_xlabel("Tiempo (hora Perú)")
-        self.ax.set_ylabel("Dinero / Saldo")
-        self.line_main, = self.ax.plot([], [], lw=2, label="Saldo")
-        self.line_ma_short, = self.ax.plot([], [], lw=1.2, alpha=0.8, label="MM corta")
-        self.line_ma_long, = self.ax.plot([], [], lw=1.2, alpha=0.8, label="MM lenta")
-        self.marker_last, = self.ax.plot([], [], marker="o", linestyle="", markersize=6)
-        self.ax.legend(loc="best")
-        self.ax.grid(True, alpha=0.3)
+        fig.patch.set_facecolor("#0b0b0b")
+        self.ax.set_facecolor("#111111")
+        self.ax.set_title("Saldo REAL vs Tiempo", color="#f5f5f5")
+        self.ax.set_xlabel("Tiempo (hora Perú)", color="#cfcfcf")
+        self.ax.set_ylabel("Dinero / Saldo", color="#cfcfcf")
+        self.ax.tick_params(colors="#cfcfcf")
+        for sp in self.ax.spines.values():
+            sp.set_color("#4a4a4a")
+        self.line_main, = self.ax.plot([], [], lw=2.6, color="#35f2ff", label="Saldo")
+        self.line_ma_short, = self.ax.plot([], [], lw=1.5, alpha=0.95, color="#39ff88", label="MM corta")
+        self.line_ma_long, = self.ax.plot([], [], lw=1.4, alpha=0.95, color="#ffd84d", label="MM lenta")
+        self.marker_last, = self.ax.plot([], [], marker="o", linestyle="", markersize=8, color="#ffffff")
+        self.last_price_line = self.ax.axhline(0.0, color="#35f2ff", linestyle="--", linewidth=1.0, alpha=0.35)
+        self.range_low_line = self.ax.axhline(0.0, color="#8a8a8a", linestyle=":", linewidth=0.9, alpha=0.5)
+        self.range_high_line = self.ax.axhline(0.0, color="#8a8a8a", linestyle=":", linewidth=0.9, alpha=0.5)
+        self.last_value_annot = self.ax.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(8, 0),
+            textcoords="offset points",
+            color="#f5f5f5",
+            fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.2", fc="#1a1a1a", ec="#35f2ff", alpha=0.9),
+        )
+        self.crosshair_v = self.ax.axvline(color="#35f2ff", linewidth=0.8, alpha=0.35, visible=False)
+        self.crosshair_h = self.ax.axhline(color="#35f2ff", linewidth=0.8, alpha=0.35, visible=False)
+        self.crosshair_txt = self.ax.text(
+            0.02, 0.97, "", transform=self.ax.transAxes, va="top", ha="left", color="#9fe8ff", fontsize=8,
+            bbox=dict(boxstyle="round,pad=0.2", fc="#111111", ec="#35505a", alpha=0.75), visible=False
+        )
+        legend = self.ax.legend(loc="best")
+        if legend:
+            legend.get_frame().set_facecolor("#1a1a1a")
+            legend.get_frame().set_edgecolor("#4a4a4a")
+            for t in legend.get_texts():
+                t.set_color("#f5f5f5")
+        self.ax.grid(True, color="#3b3b3b", alpha=0.75, linewidth=0.9)
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S", tz=LIMA_TZ))
+        self.ax.tick_params(axis="x", rotation=18)
 
         self.canvas = FigureCanvasTkAgg(fig, master=root)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        if bool(ENABLE_PLOT_HOVER):
+            self.canvas.mpl_connect("motion_notify_event", self._on_plot_hover)
+        self._xs_num: List[float] = []
+        self._ys_live: List[float] = []
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         threading.Thread(target=self.loop_muestreo, daemon=True).start()
         self.root.after(500, self.actualizar_grafica)
+
+    def _on_plot_hover(self, event):
+        if not bool(ENABLE_PLOT_HOVER):
+            return
+        try:
+            if not all(hasattr(self, a) for a in ("crosshair_v", "crosshair_h", "crosshair_txt", "canvas", "_xs_num", "_ys_live")):
+                return
+            if event is None or event.inaxes != self.ax or not self._xs_num or not self._ys_live:
+                if self.crosshair_v.get_visible() or self.crosshair_h.get_visible() or self.crosshair_txt.get_visible():
+                    self.crosshair_v.set_visible(False)
+                    self.crosshair_h.set_visible(False)
+                    self.crosshair_txt.set_visible(False)
+                    self.canvas.draw_idle()
+                return
+            if event.xdata is None or event.ydata is None:
+                return
+            idx = min(range(len(self._xs_num)), key=lambda i: abs(self._xs_num[i] - float(event.xdata)))
+            x_num = self._xs_num[idx]
+            y_val = self._ys_live[idx]
+            dt = mdates.num2date(x_num, tz=LIMA_TZ).strftime("%H:%M:%S")
+            self.crosshair_v.set_xdata([x_num, x_num])
+            self.crosshair_h.set_ydata([y_val, y_val])
+            self.crosshair_txt.set_text(f"{dt} | {y_val:,.2f}")
+            self.crosshair_v.set_visible(True)
+            self.crosshair_h.set_visible(True)
+            self.crosshair_txt.set_visible(True)
+            self.canvas.draw_idle()
+        except Exception:
+            # Degradación elegante: nunca romper ni spamear por hover.
+            return
 
     def _on_close(self):
         self.stop_evt.set()
@@ -672,6 +811,12 @@ class MonitorSaldoApp:
         ymax = max(ys)
 
         if mode == "AUTO":
+            if len(ys) <= 1 or abs(ymax - ymin) < 1e-9:
+                center = float(ys[-1])
+                half = max(abs(center) * 0.03, 0.7)
+                self.ax.set_ylim(center - half, center + half)
+                self.lbl_scale.config(text="ESCALA: AUTO")
+                return
             self.ax.relim()
             self.ax.autoscale_view()
             span = max(ymax - ymin, max(abs(ymax), 1.0) * 0.02, 0.5)
@@ -695,7 +840,7 @@ class MonitorSaldoApp:
             expanded = True
 
         if expanded:
-            print(f"[ESCALA] expandida automáticamente: {orig_min:.2f}..{orig_max:.2f} -> {min_y:.2f}..{max_y:.2f}")
+            print(f"[ESCALA] expandida automáticamente: {orig_min:,.2f}..{orig_max:,.2f} -> {min_y:,.2f}..{max_y:,.2f}")
             self.manual_min_y = min_y
             self.manual_max_y = max_y
             self.last_valid_manual_range = (min_y, max_y)
@@ -704,6 +849,23 @@ class MonitorSaldoApp:
 
         self.ax.set_ylim(min_y, max_y)
         self.lbl_scale.config(text=f"ESCALA: MANUAL {min_y:,.2f}..{max_y:,.2f} USD")
+
+    def _flush_skip_summary(self, force: bool = False):
+        if not bool(self.debug_logs):
+            return
+        now = time.time()
+        total = int(self.skip_counts.get("sin_cambio", 0)) + int(self.skip_counts.get("duplicada_exacta", 0))
+        if total <= 0:
+            return
+        if (not force) and (now - float(self.last_skip_summary_ts or 0.0) < float(self.skip_summary_every_s)):
+            return
+        print(
+            f"[DB SALDO][SKIP-RESUMEN] "
+            f"sin_cambio={int(self.skip_counts.get('sin_cambio', 0))} "
+            f"duplicada_exacta={int(self.skip_counts.get('duplicada_exacta', 0))}"
+        )
+        self.skip_counts = {"sin_cambio": 0, "duplicada_exacta": 0}
+        self.last_skip_summary_ts = now
 
     def loop_muestreo(self):
         last_log_err = 0.0
@@ -725,8 +887,13 @@ class MonitorSaldoApp:
                     self._flush_skip_summary(force=True)
                     self.series.append(sample)
                     self.last_saved = sample
+                    print(
+                        f"[DB SALDO][WRITE] saldo={float(sample.saldo):,.2f} "
+                        f"fuente={sample.fuente} ts={_fmt_lima(sample.ts_epoch)} db={self.db_path.name}"
+                    )
                 elif reason in {"duplicada_exacta", "sin_cambio"}:
-                    print(f"[DB SALDO][SKIP] muestra duplicada ({reason})")
+                    self.skip_counts[reason] = int(self.skip_counts.get(reason, 0)) + 1
+                    self._flush_skip_summary(force=False)
 
                 status = "OK"
                 if sample.observacion == "stale":
@@ -753,7 +920,14 @@ class MonitorSaldoApp:
         )
 
         def apply_text():
+            self.last_status = status
             self.lbl_saldo.config(text=saldo_txt)
+            if status == "OK":
+                self.lbl_saldo.config(foreground="#35f2ff")
+            elif status == "STALE":
+                self.lbl_saldo.config(foreground="#ffe14d")
+            else:
+                self.lbl_saldo.config(foreground="#ff7f50")
             self.lbl_status.config(text=text)
 
         self.root.after(0, apply_text)
@@ -779,6 +953,7 @@ class MonitorSaldoApp:
         window = [s for s in samples if s.ts_epoch >= low]
         if not window:
             window = samples[-1:]
+        window.sort(key=lambda s: float(s.ts_epoch))
 
         xs = [datetime.fromtimestamp(s.ts_epoch, tz=LIMA_TZ) for s in window]
         ys = [float(s.saldo) for s in window if s.saldo is not None]
@@ -799,9 +974,26 @@ class MonitorSaldoApp:
         ma_long = moving_avg(ys, 20)
 
         self.line_main.set_data(xs, ys)
-        self.line_ma_short.set_data(xs, ma_short)
-        self.line_ma_long.set_data(xs, ma_long)
+        self.line_main.set_visible(True)
+        if bool(self.show_ma_short.get()):
+            self.line_ma_short.set_data(xs, ma_short)
+            self.line_ma_short.set_visible(True)
+        else:
+            self.line_ma_short.set_visible(False)
+        if bool(self.show_ma_long.get()):
+            self.line_ma_long.set_data(xs, ma_long)
+            self.line_ma_long.set_visible(True)
+        else:
+            self.line_ma_long.set_visible(False)
         self.marker_last.set_data([xs[-1]], [ys[-1]])
+        self.last_price_line.set_ydata([ys[-1], ys[-1]])
+        y_min, y_max = min(ys), max(ys)
+        self.range_low_line.set_ydata([y_min, y_min])
+        self.range_high_line.set_ydata([y_max, y_max])
+        self.last_value_annot.xy = (xs[-1], ys[-1])
+        self.last_value_annot.set_text(f"  {ys[-1]:,.2f}  ")
+        self._xs_num = mdates.date2num(xs).tolist()
+        self._ys_live = list(ys)
 
         self.ax.relim()
         self.ax.autoscale_view()

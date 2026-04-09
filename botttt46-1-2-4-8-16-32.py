@@ -201,6 +201,7 @@ estado_bot = {
     "score_senal": None,
     "ciclo_actual": 1,
     "real_first_cycle_reset_pending": False,
+    "real_cycle_guard_last_ts": 0.0,
     "sync_round_id": 1,
     "sync_wait": False,
     "pending_contract_resolution": False,
@@ -225,8 +226,8 @@ REAL_COMMIT_WINDOW_S = 20
 last_real_contract_id = None
 real_buy_commit_until = 0.0
 
-# Higiene de riesgo: al saltar a REAL, arrancar en C1 (aunque el maestro sugiera C2+)
-RESET_CICLO_EN_ENTRADA_REAL = True
+# Legado: no gobierna el ciclo REAL actual; manda ciclo_maestro/ciclo_forzado
+RESET_CICLO_EN_ENTRADA_REAL = True  # legado visual/auditoría
 
 def commit_guard_active() -> bool:
     return (last_real_contract_id is not None) and (time.time() < real_buy_commit_until)
@@ -2483,6 +2484,15 @@ async def ejecutar_panel():
                 ciclo_forzado = None
 
             ciclo = ciclo_maestro or ciclo_forzado or 1
+            if modo_real:
+                now_guard = time.time()
+                last_guard = float(estado_bot.get("real_cycle_guard_last_ts", 0.0) or 0.0)
+                if (now_guard - last_guard) >= 8.0:
+                    if ciclo_maestro is None and ciclo_forzado is not None:
+                        print(Fore.YELLOW + "REAL sin orden viva del maestro, usando retenido")
+                    elif ciclo_maestro is None and ciclo_forzado is None:
+                        print(Fore.RED + Style.BRIGHT + "REAL sin ciclo válido")
+                    estado_bot["real_cycle_guard_last_ts"] = now_guard
             if ciclo_maestro is not None and ciclo_forzado is not None and int(ciclo_maestro) != int(ciclo_forzado):
                 print(
                     Fore.CYAN + Style.BRIGHT +
