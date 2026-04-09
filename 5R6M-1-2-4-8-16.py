@@ -1190,6 +1190,17 @@ reinicio_forzado = asyncio.Event()
 salir = False
 pausado = False
 reinicio_manual = False
+MAESTRO_PAUSE_FILE = os.path.abspath(os.path.expanduser(os.getenv("MAESTRO_PAUSE_STATE_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "maestro_pause_state.json"))))
+maestro_pause_active = False
+maestro_pause_reason = ""
+maestro_pause_resume_ts = 0.0
+maestro_pause_started_ts = 0.0
+maestro_pause_last_read_ts = 0.0
+maestro_pause_last_log_ts = 0.0
+maestro_pause_ref_balance = None
+maestro_pause_trigger_balance = None
+maestro_pause_source = ""
+maestro_pause_last_state = False
 
 LIMPIEZA_PANEL_HASTA = 0
 ULTIMA_ACT_SALDO = 0
@@ -2241,6 +2252,139 @@ def path_orden(bot: str) -> str:
     _ensure_dir(ORDEN_DIR)
     return os.path.join(ORDEN_DIR, f"{bot}.json")
 
+
+def leer_pause_state_maestro() -> dict:
+    base = {
+        "paused": False,
+        "reason": "",
+        "started_ts": 0.0,
+        "resume_ts": 0.0,
+        "duration_sec": 0,
+        "source": "",
+        "reference_balance": None,
+        "trigger_balance": None,
+    }
+    path = MAESTRO_PAUSE_FILE
+    if (not path) or (not os.path.exists(path)):
+        return base
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            raw = f.read().strip()
+        if not raw:
+            return base
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return base
+        out = dict(base)
+        out.update(data)
+        return out
+    except Exception:
+        return base
+
+
+def tiempo_restante_pausa_maestro() -> int:
+    try:
+        if not maestro_pause_active:
+            return 0
+        return max(0, int(round(float(maestro_pause_resume_ts or 0.0) - time.time())))
+    except Exception:
+        return 0
+
+
+def motivo_pausa_maestro() -> str:
+    try:
+        reason = str(maestro_pause_reason or "drawdown_20_monitor").strip()
+        if reason == "drawdown_20_monitor":
+            return "Protección por drawdown 20% activada desde monitor"
+        if reason == "manual_resume":
+            return "Pausa liberada manualmente desde monitor"
+        return reason
+    except Exception:
+        return "Pausa externa"
+
+
+def maestro_en_pausa() -> bool:
+    try:
+        return bool(maestro_pause_active)
+    except Exception:
+        return False
+
+
+def _maybe_log_pause_state(force: bool = False):
+    global maestro_pause_last_log_ts
+    now = time.time()
+    if (not force) and ((now - float(maestro_pause_last_log_ts or 0.0)) < 7.0):
+        return
+    maestro_pause_last_log_ts = now
+    if maestro_pause_active:
+        remain = tiempo_restante_pausa_maestro()
+        mm, ss = divmod(max(0, int(remain)), 60)
+        ref_txt = f"{float(maestro_pause_ref_balance):,.2f}" if isinstance(maestro_pause_ref_balance, (int, float)) else "--"
+        trg_txt = f"{float(maestro_pause_trigger_balance):,.2f}" if isinstance(maestro_pause_trigger_balance, (int, float)) else "--"
+        print(
+            f"⛔ MAESTRO EN PAUSA | {mm:02d}:{ss:02d} | reason={maestro_pause_reason or 'drawdown_20_monitor'} "
+            f"| ref={ref_txt} | trigger={trg_txt}"
+        )
+
+
+def actualizar_pause_state_maestro():
+    global maestro_pause_active, maestro_pause_reason, maestro_pause_resume_ts, maestro_pause_started_ts
+    global maestro_pause_last_read_ts, maestro_pause_ref_balance, maestro_pause_trigger_balance, maestro_pause_source
+    global maestro_pause_last_state
+    now = time.time()
+    if (now - float(maestro_pause_last_read_ts or 0.0)) < 0.35:
+        return
+    maestro_pause_last_read_ts = now
+
+    def _as_float(v):
+        try:
+            if v is None:
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    data = leer_pause_state_maestro()
+    paused_flag = bool(data.get("paused", False))
+    resume_ts = float(data.get("resume_ts") or 0.0)
+    started_ts = float(data.get("started_ts") or 0.0)
+    reason = str(data.get("reason") or "")
+    source = str(data.get("source") or "")
+    ref_bal = _as_float(data.get("reference_balance"))
+    trg_bal = _as_float(data.get("trigger_balance"))
+
+    active_now = bool(paused_flag and resume_ts > now)
+    just_changed = (active_now != bool(maestro_pause_last_state))
+
+    if active_now:
+        maestro_pause_active = True
+        maestro_pause_resume_ts = resume_ts
+        maestro_pause_started_ts = started_ts
+        maestro_pause_reason = reason or "drawdown_20_monitor"
+        maestro_pause_source = source
+        maestro_pause_ref_balance = ref_bal
+        maestro_pause_trigger_balance = trg_bal
+        if just_changed:
+            agregar_evento("⛔ MAESTRO EN PAUSA · Protección por drawdown 20% activada desde monitor.")
+            _maybe_log_pause_state(force=True)
+    else:
+        maestro_pause_active = False
+        maestro_pause_resume_ts = resume_ts
+        maestro_pause_started_ts = started_ts
+        if just_changed:
+            if reason == "manual_resume":
+                agregar_evento("✅ Pausa liberada manualmente desde monitor.")
+                print("✅ Pausa liberada manualmente desde monitor")
+            else:
+                agregar_evento("✅ Pausa finalizada por tiempo.")
+                print("✅ Pausa finalizada por tiempo")
+        maestro_pause_reason = reason or ""
+        maestro_pause_source = source
+        maestro_pause_ref_balance = ref_bal
+        maestro_pause_trigger_balance = trg_bal
+
+    maestro_pause_last_state = bool(maestro_pause_active)
+
 # === SALDO LIVE FEED (maestro -> monitor_saldo_pro) ===
 SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
@@ -2986,6 +3130,17 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
     - Activa REAL inmediato en HUD + token file
     """
     ciclo = max(1, min(int(ciclo), MAX_CICLOS))
+
+    actualizar_pause_state_maestro()
+    if maestro_en_pausa():
+        try:
+            remain = tiempo_restante_pausa_maestro()
+            mm, ss = divmod(max(0, int(remain)), 60)
+            agregar_evento(f"⛔ Entrada bloqueada por pausa monitor ({mm:02d}:{ss:02d}).")
+        except Exception:
+            pass
+        _maybe_log_pause_state(force=False)
+        return False
 
     if _purificacion_real_activa():
         _emitir_marca_purificacion_real()
@@ -12577,7 +12732,18 @@ def mostrar_panel():
     # ==========================
 
     # Línea de estado general
-    print(padding + Fore.GREEN + "🟢 MODO OPERACIÓN ACTIVO – Escaneando…")
+    actualizar_pause_state_maestro()
+    if maestro_en_pausa():
+        rem = tiempo_restante_pausa_maestro()
+        mm, ss = divmod(max(0, int(rem)), 60)
+        ref_txt = f"{float(maestro_pause_ref_balance):.2f}" if isinstance(maestro_pause_ref_balance, (int, float)) else "--"
+        trg_txt = f"{float(maestro_pause_trigger_balance):.2f}" if isinstance(maestro_pause_trigger_balance, (int, float)) else "--"
+        print(padding + Fore.LIGHTRED_EX + Style.BRIGHT + "⛔ MAESTRO EN PAUSA")
+        print(padding + Fore.LIGHTRED_EX + "Protección por drawdown 20% activada desde monitor")
+        print(padding + Fore.LIGHTRED_EX + f"⏳ Restante: {mm:02d}:{ss:02d} | reason={maestro_pause_reason or 'drawdown_20_monitor'}")
+        print(padding + Fore.LIGHTRED_EX + f"📉 Ref={ref_txt} | Trigger={trg_txt}")
+    else:
+        print(padding + Fore.GREEN + "🟢 MODO OPERACIÓN ACTIVO – Escaneando…")
     if _purificacion_real_activa():
         print(padding + Fore.YELLOW + "🧪 IA REAL purificada | LXV_SYNC habilitado")
 
@@ -16355,6 +16521,17 @@ async def main():
             if salir:
                 set_etapa("STOP", "Señal de salida detectada", anunciar=True)
                 break
+            actualizar_pause_state_maestro()
+            if maestro_en_pausa():
+                try:
+                    _maybe_log_pause_state(force=False)
+                    await refresh_saldo_real(forzado=False)
+                    with RENDER_LOCK:
+                        mostrar_panel()
+                except Exception:
+                    pass
+                await asyncio.sleep(0.8)
+                continue
             if pausado:
                 await asyncio.sleep(1)
                 continue

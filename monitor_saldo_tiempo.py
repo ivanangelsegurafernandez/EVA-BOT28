@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -57,6 +58,9 @@ SALDO_HISTORY_FILE = "saldo_real_live_history.jsonl"
 SCRIPT_DIR = Path(__file__).resolve().parent
 HOME_DIR = Path.home()
 LIMA_TZ = ZoneInfo("America/Lima")
+MASTER_PAUSE_STATE_PATH = Path(os.path.expanduser(os.getenv("MAESTRO_PAUSE_STATE_PATH", str(SCRIPT_DIR / "maestro_pause_state.json"))))
+PROTECTION_DRAWDOWN_PCT = float(os.getenv("SALDO_MONITOR_PROTECTION_DRAWDOWN", "0.20"))
+PROTECTION_PAUSE_SECONDS = int(float(os.getenv("SALDO_MONITOR_PROTECTION_PAUSE_SECONDS", "1200")))
 
 
 @dataclass
@@ -140,6 +144,32 @@ def _read_last_nonempty_line(path: Path) -> Optional[str]:
             chunk = fh.read().decode("utf-8", errors="ignore")
         lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
         return lines[-1] if lines else None
+    except Exception:
+        return None
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        except Exception:
+            pass
+
+
+def _safe_read_json(path: Path) -> Optional[dict]:
+    try:
+        if not path.exists() or path.stat().st_size <= 0:
+            return None
+        return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
     except Exception:
         return None
 
@@ -605,7 +635,7 @@ class MonitorSaldoApp:
         self.skip_summary_every_s = 60.0
         self.debug_logs = bool(DEBUG_LOGS)
         self.stop_evt = threading.Event()
-        self.view_mode = tk.StringVar(value="15m")
+        self.view_mode = tk.StringVar(value="6h")
         self.last_status = "OK"
         self.show_ma_short = tk.BooleanVar(value=True)
         self.show_ma_long = tk.BooleanVar(value=True)
@@ -616,6 +646,17 @@ class MonitorSaldoApp:
         self.manual_min_y = 0.0
         self.manual_max_y = 100.0
         self.last_valid_manual_range: Tuple[float, float] = (self.manual_min_y, self.manual_max_y)
+        self.pause_state_path = MASTER_PAUSE_STATE_PATH
+        self.protection_active = False
+        self.protection_started_ts: Optional[float] = None
+        self.protection_resume_ts: Optional[float] = None
+        self.protection_reference_balance: Optional[float] = None
+        self.protection_trigger_balance: Optional[float] = None
+        self.protection_reason = ""
+        self.manual_resume_in_progress = False
+        self.reference_reset_ts = time.time()
+        self.rearm_cooldown_until = 0.0
+        self.last_balance_for_delta: Optional[float] = self.series[0].saldo if self.series else None
 
         # === Tema oscuro visual (sin tocar lógica) ===
         style = ttk.Style()
@@ -644,30 +685,73 @@ class MonitorSaldoApp:
         style.configure("Dark.TButton", background="#222222", foreground="#f5f5f5", borderwidth=1, focusthickness=0)
         style.map("Dark.TButton", background=[("active", "#2f2f2f"), ("pressed", "#1d1d1d")])
         style.configure("Dark.TEntry", fieldbackground="#171717", foreground="#f5f5f5")
+        style.configure("PauseBanner.TFrame", background="#3d0a0a")
+        style.configure("PauseTitle.TLabel", background="#3d0a0a", foreground="#ff6b6b")
+        style.configure("PauseSub.TLabel", background="#3d0a0a", foreground="#ffd6d6")
+        style.configure("PauseTimer.TLabel", background="#3d0a0a", foreground="#ff4040")
+        style.configure("Resume.TButton", background="#ff2f2f", foreground="#ffffff", borderwidth=1)
+        style.map("Resume.TButton", background=[("active", "#ff5555"), ("pressed", "#cc1f1f")])
 
         header = ttk.Frame(root, style="Dark.TFrame")
-        header.pack(fill="x", padx=8, pady=(4, 1))
+        header.pack(fill="x", padx=8, pady=(4, 2))
 
         status_band = ttk.Frame(header, style="DarkPanel.TFrame")
         status_band.pack(fill="x", pady=(0, 2))
         self.lbl_status = ttk.Label(status_band, text="Estado: iniciando...", style="Muted.TLabel", anchor="center")
-        self.lbl_status.pack(fill="x", padx=10, pady=(3, 2))
+        self.lbl_status.pack(fill="x", padx=10, pady=(2, 2))
+
+        self.pause_banner = ttk.Frame(header, style="PauseBanner.TFrame")
+        self.pause_title = ttk.Label(
+            self.pause_banner,
+            text="⛔ MAESTRO EN PAUSA",
+            style="PauseTitle.TLabel",
+            font=("Segoe UI", 28, "bold"),
+            anchor="center",
+        )
+        self.pause_subtitle = ttk.Label(
+            self.pause_banner,
+            text="Protección activada por caída del 20% del saldo",
+            style="PauseSub.TLabel",
+            font=("Segoe UI", 13, "bold"),
+            anchor="center",
+        )
+        self.pause_timer = ttk.Label(
+            self.pause_banner,
+            text="20:00",
+            style="PauseTimer.TLabel",
+            font=("Consolas", 34, "bold"),
+            anchor="center",
+        )
+        self.pause_detail = ttk.Label(self.pause_banner, text="", style="PauseSub.TLabel", anchor="center", font=("Segoe UI", 11))
+        self.btn_manual_resume = ttk.Button(
+            self.pause_banner,
+            text="REANUDAR AHORA",
+            style="Resume.TButton",
+            command=self._manual_resume,
+        )
+        self.pause_title.pack(fill="x", padx=10, pady=(8, 0))
+        self.pause_subtitle.pack(fill="x", padx=10, pady=(2, 1))
+        self.pause_timer.pack(fill="x", padx=10, pady=(0, 1))
+        self.pause_detail.pack(fill="x", padx=10, pady=(0, 5))
+        self.btn_manual_resume.pack(pady=(1, 9), ipadx=20, ipady=8)
 
         saldo_band = ttk.Frame(header, style="DarkPanel.TFrame")
         saldo_band.pack(fill="x", pady=(0, 3))
         self.lbl_saldo = ttk.Label(
             saldo_band,
             text="--",
-            font=("Segoe UI", 96, "bold"),
+            font=("Segoe UI", 98, "bold"),
             style="Dark.TLabel",
             anchor="center",
             justify="center",
         )
-        self.lbl_saldo.pack(fill="x", padx=10, pady=(3, 4))
+        self.lbl_saldo.pack(fill="x", padx=10, pady=(2, 2))
+        self.lbl_delta = ttk.Label(saldo_band, text="Δ -- (--%)", style="Muted.TLabel", anchor="center", font=("Segoe UI", 18, "bold"))
+        self.lbl_delta.pack(fill="x", padx=10, pady=(0, 8))
 
         controls = ttk.Frame(header, style="DarkPanel.TFrame")
         controls.pack(fill="x", padx=0, pady=(0, 2))
-        for txt, val in (("5 min", "5m"), ("15 min", "15m"), ("1 hora", "1h"), ("Todo", "all")):
+        for txt, val in (("1 hora", "1h"), ("6 horas", "6h"), ("12 horas", "12h"), ("24 horas", "24h"), ("7 días", "7d"), ("Todo", "all")):
             ttk.Radiobutton(
                 controls, text=txt, value=val, variable=self.view_mode, command=self.actualizar_grafica, style="Dark.TRadiobutton"
             ).pack(side="left", padx=4, pady=1)
@@ -693,7 +777,7 @@ class MonitorSaldoApp:
         self.lbl_scale = ttk.Label(header, text="ESCALA: AUTO", style="Scale.TLabel", anchor="center")
         self.lbl_scale.pack(fill="x", padx=10, pady=(0, 2))
 
-        fig = Figure(figsize=(10, 5), dpi=100)
+        fig = Figure(figsize=(11, 6), dpi=100)
         self.ax = fig.add_subplot(111)
         fig.patch.set_facecolor("#0b0b0b")
         self.ax.set_facecolor("#111111")
@@ -743,6 +827,8 @@ class MonitorSaldoApp:
         self._ys_live: List[float] = []
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._load_existing_pause_state()
+        self._render_pause_banner()
         threading.Thread(target=self.loop_muestreo, daemon=True).start()
         self.root.after(500, self.actualizar_grafica)
 
@@ -882,6 +968,7 @@ class MonitorSaldoApp:
 
                 if sample.saldo is not None:
                     self.last_valid = sample
+                    self._update_protection_state(float(sample.saldo), sample.ts_epoch)
                 wrote, reason = anexar_muestra_csv(self.db_path, sample, self.last_saved, self.lock_path)
                 if wrote:
                     self._flush_skip_summary(force=True)
@@ -922,6 +1009,7 @@ class MonitorSaldoApp:
         def apply_text():
             self.last_status = status
             self.lbl_saldo.config(text=saldo_txt)
+            self._update_delta_label(sample.saldo)
             if status == "OK":
                 self.lbl_saldo.config(foreground="#35f2ff")
             elif status == "STALE":
@@ -929,24 +1017,196 @@ class MonitorSaldoApp:
             else:
                 self.lbl_saldo.config(foreground="#ff7f50")
             self.lbl_status.config(text=text)
+            self._render_pause_banner()
 
         self.root.after(0, apply_text)
+
+    def _update_delta_label(self, current_balance: Optional[float]):
+        if current_balance is None:
+            self.lbl_delta.config(text="Δ -- (--%)", foreground="#cfcfcf")
+            return
+        if self.last_balance_for_delta is None:
+            self.last_balance_for_delta = float(current_balance)
+            self.lbl_delta.config(text="Δ +0.00 (+0.00%)", foreground="#b4ffb4")
+            return
+        delta = float(current_balance) - float(self.last_balance_for_delta)
+        pct = (delta / self.last_balance_for_delta * 100.0) if abs(self.last_balance_for_delta) > 1e-9 else 0.0
+        color = "#7bffb2" if delta >= 0 else "#ff9a9a"
+        self.lbl_delta.config(text=f"Δ {delta:+,.2f} ({pct:+.2f}%)", foreground=color)
+
+    def _valid_balance(self, value: Optional[float]) -> bool:
+        if value is None:
+            return False
+        if value != value:
+            return False
+        return True
+
+    def _compute_reference_balance(self, current_balance: float):
+        if not self._valid_balance(current_balance):
+            return
+        if self.protection_reference_balance is None:
+            self.protection_reference_balance = float(current_balance)
+            return
+        if float(current_balance) > float(self.protection_reference_balance):
+            self.protection_reference_balance = float(current_balance)
+
+    def _trigger_master_pause(self, current_balance: float, now_ts: float):
+        if self.protection_active:
+            return
+        if self.protection_reference_balance is None or self.protection_reference_balance <= 0:
+            return
+        trigger_balance = float(self.protection_reference_balance) * (1.0 - PROTECTION_DRAWDOWN_PCT)
+        payload = {
+            "paused": True,
+            "reason": "drawdown_20_monitor",
+            "started_ts": float(now_ts),
+            "resume_ts": float(now_ts + PROTECTION_PAUSE_SECONDS),
+            "duration_sec": int(PROTECTION_PAUSE_SECONDS),
+            "source": "monitor_saldo_tiempo.py",
+            "reference_balance": float(self.protection_reference_balance),
+            "trigger_balance": float(current_balance),
+            "drawdown_pct": float(PROTECTION_DRAWDOWN_PCT),
+        }
+        _atomic_write_text(self.pause_state_path, json.dumps(payload, ensure_ascii=False, indent=2))
+        self.protection_active = True
+        self.protection_started_ts = float(payload["started_ts"])
+        self.protection_resume_ts = float(payload["resume_ts"])
+        self.protection_reason = str(payload.get("reason") or "drawdown_20_monitor")
+        self.protection_trigger_balance = float(current_balance)
+        self.rearm_cooldown_until = float(payload["resume_ts"])
+        self.root.after(0, self._render_pause_banner)
+        print(
+            f"[PROTECTION][PAUSE] drawdown {PROTECTION_DRAWDOWN_PCT*100:.0f}% | "
+            f"ref={self.protection_reference_balance:,.2f} trigger={current_balance:,.2f} "
+            f"resume={_fmt_lima(float(payload['resume_ts']))}"
+        )
+
+    def _clear_master_pause(self, manual: bool = False):
+        now_ts = time.time()
+        current_balance = self.last_valid.saldo if self.last_valid and self.last_valid.saldo is not None else None
+        payload = {
+            "paused": False,
+            "reason": "manual_resume" if manual else "auto_resume",
+            "started_ts": self.protection_started_ts if self.protection_started_ts is not None else now_ts,
+            "resume_ts": now_ts,
+            "duration_sec": 0,
+            "source": "monitor_saldo_tiempo.py",
+            "reference_balance": current_balance if self._valid_balance(current_balance) else self.protection_reference_balance,
+            "trigger_balance": self.protection_trigger_balance,
+        }
+        _atomic_write_text(self.pause_state_path, json.dumps(payload, ensure_ascii=False, indent=2))
+        self.protection_active = False
+        self.protection_started_ts = None
+        self.protection_resume_ts = None
+        self.protection_reason = ""
+        self.protection_trigger_balance = None
+        if self._valid_balance(current_balance):
+            self.protection_reference_balance = float(current_balance)
+            self.last_balance_for_delta = float(current_balance)
+        self.reference_reset_ts = now_ts
+        self.rearm_cooldown_until = now_ts + 5.0
+        self.root.after(0, self._render_pause_banner)
+        if manual:
+            print("[PROTECTION][RESUME] reanudado manualmente")
+        else:
+            print("[PROTECTION][RESUME] pausa finalizada por tiempo")
+
+    def _manual_resume(self):
+        if self.manual_resume_in_progress:
+            return
+        self.manual_resume_in_progress = True
+        self.btn_manual_resume.state(["disabled"])
+        try:
+            if self.protection_active:
+                self._clear_master_pause(manual=True)
+        finally:
+            self.manual_resume_in_progress = False
+            if self.protection_active:
+                self.btn_manual_resume.state(["disabled"])
+            else:
+                self.btn_manual_resume.state(["!disabled"])
+
+    def _load_existing_pause_state(self):
+        data = _safe_read_json(self.pause_state_path) or {}
+        if not bool(data.get("paused")):
+            return
+        now_ts = time.time()
+        resume_ts = _to_float(data.get("resume_ts"))
+        if resume_ts is not None and resume_ts <= now_ts:
+            self._clear_master_pause(manual=False)
+            return
+        self.protection_active = True
+        self.protection_started_ts = _to_float(data.get("started_ts")) or now_ts
+        self.protection_resume_ts = resume_ts or (now_ts + PROTECTION_PAUSE_SECONDS)
+        self.protection_reason = str(data.get("reason") or "drawdown_20_monitor")
+        self.protection_reference_balance = _to_float(data.get("reference_balance")) or self.protection_reference_balance
+        self.protection_trigger_balance = _to_float(data.get("trigger_balance")) or self.protection_trigger_balance
+
+    def _update_protection_state(self, current_balance: float, now_ts: float):
+        if not self._valid_balance(current_balance):
+            return
+        if self.protection_active:
+            if self.protection_resume_ts is not None and now_ts >= float(self.protection_resume_ts):
+                self._clear_master_pause(manual=False)
+            return
+
+        self._compute_reference_balance(float(current_balance))
+        if now_ts < float(self.rearm_cooldown_until):
+            return
+        if self.protection_reference_balance is None or self.protection_reference_balance <= 0:
+            return
+        trigger_balance = float(self.protection_reference_balance) * (1.0 - PROTECTION_DRAWDOWN_PCT)
+        if float(current_balance) <= trigger_balance:
+            self._trigger_master_pause(float(current_balance), now_ts)
+
+    def _render_pause_banner(self):
+        if self.protection_active:
+            self.pause_banner.pack(fill="x", pady=(0, 4))
+            now_ts = time.time()
+            remain = 0
+            if self.protection_resume_ts is not None:
+                remain = max(0, int(round(float(self.protection_resume_ts) - now_ts)))
+            mm = remain // 60
+            ss = remain % 60
+            self.pause_timer.config(text=f"{mm:02d}:{ss:02d}")
+            ref = self.protection_reference_balance
+            trg = self.protection_trigger_balance
+            if ref is not None and trg is not None:
+                detail = f"Referencia: {ref:,.2f} → Disparo: {trg:,.2f} | Queda {mm:02d}:{ss:02d}"
+            else:
+                detail = f"Razón: {self.protection_reason or 'drawdown_20_monitor'} | Queda {mm:02d}:{ss:02d}"
+            self.pause_detail.config(text=detail)
+            self.lbl_saldo.config(foreground="#ff4d4d")
+            self.root.configure(bg="#210808")
+            self.btn_manual_resume.state(["!disabled"])
+            if remain <= 0:
+                self._clear_master_pause(manual=False)
+        else:
+            if self.pause_banner.winfo_manager():
+                self.pause_banner.pack_forget()
+            self.root.configure(bg="#0b0b0b")
+            self.btn_manual_resume.state(["!disabled"])
 
     def actualizar_grafica(self):
         samples = [s for s in self.series if s.saldo is not None]
         if not samples:
+            self._render_pause_banner()
             self.canvas.draw_idle()
             self.root.after(900, self.actualizar_grafica)
             return
 
         now = time.time()
         mode = self.view_mode.get()
-        if mode == "5m":
-            low = now - 300
-        elif mode == "15m":
-            low = now - 900
-        elif mode == "1h":
+        if mode == "1h":
             low = now - 3600
+        elif mode == "6h":
+            low = now - (6 * 3600)
+        elif mode == "12h":
+            low = now - (12 * 3600)
+        elif mode == "24h":
+            low = now - (24 * 3600)
+        elif mode == "7d":
+            low = now - (7 * 24 * 3600)
         else:
             low = float("-inf")
 
@@ -999,6 +1259,7 @@ class MonitorSaldoApp:
         self.ax.autoscale_view()
         self._apply_y_scale(ys)
         self.ax.set_title(f"Saldo REAL vs Tiempo · vista={mode}")
+        self._render_pause_banner()
         self.canvas.draw_idle()
         self.root.after(900, self.actualizar_grafica)
 
