@@ -1306,8 +1306,35 @@ class MonitorSaldoApp:
         self.delta_reference_balance = float(window[0].saldo) if window and window[0].saldo is not None else None
         self._update_delta_label(float(window[-1].saldo) if window[-1].saldo is not None else None)
 
-        xs = [datetime.fromtimestamp(s.ts_epoch, tz=LIMA_TZ) for s in window]
-        ys = [float(s.saldo) for s in window if s.saldo is not None]
+        xs: List[datetime] = []
+        ys: List[float] = []
+        prev_ts: Optional[float] = None
+        gaps: List[float] = []
+        for s in window:
+            if s.saldo is None:
+                continue
+            ts = float(s.ts_epoch)
+            if prev_ts is not None and ts <= prev_ts:
+                continue
+            if prev_ts is not None:
+                gaps.append(ts - prev_ts)
+            xs.append(datetime.fromtimestamp(ts, tz=LIMA_TZ))
+            ys.append(float(s.saldo))
+            prev_ts = ts
+        if len(xs) >= 3 and gaps:
+            gaps_sorted = sorted(g for g in gaps if g > 0.0)
+            med_gap = gaps_sorted[len(gaps_sorted) // 2] if gaps_sorted else 0.0
+            if med_gap > 0.0:
+                xs_line: List[datetime] = [xs[0]]
+                ys_line: List[float] = [ys[0]]
+                for i in range(1, len(xs)):
+                    dt_gap = (xs[i] - xs[i - 1]).total_seconds()
+                    if dt_gap > (med_gap * 6.0):
+                        xs_line.append(xs[i])
+                        ys_line.append(float("nan"))
+                    xs_line.append(xs[i])
+                    ys_line.append(ys[i])
+                xs, ys = xs_line, ys_line
 
         def moving_avg(vals: List[float], n: int) -> List[float]:
             out = []
