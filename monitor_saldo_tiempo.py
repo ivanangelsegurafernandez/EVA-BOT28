@@ -49,7 +49,7 @@ DEBUG_LOGS = False
 SOURCE_SERIES_FILE = "saldo_real_series.csv"  # feed del maestro (solo lectura)
 DB_FILENAME = "saldo_monitor_db.csv"  # DB canónica del monitor (lectura/escritura)
 LEGACY_DB_FILENAME = "saldo_real_series.csv"  # histórico legacy del monitor
-DB_HEADERS = ["ts_epoch", "ts_iso", "saldo", "fuente", "maestro_activo", "observacion"]
+DB_HEADERS = ["ts_epoch", "ts_iso", "saldo", "fuente", "maestro_activo", "observacion", "source_ts_epoch", "source_ts_iso"]
 
 SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_HISTORY_FILE = "saldo_real_live_history.jsonl"
@@ -67,6 +67,8 @@ class SaldoSample:
     fuente: str
     maestro_activo: int
     observacion: str
+    source_ts_epoch: Optional[float] = None
+    source_ts_iso: Optional[str] = None
 
 
 @dataclass
@@ -238,7 +240,7 @@ async def _leer_saldo_deriv_ws() -> Optional[SaldoSample]:
             if saldo is None:
                 return None
             ts_epoch = time.time()
-            return SaldoSample(ts_epoch, _now_iso(), saldo, "fallback_deriv_ws", 0, "ok")
+            return SaldoSample(ts_epoch, _now_iso(), saldo, "fallback_deriv_ws", 0, "ok", None, None)
     except Exception:
         return None
 
@@ -254,9 +256,10 @@ def leer_saldo_desde_fuente(db_path: Path) -> Tuple[SaldoSample, Optional[Path]]
                 saldo = _extract_saldo(payload)
                 if saldo is None:
                     continue
-                ts_epoch = _extract_ts_epoch(payload) or now
-                obs = "ok" if now - ts_epoch <= SOURCE_STALE_SECONDS else "stale"
-                return SaldoSample(ts_epoch, _now_iso(), saldo, fuente, 1, obs), path
+                source_ts = _extract_ts_epoch(payload)
+                obs = "ok" if (source_ts is None or now - source_ts <= SOURCE_STALE_SECONDS) else "stale"
+                source_ts_iso = datetime.fromtimestamp(source_ts, tz=LIMA_TZ).isoformat() if isinstance(source_ts, (int, float)) else None
+                return SaldoSample(now, _now_iso(), saldo, fuente, 1, obs, source_ts, source_ts_iso), path
 
             if "history" in fuente:
                 line = _read_last_nonempty_line(path)
@@ -266,9 +269,10 @@ def leer_saldo_desde_fuente(db_path: Path) -> Tuple[SaldoSample, Optional[Path]]
                 saldo = _extract_saldo(payload)
                 if saldo is None:
                     continue
-                ts_epoch = _extract_ts_epoch(payload) or now
-                obs = "ok" if now - ts_epoch <= SOURCE_STALE_SECONDS else "stale"
-                return SaldoSample(ts_epoch, _now_iso(), saldo, fuente, 1, obs), path
+                source_ts = _extract_ts_epoch(payload)
+                obs = "ok" if (source_ts is None or now - source_ts <= SOURCE_STALE_SECONDS) else "stale"
+                source_ts_iso = datetime.fromtimestamp(source_ts, tz=LIMA_TZ).isoformat() if isinstance(source_ts, (int, float)) else None
+                return SaldoSample(now, _now_iso(), saldo, fuente, 1, obs, source_ts, source_ts_iso), path
 
             if "series" in fuente:
                 if not path.exists() or path.stat().st_size <= 0:
@@ -278,20 +282,21 @@ def leer_saldo_desde_fuente(db_path: Path) -> Tuple[SaldoSample, Optional[Path]]
                     continue
                 cols = [c.strip() for c in line.split(",")]
                 saldo = None
-                ts_epoch = now
+                source_ts = None
                 if len(cols) >= 2:
                     saldo = _to_float(cols[1])
                     try:
-                        ts_epoch = datetime.fromisoformat(cols[0].replace("Z", "+00:00")).timestamp()
+                        source_ts = datetime.fromisoformat(cols[0].replace("Z", "+00:00")).timestamp()
                     except Exception:
-                        ts_epoch = now
+                        source_ts = None
                 if saldo is None and len(cols) >= 3:
-                    ts_epoch = _to_float(cols[0]) or now
+                    source_ts = _to_float(cols[0])
                     saldo = _to_float(cols[2])
                 if saldo is None:
                     continue
-                obs = "ok" if now - ts_epoch <= SOURCE_STALE_SECONDS else "stale"
-                return SaldoSample(ts_epoch, _now_iso(), saldo, fuente, 1, obs), path
+                obs = "ok" if (source_ts is None or now - source_ts <= SOURCE_STALE_SECONDS) else "stale"
+                source_ts_iso = datetime.fromtimestamp(source_ts, tz=LIMA_TZ).isoformat() if isinstance(source_ts, (int, float)) else None
+                return SaldoSample(now, _now_iso(), saldo, fuente, 1, obs, source_ts, source_ts_iso), path
         except Exception:
             continue
 
@@ -299,7 +304,7 @@ def leer_saldo_desde_fuente(db_path: Path) -> Tuple[SaldoSample, Optional[Path]]
     if ws_sample is not None:
         return ws_sample, None
 
-    return SaldoSample(now, _now_iso(), None, "sin_fuente", 0, "sin_datos"), None
+    return SaldoSample(now, _now_iso(), None, "sin_fuente", 0, "sin_datos", None, None), None
 
 
 # =========================
@@ -321,7 +326,9 @@ def _normalize_monitor_row(row: Dict[str, str]) -> Optional[SaldoSample]:
     fuente = (row.get("fuente") or "db").strip() or "db"
     maestro_activo = int(_to_float(row.get("maestro_activo")) or 0)
     observacion = (row.get("observacion") or "hist").strip() or "hist"
-    return SaldoSample(ts_epoch, ts_iso, saldo, fuente, maestro_activo, observacion)
+    source_ts_epoch = _to_float(row.get("source_ts_epoch"))
+    source_ts_iso = (row.get("source_ts_iso") or "").strip() or None
+    return SaldoSample(ts_epoch, ts_iso, saldo, fuente, maestro_activo, observacion, source_ts_epoch, source_ts_iso)
 
 
 def _parse_legacy_line(line: str) -> Optional[SaldoSample]:
@@ -341,7 +348,9 @@ def _parse_legacy_line(line: str) -> Optional[SaldoSample]:
                 "saldo": cols[2],
                 "fuente": cols[3],
                 "maestro_activo": cols[4],
-                "observacion": ",".join(cols[5:]),
+                "observacion": cols[5],
+                "source_ts_epoch": cols[6] if len(cols) >= 7 else "",
+                "source_ts_iso": cols[7] if len(cols) >= 8 else "",
             }
         )
 
@@ -357,7 +366,7 @@ def _parse_legacy_line(line: str) -> Optional[SaldoSample]:
             return None
         fuente = cols[2] if len(cols) >= 3 else "legacy_series"
         ts_iso = datetime.fromtimestamp(ts_epoch, tz=LIMA_TZ).isoformat()
-        return SaldoSample(ts_epoch, ts_iso, saldo, fuente or "legacy_series", 1, "migrado_legacy")
+        return SaldoSample(ts_epoch, ts_iso, saldo, fuente or "legacy_series", 1, "migrado_legacy", ts_epoch, ts_iso)
 
     return None
 
@@ -413,6 +422,8 @@ def reparar_y_migrar_db_saldo(db_path: Path, legacy_candidates: List[Path]) -> D
                     s.fuente,
                     str(s.maestro_activo),
                     s.observacion,
+                    "" if s.source_ts_epoch is None else f"{float(s.source_ts_epoch):.3f}",
+                    s.source_ts_iso or "",
                 ]
             )
         fh.flush()
@@ -489,6 +500,9 @@ def _release_lock(lock_path: Path, fd: Optional[int]) -> None:
 def anexar_muestra_csv(db_path: Path, sample: SaldoSample, last_saved: Optional[SaldoSample], lock_path: Path) -> Tuple[bool, str]:
     if sample.saldo is None:
         return False, "sin_saldo"
+    if last_saved is not None and sample.ts_epoch <= float(last_saved.ts_epoch):
+        sample.ts_epoch = float(last_saved.ts_epoch) + 0.001
+        sample.ts_iso = datetime.fromtimestamp(sample.ts_epoch, tz=LIMA_TZ).isoformat()
 
     should_write = last_saved is None
     if not should_write and last_saved is not None:
@@ -514,6 +528,8 @@ def anexar_muestra_csv(db_path: Path, sample: SaldoSample, last_saved: Optional[
         sample.fuente,
         str(sample.maestro_activo),
         sample.observacion,
+        "" if sample.source_ts_epoch is None else f"{float(sample.source_ts_epoch):.3f}",
+        sample.source_ts_iso or "",
     ]
 
     for _ in range(CSV_WRITE_RETRIES):
@@ -937,6 +953,7 @@ class MonitorSaldoApp:
         window = [s for s in samples if s.ts_epoch >= low]
         if not window:
             window = samples[-1:]
+        window.sort(key=lambda s: float(s.ts_epoch))
 
         xs = [datetime.fromtimestamp(s.ts_epoch, tz=LIMA_TZ) for s in window]
         ys = [float(s.saldo) for s in window if s.saldo is not None]
