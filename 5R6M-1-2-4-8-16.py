@@ -16522,16 +16522,13 @@ async def main():
                 set_etapa("STOP", "Señal de salida detectada", anunciar=True)
                 break
             actualizar_pause_state_maestro()
-            if maestro_en_pausa():
+            pausa_maestro_activa = maestro_en_pausa()
+            if pausa_maestro_activa:
                 try:
                     _maybe_log_pause_state(force=False)
                     await refresh_saldo_real(forzado=False)
-                    with RENDER_LOCK:
-                        mostrar_panel()
                 except Exception:
                     pass
-                await asyncio.sleep(0.8)
-                continue
             if pausado:
                 await asyncio.sleep(1)
                 continue
@@ -16683,7 +16680,7 @@ async def main():
                                     activo_real = None
                                     break
 
-                    if not activo_real:
+                    if (not activo_real) and (not pausa_maestro_activa):
                         set_etapa("TICK_03")
 
                         # 🔒 Lock estricto: una sola inversión REAL a la vez.
@@ -17150,6 +17147,8 @@ async def main():
                             max_prob = max((_prob_ia_operativa_bot(bot, default=0.0) for bot in BOT_NAMES if estado_bots[bot]["ia_ready"]), default=0)
                             if max_prob < umbral_ia_real:
                                 pass
+                    elif (not activo_real) and pausa_maestro_activa:
+                        set_etapa("TICK_03", "Pausa maestro activa: sin promoción REAL")
 
                     set_etapa("TICK_04")
                     await refresh_saldo_real()
