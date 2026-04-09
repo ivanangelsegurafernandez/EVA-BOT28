@@ -1065,7 +1065,6 @@ class MonitorSaldoApp:
             "source": "monitor_saldo_tiempo.py",
             "reference_balance": float(self.protection_reference_balance),
             "trigger_balance": float(current_balance),
-            "drawdown_pct": float(PROTECTION_DRAWDOWN_PCT),
         }
         _atomic_write_text(self.pause_state_path, json.dumps(payload, ensure_ascii=False, indent=2))
         self.protection_active = True
