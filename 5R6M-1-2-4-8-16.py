@@ -274,7 +274,7 @@ REAL_CLASSIC_GATE = True
 MODO_PURIFICACION_REAL = True  # Llave maestra: bypassea toda promoción/activación REAL sin apagar IA/HUD.
 LXV_SYNC_REAL_ROUTE_ENABLE = True
 LXV_SYNC_REAL_SOURCE = "LXV_SYNC"
-LXV_5V1X_ONLY_ENABLE = False  # compat legacy: ruta paralela LXV_5V1X desactivada
+LXV_5V1X_ONLY_ENABLE = True  # modo quirúrgico: solo 5V1X promueve REAL en ruta LXV_SYNC
 LXV_5V1X_REAL_SOURCE = "LXV_5V1X"
 LXV_5V1X_REQUIRE_DATA_QUALITY_OK = True
 LXV_5V1X_REQUIRE_ROUND_COMPLETE = True
@@ -629,9 +629,32 @@ def _purificacion_real_activa() -> bool:
     """Llave maestra centralizada para apagar capa REAL sin romper flujo IA/HUD."""
     try:
         route_src = str(globals().get("_REAL_ROUTE_SOURCE", "") or "").strip().upper()
-        if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and route_src == str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper():
+        allow_sync = str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper()
+        allow_5v1x = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper()
+        allowed_sources = {allow_sync}
+        if bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)):
+            allowed_sources.add(allow_5v1x)
+        if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and route_src in allowed_sources:
+            try:
+                _lxv_5v1x_event_cooldown(
+                    key=f"purif:allow:{route_src}",
+                    msg=f"🛡️ Purificación bypass: source REAL permitida={route_src}",
+                    cooldown_s=15.0,
+                )
+            except Exception:
+                pass
             return False
-        return bool(globals().get("MODO_PURIFICACION_REAL", False))
+        purif_on = bool(globals().get("MODO_PURIFICACION_REAL", False))
+        if purif_on and route_src:
+            try:
+                _lxv_5v1x_event_cooldown(
+                    key=f"purif:block:{route_src}",
+                    msg=f"🧪 Purificación activa: source REAL bloqueada={route_src}",
+                    cooldown_s=15.0,
+                )
+            except Exception:
+                pass
+        return purif_on
     except Exception:
         return False
 
@@ -3337,7 +3360,27 @@ def _sync_round_tick_maestro():
                 f"| snapshot=C{ciclo_snapshot} | global=C{ciclo_pick}"
             )
             if int(_LXV_LAST_EMITTED_ROUND or 0) != int(round_id):
-                ok_emit = emitir_real_autorizado(bot_pick, ciclo_pick, source=LXV_SYNC_REAL_SOURCE)
+                ok_emit = False
+                if bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)):
+                    round_row, feat_row = _lxv_5v1x_get_exported_rows(int(round_id))
+                    candidate = _lxv_5v1x_candidate_from_round(round_row, feat_row)
+                    gate_ok, gate_reason = _lxv_5v1x_gate_ok(candidate)
+                    if gate_ok:
+                        _lxv_5v1x_event_cooldown(
+                            key=f"gate_ok:{round_id}",
+                            msg=f"✅ 5V1X gate OK ronda #{round_id}: candidato REAL válido",
+                            cooldown_s=8.0,
+                        )
+                        ok_emit = bool(_lxv_5v1x_apply_real_route(candidate, ciclo_pick))
+                    else:
+                        _lxv_5v1x_event_cooldown(
+                            key=f"gate_no:{round_id}",
+                            msg=f"⏸️ 5V1X gate OFF ronda #{round_id}: {gate_reason}",
+                            cooldown_s=8.0,
+                        )
+                        ok_emit = False
+                else:
+                    ok_emit = emitir_real_autorizado(bot_pick, ciclo_pick, source=LXV_SYNC_REAL_SOURCE)
                 _LXV_LAST_EMITTED_ROUND = int(round_id) if ok_emit else int(_LXV_LAST_EMITTED_ROUND or 0)
                 if ok_emit:
                     try:
@@ -3352,6 +3395,12 @@ def _sync_round_tick_maestro():
                         f"⚠️ LXV_SYNC REAL no emitido en ronda #{round_id} (lock/purificación/estado)."
                     )
         else:
+            if str(patron).upper() == "4V/2X":
+                _lxv_5v1x_event_cooldown(
+                    key=f"4v2x_off:{round_id}",
+                    msg=f"🚫 4V2X ignorado en ronda #{round_id}: promoción REAL OFF",
+                    cooldown_s=8.0,
+                )
             agregar_evento(f"ℹ️ LXV columna #{round_id}: {patron} → {motivo}.")
         # Higiene mínima: baja "sync_wait" en bots ya contabilizados
         for bot in closed.keys():
@@ -3722,10 +3771,17 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool
     Conserva la infraestructura existente (orden_real/token/HUD), pero restringe la decisión.
     """
     src = str(source or "LEGACY").strip().upper()
-    allow_src = str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper()
-    if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and src != allow_src:
-        agregar_evento(f"🧊 REAL legacy congelado: source={src} bloqueado (solo {allow_src}).")
+    allow_sync = str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper()
+    allow_5v1x = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper()
+    allow_sources = {allow_sync}
+    if bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)):
+        allow_sources.add(allow_5v1x)
+    if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and src not in allow_sources:
+        agregar_evento(
+            f"🧊 REAL source rechazada: {src} (permitidas={','.join(sorted(allow_sources))})."
+        )
         return False
+    agregar_evento(f"✅ REAL source autorizada: {src}.")
     prev_src = globals().get("_REAL_ROUTE_SOURCE", None)
     globals()["_REAL_ROUTE_SOURCE"] = src
     try:
