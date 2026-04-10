@@ -2531,6 +2531,415 @@ _SYNC_ROUND_LAST_CLOSED_COUNT = {}
 _LXV_LAST_EMITTED_ROUND = 0
 _SYNC_PENDING_WARN_TS = {}
 _SYNC_STALE_WARN_TS = {}
+LXV_MATRIX_EXPORT_ENABLE = True
+LXV_MATRIX_DIR = script_dir
+LXV_MATRIX_EXPORT_LOCK = "lxv_matrix_export.lock"
+LXV_MATRIX_EXPORT_LOG_EVERY_S = 10.0
+_LXV_MATRIX_LAST_LOG_TS = 0.0
+_LXV_MATRIX_HEADERS = {
+    "matrix": [
+        "round_id", "ts_round",
+        "fulll47", "fulll50", "fulll45", "fulll48", "fulll49", "fulll46",
+        "n_verdes", "n_rojos", "n_indef", "n_vacios",
+        "ratio_verdes", "ratio_rojos",
+        "patron_lxv", "bot_x1", "bot_x2", "bot_x_fuerte",
+        "round_complete", "missing_bots", "data_quality",
+        "source",
+    ],
+    "long": [
+        "round_id", "ts_round", "bot", "bot_order",
+        "resultado_symbol", "resultado_texto", "result_bin",
+        "activo", "direccion", "ciclo", "monto",
+        "payout_total", "payout_multiplier",
+        "token", "prob_ia", "modo_ia", "ia_gate_real",
+        "trade_status", "epoch", "ts_trade",
+        "ia_decision_id", "puntaje_estrategia",
+        "round_complete", "missing_bots", "data_quality",
+    ],
+    "features": [
+        "round_id", "ts_round", "secuencia_columna",
+        "n_verdes", "n_rojos", "n_indef",
+        "ratio_verdes", "ratio_rojos",
+        "x_unica", "x_doble",
+        "bots_rojos", "bots_verdes",
+        "bot_x1", "bot_x2", "bot_x_fuerte",
+        "avg_prob_verdes", "avg_prob_rojos", "max_prob_rojos", "min_prob_rojos", "std_prob_columna",
+        "avg_score_verdes", "avg_score_rojos",
+        "patron_lxv", "patron_simple", "patron_hash",
+        "round_complete", "missing_bots", "data_quality",
+    ],
+}
+
+def _lxv_matrix_paths() -> dict:
+    base = os.path.abspath(os.path.expanduser(LXV_MATRIX_DIR or script_dir))
+    return {
+        "matrix": os.path.join(base, "matriz_lxv.csv"),
+        "long": os.path.join(base, "rondas_lxv_long.csv"),
+        "features": os.path.join(base, "features_columnas_lxv.csv"),
+        "xlsx": os.path.join(base, "matriz_lxv.xlsx"),
+    }
+
+def _lxv_result_to_symbol(resultado: str | None) -> str:
+    r = normalizar_resultado(resultado)
+    if r == "GANANCIA":
+        return "✓"
+    if r == "PÉRDIDA":
+        return "X"
+    if r == "INDEFINIDO":
+        return "·"
+    return "-"
+
+def _lxv_safe_float(v, default=None):
+    try:
+        if v is None or str(v).strip() == "":
+            return default
+        x = float(v)
+        if np.isnan(x) or np.isinf(x):
+            return default
+        return x
+    except Exception:
+        return default
+
+def _lxv_safe_int(v, default=None):
+    try:
+        if v is None or str(v).strip() == "":
+            return default
+        return int(float(v))
+    except Exception:
+        return default
+
+def _lxv_csv_read_rows(path: str, max_lines: int = 1800) -> list[dict]:
+    return _tail_rows_dict(path, max_lines=max_lines)
+
+def _lxv_get_last_closed_row_for_bot(bot: str, ack_close: dict, round_id: int) -> dict | None:
+    ruta = f"registro_enriquecido_{bot}.csv"
+    rows = _lxv_csv_read_rows(ruta, max_lines=2500)
+    if not rows:
+        return None
+    ack_res = normalizar_resultado((ack_close or {}).get("resultado"))
+    ack_ts = _lxv_safe_float((ack_close or {}).get("ts"), default=0.0) or 0.0
+    cands = []
+    for r in rows:
+        res = normalizar_resultado(r.get("resultado"))
+        if res not in ("GANANCIA", "PÉRDIDA"):
+            continue
+        if ack_res in ("GANANCIA", "PÉRDIDA") and res != ack_res:
+            continue
+        ts_norm = normalizar_trade_status(r.get("trade_status_norm", None) or r.get("trade_status", None))
+        if ts_norm and ts_norm != "CERRADO":
+            continue
+        ts_trade = _lxv_safe_float(r.get("ts"), default=0.0) or 0.0
+        epoch = _lxv_safe_int(r.get("epoch"), default=0) or 0
+        cycle = _lxv_safe_int(r.get("ciclo_martingala"), default=_lxv_safe_int(r.get("ciclo"), default=0) or 0) or 0
+        cands.append({
+            "_row": r,
+            "_ts_trade": ts_trade,
+            "_epoch": epoch,
+            "_cycle": cycle,
+            "_dt_ack": abs(ts_trade - ack_ts) if (ack_ts > 0 and ts_trade > 0) else 999999.0,
+        })
+    if not cands:
+        return None
+    cands.sort(key=lambda x: (x["_dt_ack"], -(x["_epoch"]), -(x["_ts_trade"])))
+    if len(cands) >= 2:
+        a, b = cands[0], cands[1]
+        if abs(float(a["_dt_ack"]) - float(b["_dt_ack"])) <= 0.05 and a["_epoch"] == b["_epoch"]:
+            return None
+    if ack_ts > 0 and cands[0]["_dt_ack"] > 1200:
+        return None
+    out = dict(cands[0]["_row"])
+    out["__round_id"] = int(round_id)
+    out["__ack_resultado"] = ack_res
+    out["__ack_ts"] = ack_ts
+    out["__bot"] = bot
+    return out
+
+def _lxv_round_already_exported(round_id: int, bot: str | None = None) -> bool:
+    p = _lxv_matrix_paths()
+    if bot is None:
+        path = p["matrix"]
+        if not os.path.exists(path):
+            return False
+        rows = _lxv_csv_read_rows(path, max_lines=3000)
+        rid = str(int(round_id))
+        return any(str(r.get("round_id", "")).strip() == rid for r in rows)
+    path = p["long"]
+    if not os.path.exists(path):
+        return False
+    rows = _lxv_csv_read_rows(path, max_lines=6000)
+    rid = str(int(round_id))
+    for r in rows:
+        if str(r.get("round_id", "")).strip() == rid and str(r.get("bot", "")).strip() == str(bot):
+            return True
+    return False
+
+def _lxv_append_rows_csv(path: str, rows: list[dict], headers: list[str], unique_keys: list[str]) -> int:
+    if not rows:
+        return 0
+    _ensure_dir(os.path.dirname(path) or ".")
+    wrote = 0
+    with file_lock_required(LXV_MATRIX_EXPORT_LOCK, timeout=3.0, stale_after=30.0) as got:
+        if not got:
+            return 0
+        existing = set()
+        if os.path.exists(path):
+            old = _lxv_csv_read_rows(path, max_lines=20000)
+            for r in old:
+                k = tuple(str(r.get(c, "")).strip() for c in unique_keys)
+                existing.add(k)
+        need_header = (not os.path.exists(path)) or os.path.getsize(path) <= 0
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
+            if need_header:
+                w.writeheader()
+            for row in rows:
+                k = tuple(str(row.get(c, "")).strip() for c in unique_keys)
+                if k in existing:
+                    continue
+                payload = {h: row.get(h, "") for h in headers}
+                w.writerow(payload)
+                existing.add(k)
+                wrote += 1
+            f.flush()
+            os.fsync(f.fileno())
+    return wrote
+
+def _lxv_build_round_row(round_id: int, ts_round: float, rows_long: list[dict], missing_bots: list[str], round_complete: bool, data_quality: str) -> dict:
+    by_bot = {str(r.get("bot")): r for r in rows_long}
+    symbols = []
+    n_verdes = n_rojos = n_indef = n_vacios = 0
+    rojos = []
+    for b in BOT_NAMES:
+        sym = str((by_bot.get(b, {}) or {}).get("resultado_symbol", "-") or "-")
+        if sym not in ("✓", "X", "·", "-"):
+            sym = "-"
+        symbols.append(sym)
+        if sym == "✓":
+            n_verdes += 1
+        elif sym == "X":
+            n_rojos += 1
+            rojos.append(b)
+        elif sym == "·":
+            n_indef += 1
+        else:
+            n_vacios += 1
+    bot_x1 = rojos[0] if len(rojos) >= 1 else ""
+    bot_x2 = rojos[1] if len(rojos) >= 2 else ""
+    if n_verdes == 5 and n_rojos == 1:
+        patron = "5V1X"
+    elif n_verdes == 4 and n_rojos == 2:
+        patron = "4V2X"
+    else:
+        patron = "OTHER"
+    row = {
+        "round_id": int(round_id),
+        "ts_round": float(ts_round),
+        "n_verdes": int(n_verdes),
+        "n_rojos": int(n_rojos),
+        "n_indef": int(n_indef),
+        "n_vacios": int(n_vacios),
+        "ratio_verdes": round(float(n_verdes) / float(len(BOT_NAMES)), 6),
+        "ratio_rojos": round(float(n_rojos) / float(len(BOT_NAMES)), 6),
+        "patron_lxv": patron,
+        "bot_x1": bot_x1,
+        "bot_x2": bot_x2,
+        "bot_x_fuerte": "",
+        "round_complete": bool(round_complete),
+        "missing_bots": "|".join([b for b in BOT_NAMES if b in set(missing_bots or [])]),
+        "data_quality": str(data_quality),
+        "source": "sync_round",
+    }
+    for idx, b in enumerate(BOT_NAMES):
+        row[b] = symbols[idx]
+    return row
+
+def _lxv_pick_bot_x_fuerte(rojos_rows: list[dict]) -> str:
+    if len(rojos_rows) == 1:
+        return str(rojos_rows[0].get("bot", ""))
+    if len(rojos_rows) < 2:
+        return ""
+    stats_wr = {}
+    for b in BOT_NAMES:
+        stats_wr[b] = _lxv_safe_float(estado_bots.get(b, {}).get("porcentaje_exito"), default=-1e9)
+    def rank(r):
+        b = str(r.get("bot", ""))
+        order = BOT_NAMES.index(b) if b in BOT_NAMES else 999
+        return (
+            _lxv_safe_float(r.get("prob_ia"), default=-1e9),
+            _lxv_safe_float(r.get("puntaje_estrategia"), default=-1e9),
+            _lxv_safe_float(r.get("payout_total"), default=-1e9),
+            _lxv_safe_float(stats_wr.get(b), default=-1e9),
+            -float(order),
+        )
+    ranked = sorted(rojos_rows, key=rank, reverse=True)
+    return str(ranked[0].get("bot", "")) if ranked else ""
+
+def _lxv_build_features_row(round_row: dict, rows_long: list[dict]) -> dict:
+    vals_prob = []
+    verdes_prob = []
+    rojos_prob = []
+    verdes_score = []
+    rojos_score = []
+    bots_rojos = []
+    bots_verdes = []
+    secuencia = []
+    rojos_rows = []
+    by_bot = {str(r.get("bot")): r for r in rows_long}
+    for b in BOT_NAMES:
+        r = by_bot.get(b, {})
+        sym = str(r.get("resultado_symbol", "-") or "-")
+        secuencia.append(sym)
+        p = _lxv_safe_float(r.get("prob_ia"), default=None)
+        s = _lxv_safe_float(r.get("puntaje_estrategia"), default=None)
+        if p is not None:
+            vals_prob.append(p)
+        if sym == "✓":
+            bots_verdes.append(b)
+            if p is not None:
+                verdes_prob.append(p)
+            if s is not None:
+                verdes_score.append(s)
+        elif sym == "X":
+            bots_rojos.append(b)
+            rojos_rows.append(r)
+            if p is not None:
+                rojos_prob.append(p)
+            if s is not None:
+                rojos_score.append(s)
+    bot_x_fuerte = _lxv_pick_bot_x_fuerte(rojos_rows)
+    patron_simple = "".join(secuencia)
+    out = {
+        "round_id": round_row.get("round_id"),
+        "ts_round": round_row.get("ts_round"),
+        "secuencia_columna": "|".join(secuencia),
+        "n_verdes": round_row.get("n_verdes", 0),
+        "n_rojos": round_row.get("n_rojos", 0),
+        "n_indef": round_row.get("n_indef", 0),
+        "ratio_verdes": round_row.get("ratio_verdes", 0.0),
+        "ratio_rojos": round_row.get("ratio_rojos", 0.0),
+        "x_unica": bool(int(round_row.get("n_rojos", 0) or 0) == 1),
+        "x_doble": bool(int(round_row.get("n_rojos", 0) or 0) == 2),
+        "bots_rojos": "|".join(bots_rojos),
+        "bots_verdes": "|".join(bots_verdes),
+        "bot_x1": round_row.get("bot_x1", ""),
+        "bot_x2": round_row.get("bot_x2", ""),
+        "bot_x_fuerte": bot_x_fuerte,
+        "avg_prob_verdes": float(np.mean(verdes_prob)) if verdes_prob else "",
+        "avg_prob_rojos": float(np.mean(rojos_prob)) if rojos_prob else "",
+        "max_prob_rojos": float(np.max(rojos_prob)) if rojos_prob else "",
+        "min_prob_rojos": float(np.min(rojos_prob)) if rojos_prob else "",
+        "std_prob_columna": float(np.std(vals_prob)) if vals_prob else "",
+        "avg_score_verdes": float(np.mean(verdes_score)) if verdes_score else "",
+        "avg_score_rojos": float(np.mean(rojos_score)) if rojos_score else "",
+        "patron_lxv": round_row.get("patron_lxv", "OTHER"),
+        "patron_simple": patron_simple,
+        "patron_hash": hashlib.md5(patron_simple.encode("utf-8")).hexdigest()[:16],
+        "round_complete": round_row.get("round_complete", False),
+        "missing_bots": round_row.get("missing_bots", ""),
+        "data_quality": round_row.get("data_quality", "partial"),
+    }
+    return out
+
+def _lxv_export_excel_optional(paths: dict) -> None:
+    try:
+        if importlib.util.find_spec("openpyxl") is None:
+            return
+        matrix_rows = _lxv_csv_read_rows(paths["matrix"], max_lines=50000) if os.path.exists(paths["matrix"]) else []
+        long_rows = _lxv_csv_read_rows(paths["long"], max_lines=120000) if os.path.exists(paths["long"]) else []
+        feat_rows = _lxv_csv_read_rows(paths["features"], max_lines=50000) if os.path.exists(paths["features"]) else []
+        with pd.ExcelWriter(paths["xlsx"], engine="openpyxl", mode="w") as writer:
+            pd.DataFrame(matrix_rows).to_excel(writer, sheet_name="Matriz", index=False)
+            pd.DataFrame(long_rows).to_excel(writer, sheet_name="Long", index=False)
+            pd.DataFrame(feat_rows).to_excel(writer, sheet_name="Features", index=False)
+    except Exception:
+        return
+
+def _lxv_export_round_snapshot(round_id: int, ts_round: float, closed: dict, expected: list[str], stale_ignored: list[str], released_reason: str) -> None:
+    global _LXV_MATRIX_LAST_LOG_TS
+    if not bool(LXV_MATRIX_EXPORT_ENABLE):
+        return
+    if _lxv_round_already_exported(round_id):
+        return
+    expected = [b for b in list(expected or []) if b in BOT_NAMES]
+    if not expected:
+        expected = list(BOT_NAMES)
+    missing = [b for b in expected if b not in closed]
+    round_complete = len(missing) == 0
+    data_quality = "ok" if round_complete else "partial"
+    rows_long = []
+    for idx, bot in enumerate(BOT_NAMES, start=1):
+        ack = closed.get(bot, {}) if isinstance(closed.get(bot, {}), dict) else {}
+        csv_row = _lxv_get_last_closed_row_for_bot(bot, ack, round_id) if ack else None
+        rtxt = normalizar_resultado(ack.get("resultado")) if ack else "INDEFINIDO"
+        rsym = _lxv_result_to_symbol(rtxt) if ack else "-"
+        if bot in missing:
+            rsym = "-"
+            rtxt = ""
+        if _lxv_round_already_exported(round_id, bot=bot):
+            continue
+        row = {
+            "round_id": int(round_id),
+            "ts_round": float(ts_round),
+            "bot": bot,
+            "bot_order": int(idx),
+            "resultado_symbol": rsym,
+            "resultado_texto": rtxt if ack else "",
+            "result_bin": 1 if rsym == "✓" else (0 if rsym == "X" else ""),
+            "activo": (csv_row or {}).get("activo", ""),
+            "direccion": (csv_row or {}).get("direccion", (csv_row or {}).get("direction", "")),
+            "ciclo": (csv_row or {}).get("ciclo_martingala", (ack or {}).get("ciclo", "")),
+            "monto": (csv_row or {}).get("monto", ""),
+            "payout_total": (csv_row or {}).get("payout_total", ""),
+            "payout_multiplier": (csv_row or {}).get("payout_multiplier", ""),
+            "token": (csv_row or {}).get("token", estado_bots.get(bot, {}).get("token", "")),
+            "prob_ia": (csv_row or {}).get("ia_prob_en_juego", estado_bots.get(bot, {}).get("prob_ia", "")),
+            "modo_ia": (csv_row or {}).get("ia_modo_ack", estado_bots.get(bot, {}).get("modo_ia", "")),
+            "ia_gate_real": (csv_row or {}).get("ia_gate_real", ""),
+            "trade_status": (csv_row or {}).get("trade_status", "CERRADO" if ack else ""),
+            "epoch": (csv_row or {}).get("epoch", ""),
+            "ts_trade": (csv_row or {}).get("ts", (ack or {}).get("ts", "")),
+            "ia_decision_id": (csv_row or {}).get("ia_decision_id", estado_bots.get(bot, {}).get("ia_decision_id", "")),
+            "puntaje_estrategia": (csv_row or {}).get("puntaje_estrategia", ""),
+            "round_complete": bool(round_complete),
+            "missing_bots": "|".join(missing),
+            "data_quality": data_quality,
+        }
+        rows_long.append(row)
+    if len(rows_long) < len(BOT_NAMES):
+        seen = {str(r.get("bot")) for r in rows_long}
+        for idx, bot in enumerate(BOT_NAMES, start=1):
+            if bot in seen:
+                continue
+            rows_long.append({
+                "round_id": int(round_id), "ts_round": float(ts_round), "bot": bot, "bot_order": int(idx),
+                "resultado_symbol": "-", "resultado_texto": "", "result_bin": "",
+                "activo": "", "direccion": "", "ciclo": "", "monto": "",
+                "payout_total": "", "payout_multiplier": "", "token": "",
+                "prob_ia": "", "modo_ia": "", "ia_gate_real": "", "trade_status": "",
+                "epoch": "", "ts_trade": "", "ia_decision_id": "", "puntaje_estrategia": "",
+                "round_complete": bool(round_complete), "missing_bots": "|".join(missing), "data_quality": data_quality,
+            })
+    rows_long = sorted(rows_long, key=lambda r: int(r.get("bot_order", 999)))
+    round_row = _lxv_build_round_row(round_id, ts_round, rows_long, missing, round_complete, data_quality)
+    feat_row = _lxv_build_features_row(round_row, rows_long)
+    if str(data_quality) != "ok":
+        feat_row["avg_prob_verdes"] = ""
+        feat_row["avg_prob_rojos"] = ""
+        feat_row["max_prob_rojos"] = ""
+        feat_row["min_prob_rojos"] = ""
+        feat_row["std_prob_columna"] = ""
+        feat_row["avg_score_verdes"] = ""
+        feat_row["avg_score_rojos"] = ""
+    round_row["bot_x_fuerte"] = feat_row.get("bot_x_fuerte", "")
+    paths = _lxv_matrix_paths()
+    wrote_matrix = _lxv_append_rows_csv(paths["matrix"], [round_row], _LXV_MATRIX_HEADERS["matrix"], ["round_id"])
+    _lxv_append_rows_csv(paths["long"], rows_long, _LXV_MATRIX_HEADERS["long"], ["round_id", "bot"])
+    _lxv_append_rows_csv(paths["features"], [feat_row], _LXV_MATRIX_HEADERS["features"], ["round_id"])
+    _lxv_export_excel_optional(paths)
+    now_ts = time.time()
+    if wrote_matrix > 0 and (now_ts - float(_LXV_MATRIX_LAST_LOG_TS or 0.0)) >= float(LXV_MATRIX_EXPORT_LOG_EVERY_S):
+        _LXV_MATRIX_LAST_LOG_TS = now_ts
+        agregar_evento(f"📊 Export ronda LXV #{int(round_id)} -> matriz/long/features OK ({data_quality}; reason={released_reason}).")
 
 def _sync_round_ack_path(bot: str) -> str:
     _ensure_dir(SYNC_ROUND_DIR)
@@ -2795,6 +3204,14 @@ def _sync_round_tick_maestro():
             agregar_evento(f"🟠 LXV_SYNC_COLUMN failsafe: liberando ronda #{round_id} sin {stale_ignored} por stale/timeout.")
         agregar_evento(f"✅ LXV_SYNC_COLUMN columna/ronda #{round_id} COMPLETA.")
         agregar_evento(f"🚀 LXV_SYNC_COLUMN ronda #{next_round} LIBERADA.")
+        _lxv_export_round_snapshot(
+            round_id=int(round_id),
+            ts_round=float(now_ts),
+            closed=dict(closed),
+            expected=list(expected),
+            stale_ignored=list(stale_ignored),
+            released_reason=str(payload.get("reason", "")),
+        )
         snapshot = _lxv_round_snapshot(round_id, closed)
         if len(snapshot) < int(LXV_SYNC_MIN_CLOSED_FOR_EVAL):
             pick, patron, motivo = None, f"{len([x for x in snapshot if x.get('resultado') == 'GANANCIA'])}V/{len([x for x in snapshot if x.get('resultado') == 'PÉRDIDA'])}X", "masa mínima insuficiente para evaluar LXV_REAL"
