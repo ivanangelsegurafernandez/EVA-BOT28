@@ -629,7 +629,11 @@ def _purificacion_real_activa() -> bool:
     """Llave maestra centralizada para apagar capa REAL sin romper flujo IA/HUD."""
     try:
         route_src = str(globals().get("_REAL_ROUTE_SOURCE", "") or "").strip().upper()
-        if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and route_src == str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper():
+        if bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)):
+            allow_src_5v1x = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X") or "LXV_5V1X").strip().upper()
+            if route_src == allow_src_5v1x:
+                return False
+        elif bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and route_src == str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper():
             return False
         return bool(globals().get("MODO_PURIFICACION_REAL", False))
     except Exception:
