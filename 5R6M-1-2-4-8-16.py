@@ -3768,11 +3768,10 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool
                 cooldown_s=10.0,
             )
             return False
-    else:
-        allow_src = str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper()
-        if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and src != allow_src:
-            agregar_evento(f"🧊 REAL legacy congelado: source={src} bloqueado (solo {allow_src}).")
-            return False
+    allow_src = str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper()
+    if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and src != allow_src:
+        agregar_evento(f"🧊 REAL legacy congelado: source={src} bloqueado (solo {allow_src}).")
+        return False
     prev_src = globals().get("_REAL_ROUTE_SOURCE", None)
     globals()["_REAL_ROUTE_SOURCE"] = src
     try:
