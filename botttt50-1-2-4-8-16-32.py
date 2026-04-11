@@ -363,13 +363,35 @@ def _sync_round_write_release_heartbeat(round_id: int, next_round: int):
     _sync_round_write_json_atomic(path, payload)
 
 
+SYNC_WAIT_POLL_S = 0.80
+SYNC_WAIT_HEARTBEAT_S = 2.0
+SYNC_WAIT_STALE_S = 90.0
+SYNC_WAIT_MAX_IDLE_S = 240.0
+
+
+def _sync_round_state_ts(st: dict) -> float:
+    if not isinstance(st, dict):
+        return 0.0
+    for key in ("ts", "updated_ts", "updated_at", "last_seen_ts"):
+        try:
+            val = float(st.get(key, 0.0) or 0.0)
+        except Exception:
+            continue
+        if val > 0:
+            return val
+    return 0.0
+
+
 async def _sync_round_wait_release(round_id: int) -> int:
     rid = max(1, int(round_id or 1))
     next_round = rid + 1
     print(Fore.YELLOW + Style.BRIGHT + f"⏸️ LXV_SYNC_COLUMN standby columna: {NOMBRE_BOT} ronda #{rid} esperando liberación #{next_round}...")
     estado_bot["sync_wait"] = True
+    wait_start_ts = time.time()
     last_hb_ts = 0.0
+    last_progress_ts = wait_start_ts
     last_released = None
+    last_state_ts = 0.0
     first_wait_tick = True
     while not stop_event.is_set():
         st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
@@ -377,22 +399,35 @@ async def _sync_round_wait_release(round_id: int) -> int:
             released = int(st.get("released_round", 1) or 1)
         except Exception:
             released = 1
+        state_ts = _sync_round_state_ts(st)
         now_ts = time.time()
-        should_write = first_wait_tick or (released != last_released) or ((now_ts - last_hb_ts) >= 2.0)
+        if first_wait_tick or (released != last_released) or (state_ts > 0 and state_ts != last_state_ts):
+            last_progress_ts = now_ts
+        should_write = first_wait_tick or (released != last_released) or ((now_ts - last_hb_ts) >= SYNC_WAIT_HEARTBEAT_S)
         if released >= next_round:
             estado_bot["sync_wait"] = False
             _sync_round_write_release_heartbeat(rid, next_round)
             print(Fore.GREEN + f"🔓 LXV_SYNC_COLUMN liberación detectada: ronda #{released} (bot {NOMBRE_BOT})")
             print(Fore.GREEN + Style.BRIGHT + f"▶️ LXV_SYNC_COLUMN salida standby: {NOMBRE_BOT} → ronda #{next_round}")
             return next_round
+        stale_state = (state_ts > 0) and ((now_ts - state_ts) >= SYNC_WAIT_STALE_S)
+        idle_s = now_ts - last_progress_ts
+        total_wait_s = now_ts - wait_start_ts
+        if (idle_s >= SYNC_WAIT_MAX_IDLE_S) and (stale_state or total_wait_s >= (SYNC_WAIT_STALE_S + SYNC_WAIT_MAX_IDLE_S)):
+            estado_bot["sync_wait"] = False
+            _sync_round_write_release_heartbeat(rid, next_round)
+            safe_round = max(rid, _sync_round_resolve_start_round())
+            print(Fore.YELLOW + f"⚠️ LXV_SYNC_COLUMN watchdog recovery: {NOMBRE_BOT} ronda #{rid} sin progreso {idle_s:.0f}s, re-sync -> #{safe_round}")
+            return safe_round
         if should_write:
             _sync_round_write_wait_heartbeat(rid, next_round)
             last_hb_ts = now_ts
             last_released = released
+            last_state_ts = state_ts
             first_wait_tick = False
         if _print_once(f"sync-standby-{rid}", ttl=6.0):
             print(Fore.CYAN + f"… standby columna {NOMBRE_BOT}: ronda #{rid}, released_round={released}")
-        await asyncio.sleep(0.80)
+        await asyncio.sleep(SYNC_WAIT_POLL_S)
     estado_bot["sync_wait"] = False
     _sync_round_write_release_heartbeat(rid, next_round)
     return rid
