@@ -172,8 +172,8 @@ ARCHIVO_CSV = f"registro_enriquecido_{NOMBRE_BOT}.csv"
 ARCHIVO_TOKEN = "token_actual.txt"  # Fuente única de verdad (coincide con 5R6M)
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 ACTIVOS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
-MARTINGALA_DEMO = [1, 2, 4, 8]
-MARTINGALA_REAL = [1, 2, 4, 8]
+MARTINGALA_DEMO = [1, 2, 4]
+MARTINGALA_REAL = [1, 2, 4]
 VELAS = 20
 PAUSA_POST_OPERACION_S = 2  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
 # ==================== VENTANA DE DECISIÓN IA ====================
@@ -428,7 +428,10 @@ def leer_orden_real(bot: str):
             lim = max(30, min(ttl, 300))  # margen seguro
             if time.time() - ts > lim:
                 return None, None, 0, None
-            return max(1, min(cyc, MAX_CICLOS)), ts, quiet, src
+            ciclo_norm = max(1, min(cyc, MAX_CICLOS))
+            if cyc != ciclo_norm:
+                print(Fore.YELLOW + f"⚠️ ciclo>MAX_CICLOS detectado, normalizado a C{ciclo_norm}")
+            return ciclo_norm, ts, quiet, src
         return None, None, 0, None
     except Exception:
         if os.path.exists(tmp):
@@ -2481,7 +2484,9 @@ async def ejecutar_panel():
             except Exception:
                 ciclo_forzado = None
             if ciclo_forzado is not None and not (1 <= ciclo_forzado <= MAX_CICLOS):
-                ciclo_forzado = None
+                ciclo_prev = ciclo_forzado
+                ciclo_forzado = max(1, min(ciclo_forzado, MAX_CICLOS))
+                print(Fore.YELLOW + f"⚠️ ciclo>MAX_CICLOS detectado, normalizado a C{ciclo_forzado} (retenido=C{ciclo_prev})")
 
             ciclo = ciclo_maestro or ciclo_forzado or 1
             if modo_real:
@@ -2938,7 +2943,7 @@ async def ejecutar_panel():
     except Exception as e:
         if _es_error_transitorio_ws(e):
             ciclo_ref = int(estado_bot.get("ciclo_actual", 1) or 1)
-            estado_bot["ciclo_forzado"] = max(1, ciclo_ref)
+            estado_bot["ciclo_forzado"] = max(1, min(MAX_CICLOS, ciclo_ref))
             reinicio_forzado.set()
             print(Fore.YELLOW + Style.BRIGHT + f"[WARN] WS/NET transitorio ({type(e).__name__}). Blindaje activo: reintento en ciclo #{estado_bot['ciclo_forzado']}.")
             await asyncio.sleep(1.2 + random.uniform(0.0, 0.5))

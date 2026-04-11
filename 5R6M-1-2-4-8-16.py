@@ -4,7 +4,7 @@
 #
 # Este script coordina:
 # - Lectura de CSV enriquecidos de los bots fulll45–fulll50
-# - Control de Martingala 1-2-4-8
+# - Control de Martingala 1-2-4
 # - Gestión de tokens DEMO/REAL
 # - IA (XGBoost) para probabilidades de éxito
 # - HUD visual con Prob IA, % éxito, saldo, meta y eventos
@@ -180,7 +180,7 @@ init(autoreset=True)
 
 # === BLOQUE 2 — CONFIGURACIÓN GLOBAL (MARTINGALA, HUD, AUDIO, IA) ===
 # === CONFIGURACIÓN DE MARTINGALA ===
-MARTI_ESCALADO = [1, 2, 4, 8]  # Escalado oficial de 4 pasos
+MARTI_ESCALADO = [1, 2, 4]  # Escalado oficial de 3 pasos
 MONTO_TOL = 0.01  # Tolerancia para redondeos
 SONAR_TAMBIEN_EN_DEMO = False  # Activar sonidos para victorias en DEMO
 SONAR_SOLO_EN_GATEWIN = True   # Solo sonar dentro de la ventana GateWIN
@@ -3785,7 +3785,14 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool
     prev_src = globals().get("_REAL_ROUTE_SOURCE", None)
     globals()["_REAL_ROUTE_SOURCE"] = src
     try:
-        return bool(escribir_orden_real(bot, int(ciclo)))
+        ciclo_req = int(ciclo)
+    except Exception:
+        ciclo_req = 1
+    ciclo_norm = max(1, min(ciclo_req, MAX_CICLOS))
+    if ciclo_req != ciclo_norm:
+        agregar_evento(f"⚠️ ciclo>MAX_CICLOS detectado, normalizado a C{ciclo_norm} (solicitado=C{ciclo_req}).")
+    try:
+        return bool(escribir_orden_real(bot, ciclo_norm))
     finally:
         globals()["_REAL_ROUTE_SOURCE"] = prev_src
 
@@ -5969,12 +5976,12 @@ def _log_operational_degradation_runtime(ttl_s: float = 60.0):
         if sig != str(cache.get("sig", "")) or (now - float(cache.get("ts", 0.0))) >= float(max(20.0, ttl_s)):
             agregar_evento(
                 "📊 Degradación vivo: "
-                f"WR_C1={np.mean(wr_vals)*100:.1f}% ciclo={np.mean(cyc_vals):.2f} C4+={np.mean(deep_vals)*100:.1f}% "
+                f"WR_C1={np.mean(wr_vals)*100:.1f}% ciclo={np.mean(cyc_vals):.2f} C{int(MAX_CICLOS)}+={np.mean(deep_vals)*100:.1f}% "
                 f"PnL_roll={sum(pnl_vals):+.2f} | peor={worst[0]}/{worst[1]} {worst[2]['pnl']:+.2f} "
                 f"mejor={best[0]}/{best[1]} {best[2]['pnl']:+.2f}"
             )
             if (np.mean(wr_vals) < 0.46) or (np.mean(deep_vals) > 0.50) or (sum(pnl_vals) < 0.0):
-                agregar_evento("🚨 Alerta degradación: calidad operativa en caída (WR_C1/PnL/C4+).")
+                agregar_evento(f"🚨 Alerta degradación: calidad operativa en caída (WR_C1/PnL/C{int(MAX_CICLOS)}+).")
         globals()["_ASSET_RUNTIME_LOG_CACHE"] = {"ts": now, "sig": sig}
     except Exception:
         pass
@@ -17785,7 +17792,7 @@ if __name__ == "__main__":
 # === BLOQUE 99 — RESUMEN FINAL DE LO QUE SE LOGRA ===
 #
 # - Bot maestro 5R6M-1-2-4-8-16 con:
-#   * Martingala 1-2-4-8 intacta.
+#   * Martingala 1-2-4 intacta.
 #   * Tokens DEMO/REAL y handshake maestro→bots intactos.
 #   * CSV enriquecidos, dataset_incremental.csv, IA XGBoost, reentrenos intactos.
 #   * HUD visual con Prob IA, % éxito, saldo, meta, eventos
