@@ -137,8 +137,8 @@ PAUSE_MONITOR_LOG_COOLDOWN_S = 12.0
 _pause_monitor_last_log_ts = 0.0
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 ACTIVOS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
-MARTINGALA_DEMO = [1, 2, 4, 8]
-MARTINGALA_REAL = [1, 2, 4, 8]
+MARTINGALA_DEMO = [1, 2, 4, 8, 16]
+MARTINGALA_REAL = [1, 2, 4, 8, 16]
 VELAS = 20
 PAUSA_POST_OPERACION_S = 40  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
 # ==================== LEGACY IA/REVALIDACIÓN (INACTIVO) ====================
@@ -173,8 +173,8 @@ REAL_COMMIT_WINDOW_S = 75
 last_real_contract_id = None
 real_buy_commit_until = 0.0
 
-# Higiene de riesgo: al saltar a REAL, arrancar en C1 (aunque el maestro sugiera C2+)
-RESET_CICLO_EN_ENTRADA_REAL = True
+# Higiene de riesgo: en REAL se respeta ciclo del maestro (fallback C1 solo sin orden válida).
+RESET_CICLO_EN_ENTRADA_REAL = False
 
 def commit_guard_active() -> bool:
     return (last_real_contract_id is not None) and (time.time() < real_buy_commit_until)
