@@ -4,15 +4,29 @@ import websockets
 import json
 import csv
 import os
+import warnings
+import logging
 import sys
 from datetime import datetime, timezone
 from statistics import mean
 from colorama import Fore, Back, Style, init
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+warnings.filterwarnings(
+    "ignore",
+    message="pkg_resources is deprecated as an API.*",
+    category=UserWarning,
+)
 import pygame
 import pandas as pd
 import time  # Added for timestamps in orden_real and BLOQUE 5
 import random  # Added for jitter in BLOQUE 1.3
 import itertools  # For req_counter in api_call
+
+logging.getLogger("websockets").setLevel(logging.CRITICAL)
+logging.getLogger("websockets.client").setLevel(logging.CRITICAL)
+logging.getLogger("websockets.protocol").setLevel(logging.CRITICAL)
+logging.getLogger("websockets.legacy").setLevel(logging.CRITICAL)
 
 # === BLINDAJE: señales limpias ===
 import signal
@@ -1085,7 +1099,12 @@ async def api_call(ws, payload: dict, expect_msg_type: str = None, timeout=10.0)
     payload = dict(payload)
     payload["req_id"] = rid
 
-    await ws.send(json.dumps(payload))
+    try:
+        await ws.send(json.dumps(payload))
+    except Exception as e:
+        if _es_error_transitorio_ws(e):
+            raise ConnectionError(f"WS_SEND_TRANSIENT: {type(e).__name__}: {e}") from e
+        raise
 
     aliases = {
         "candles": {"history"},
@@ -1099,7 +1118,12 @@ async def api_call(ws, payload: dict, expect_msg_type: str = None, timeout=10.0)
         if remaining <= 0:
             raise TimeoutError(f"Timeout esperando respuesta para req_id={rid}")
 
-        raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+        except Exception as e:
+            if _es_error_transitorio_ws(e):
+                raise ConnectionError(f"WS_RECV_TRANSIENT: {type(e).__name__}: {e}") from e
+            raise
 
         try:
             data = json.loads(raw)
@@ -1149,11 +1173,13 @@ def _es_error_transitorio_ws(exc: Exception) -> bool:
         return True
     msg = str(exc).lower()
     return (
-        "connectionclosed" in msg
+        "winerror 121" in msg
+        or "se agotó el tiempo" in msg
+        or "data transfer failed" in msg
+        or "connection closed" in msg
+        or "connectionclosed" in msg
         or "timeout" in msg
         or "timed out" in msg
-        or "se agotó el tiempo" in msg
-        or "winerror 121" in msg
     )
 
 async def obtener_velas(ws, symbol, token, reintentos=4):
@@ -1199,8 +1225,16 @@ async def obtener_velas(ws, symbol, token, reintentos=4):
                     print(Fore.YELLOW + f"{symbol} en cooldown 90s por error: {api_e}")
                 return []
         except Exception as e:
+            if _es_error_transitorio_ws(e):
+                _ws_fail_streak += 1
+                if _print_once(f"ws-obt-transient-{symbol}", ttl=8):
+                    print(Fore.YELLOW + f"WS/NET transitorio en velas {symbol}: {type(e).__name__}. Reabro WS y mantengo ciclo.")
+                if _ws_fail_streak >= 2:
+                    ws_reset_needed.set()
+                return []
             if _print_once(f"ws-obt-err-{symbol}", ttl=8):
-                print(Fore.RED + f"Error velas {symbol}: {e}. Reintentando...")
+                print(Fore.RED + f"Error velas {symbol}: {type(e).__name__}: {e}. Reintentando...")
+            return []
         # Fallback: desde el 3er intento usa una conexión efímera dedicada
         if intento >= 2:
             try:
@@ -1284,8 +1318,6 @@ async def check_token_and_reconnect(ws, current_token):
                         ciclo_prev = estado_bot.get("ciclo_forzado")
                         ciclo_resuelto, ciclo_src, co, cf = resolver_ciclo_operativo(ciclo_orden=cyc, ciclo_forzado=ciclo_prev, modo_real=True, order_id=order_id)
                         estado_bot["ciclo_forzado"] = ciclo_resuelto
-                        if ciclo_src == "orden_maestro" and order_id:
-                            globals()["ORDEN_REAL_CONSUMIDA_ID"] = order_id
                         print(Fore.YELLOW + f"Orden maestro detectada: arrancaré en ciclo #{ciclo_resuelto}.")
                         if _print_once(f"ciclo-resuelto-entry-{ciclo_resuelto}-{ciclo_src}", ttl=20):
                             print(Fore.YELLOW + f"Ciclo resuelto REAL: orden=C{co or '-'} forzado=C{cf or '-'} final=C{ciclo_resuelto} src={ciclo_src}")
@@ -1312,8 +1344,6 @@ async def check_token_and_reconnect(ws, current_token):
                         ciclo_prev = estado_bot.get("ciclo_forzado")
                         ciclo_resuelto, ciclo_src, co, cf = resolver_ciclo_operativo(ciclo_orden=cyc, ciclo_forzado=ciclo_prev, modo_real=True, order_id=order_id)
                         estado_bot["ciclo_forzado"] = ciclo_resuelto
-                        if ciclo_src == "orden_maestro" and order_id:
-                            globals()["ORDEN_REAL_CONSUMIDA_ID"] = order_id
                         if _print_once(f"ciclo-resuelto-reaf-{ciclo_resuelto}-{ciclo_src}", ttl=20):
                             print(Fore.YELLOW + f"Ciclo resuelto REAL: orden=C{co or '-'} forzado=C{cf or '-'} final=C{ciclo_resuelto} src={ciclo_src}")
 
@@ -1959,8 +1989,7 @@ async def mostrar_saldos():
                     print(Fore.YELLOW + "Balance DEMO no disponible, usando último valor válido.")
     except Exception as e:
         if _print_once("saldo-demo-error", ttl=REFRESCO_SALDO):
-            print(Fore.YELLOW + Style.BRIGHT + f"[WARN] saldo DEMO: {type(e).__name__}: {e!r}")
-            print(Fore.YELLOW + "Balance DEMO no disponible, usando último valor válido.")
+            print(Fore.YELLOW + Style.BRIGHT + f"[INFO] saldo DEMO no disponible temporalmente ({type(e).__name__}). Uso último válido.")
 
     # REAL
     try:
@@ -1976,8 +2005,7 @@ async def mostrar_saldos():
                     print(Fore.YELLOW + "Balance REAL no disponible, usando último valor válido.")
     except Exception as e:
         if _print_once("saldo-real-error", ttl=REFRESCO_SALDO):
-            print(Fore.YELLOW + Style.BRIGHT + f"[WARN] saldo REAL: {type(e).__name__}: {e!r}")
-            print(Fore.YELLOW + "Balance REAL no disponible, usando último valor válido.")
+            print(Fore.YELLOW + Style.BRIGHT + f"[INFO] saldo REAL no disponible temporalmente ({type(e).__name__}). Uso último válido.")
 
     print(Fore.LIGHTBLUE_EX + Style.BRIGHT + f"Saldo cuenta DEMO: {saldo_demo:.2f} USD")
     print(Fore.YELLOW + Style.BRIGHT + f"Saldo cuenta REAL: {saldo_real:.2f} USD")
@@ -2106,14 +2134,15 @@ async def ejecutar_panel():
             sep_ciclo()
             ciclo_orden, _ts, _quiet, _src, order_id = leer_orden_real(NOMBRE_BOT)
             ciclo_forzado = estado_bot.get("ciclo_forzado")
+            if modo_real and reinicio_forzado.is_set() and ciclo_forzado:
+                ciclo_orden = None
+                order_id = None
             if order_id and order_id == ORDEN_REAL_CONSUMIDA_ID:
                 if _print_once(f"orden-repetida-main-{order_id}", ttl=30):
                     print(Fore.YELLOW + f"Orden REAL repetida ignorada: {order_id}")
                 ciclo_orden = None
                 order_id = None
             ciclo, ciclo_src, co, cf = resolver_ciclo_operativo(ciclo_orden=ciclo_orden, ciclo_forzado=ciclo_forzado, modo_real=modo_real, order_id=order_id)
-            if modo_real and ciclo_src == "orden_maestro" and order_id:
-                globals()["ORDEN_REAL_CONSUMIDA_ID"] = order_id
             print(Fore.YELLOW + f"Ciclo resuelto REAL: orden=C{co or '-'} forzado=C{cf or '-'} final=C{ciclo} src={ciclo_src}" if modo_real else Fore.YELLOW + f"Ciclo resuelto: C{ciclo} ({ciclo_src})")
 
             estado_bot["ciclo_forzado"] = None
@@ -2302,6 +2331,8 @@ async def ejecutar_panel():
                     continue
 
                 try:
+                    if modo_real and order_id:
+                        globals()["ORDEN_REAL_CONSUMIDA_ID"] = order_id
                     data_buy = await api_call(ws, {
                         "buy": 1,
                         "price": float(ask_price),
