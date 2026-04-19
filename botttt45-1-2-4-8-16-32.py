@@ -2031,10 +2031,12 @@ def resolver_ciclo_operativo(ciclo_orden=None, ciclo_forzado=None, modo_real=Fal
     co = max(1, min(co, MAX_CICLOS)) if co else None
     cf = max(1, min(cf, MAX_CICLOS)) if cf else None
 
-    if modo_real and co:
+    if modo_real and cf and cf > 1 and (not co or co < cf):
+        return cf, "ciclo_forzado_protege_contra_orden_vieja", co, cf
+    if co:
         return co, "orden_maestro", co, cf
     if cf:
-        return cf, "ciclo_forzado_sin_orden_maestro", co, cf
+        return cf, "ciclo_forzado", co, cf
     return 1, "fallback_C1", co, cf
 
 # ==================== LOOP PRINCIPAL ====================
