@@ -1282,6 +1282,8 @@ async def check_token_and_reconnect(ws, current_token):
                     print(Fore.MAGENTA + Style.BRIGHT + "Cambio de token detectado: cortando ciclo y aplicando de inmediato.")
                 estado_bot["token_msg_mostrado"] = True
             estado_bot["interrumpir_ciclo"] = True
+            estado_bot["token_origen_interrupcion"] = current_token
+            estado_bot["token_destino_interrupcion"] = token_desde_archivo
             reinicio_forzado.set()
             return ws, current_token  # dejar que esperar_resultado lo desprenda
         else:
@@ -1415,6 +1417,8 @@ async def vigilar_token():
                         print(Fore.MAGENTA + Style.BRIGHT + "Cambio de token detectado: cortando ciclo y aplicando de inmediato.")
                     estado_bot["token_msg_mostrado"] = True
                 estado_bot["interrumpir_ciclo"] = True
+                estado_bot["token_origen_interrupcion"] = ultimo_token
+                estado_bot["token_destino_interrupcion"] = token_desde_archivo
                 reinicio_forzado.set()
             else:
                 ultimo_token = token_desde_archivo
@@ -2159,9 +2163,15 @@ async def ejecutar_panel():
                 ws, current_token = await check_token_and_reconnect(ws, current_token)
 
                 if reinicio_forzado.is_set():
-                    estado_bot["ciclo_forzado"] = ciclo
-                    proximo = estado_bot.get("ciclo_forzado") or ciclo
-                    print(Fore.YELLOW + Style.BRIGHT + f"Reinicio forzado durante ciclo. Ciclo actual #{ciclo} → siguiente #{proximo}.")
+                    origen = estado_bot.pop("token_origen_interrupcion", None)
+                    destino = estado_bot.pop("token_destino_interrupcion", None)
+                    if origen == TOKEN_DEMO and destino == TOKEN_REAL:
+                        estado_bot["ciclo_forzado"] = None
+                        print(Fore.YELLOW + "Pase DEMO→REAL detectado: descarto ciclo DEMO local y obedeceré orden del maestro.")
+                    else:
+                        estado_bot["ciclo_forzado"] = ciclo
+                        proximo = estado_bot.get("ciclo_forzado") or ciclo
+                        print(Fore.YELLOW + Style.BRIGHT + f"Reinicio forzado durante ciclo. Ciclo actual #{ciclo} → siguiente #{proximo}.")
                     reinicio_forzado.clear()
                     await asyncio.sleep(2)
                     indefinidos_consecutivos = 0
