@@ -253,7 +253,8 @@ except Exception:
 
 def leer_orden_real(bot: str):
     """
-    Devuelve (ciclo, ts, quiet, src) si existe orden fresca, o (None, None, 0, None) si no.
+    Devuelve (ciclo, ts, quiet, src, order_id) si existe orden fresca,
+    o (None, None, 0, None, None) si no.
     """
     ruta = os.path.join(ORDEN_DIR, f"{bot}.json")
     tmp = ruta + ".tmp"
@@ -265,7 +266,7 @@ def leer_orden_real(bot: str):
                 data = json.load(f)
             os.remove(tmp)
             if data.get("bot") != bot:
-                return None, None, 0, None
+                return None, None, 0, None, None
             cyc = int(data.get("ciclo", 1))
             ts = float(data.get("ts", 0.0))
             ttl = int(data.get("ttl", 120))
@@ -273,13 +274,15 @@ def leer_orden_real(bot: str):
             src = str(data.get("src", "") or "").upper() or None
             lim = max(30, min(ttl, 300))  # margen seguro
             if time.time() - ts > lim:
-                return None, None, 0, None
-            return max(1, min(cyc, MAX_CICLOS)), ts, quiet, src
-        return None, None, 0, None
+                return None, None, 0, None, None
+            cyc = max(1, min(cyc, MAX_CICLOS))
+            order_id = str(data.get("order_id", "") or "").strip() or f"legacy|{bot}|{int(ts)}|C{cyc}"
+            return cyc, ts, quiet, src, order_id
+        return None, None, 0, None, None
     except Exception:
         if os.path.exists(tmp):
             os.remove(tmp)
-        return None, None, 0, None
+        return None, None, 0, None, None
 
 # <<< PATCH 1
 
@@ -326,6 +329,7 @@ csv_lock = asyncio.Lock()
 
 # >>> PATCH: cooldown antirrebote BLOQUE 2 y 9
 COOLDOWN_REAL_S = 12
+ORDEN_REAL_CONSUMIDA_ID = None
 # <<< PATCH
 
 # >>> PATCH BLOQUE 4 y 8
@@ -378,6 +382,7 @@ CSV_HEADER = [
     "puntaje_estrategia",
     "result_bin",            # 1 o 0 solo en filas cerradas
     "trade_status",          # "PRE_TRADE" o "CERRADO"
+    "modo_operacion",        # "REAL" o "DEMO"
     "epoch",
     "ts",
     "ia_prob_en_juego",
@@ -586,6 +591,7 @@ def write_pretrade_snapshot(
         "puntaje_estrategia": float(round(float(puntaje01), 6)),
         "result_bin": "",
         "trade_status": "PRE_TRADE",
+        "modo_operacion": "REAL" if str(kwargs.get("token", "")) == TOKEN_REAL else "DEMO",
         "epoch": int(epoch_val),
         "ts": ts_val,
         "ia_prob_en_juego": "",
@@ -636,6 +642,16 @@ def write_token_atomic(path: str, content: str):
             os.remove(tmp)
     except Exception:
         pass
+def limpiar_orden_real_local():
+    try:
+        p = os.path.join(ORDEN_DIR, f"{NOMBRE_BOT}.json")
+        if os.path.exists(p):
+            os.remove(p)
+            if _print_once("orden-local-clean", ttl=30):
+                print(Fore.YELLOW + "Orden REAL local limpiada al liberar token.")
+    except Exception:
+        pass
+
 def release_real_token_if_owned():
     """
     Libera el token REAL solo si el archivo todavía dice REAL:<este bot>.
@@ -652,6 +668,7 @@ def release_real_token_if_owned():
     if cur == expected:
         try:
             write_token_atomic(ARCHIVO_TOKEN, "REAL:none")
+            limpiar_orden_real_local()
             return True
         except Exception:
             return False
@@ -1254,16 +1271,24 @@ async def check_token_and_reconnect(ws, current_token):
                     primer_ingreso_real = True
                     real_activado_en_bot = time.time()  # BLOQUE 5 and 2: Set activation time
                     # Lee la orden del maestro y deja seteado el ciclo para la siguiente vuelta
-                    cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
-                    if RESET_CICLO_EN_ENTRADA_REAL:
+                    cyc, _, quiet, src, order_id = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
+                    if order_id and order_id == ORDEN_REAL_CONSUMIDA_ID:
+                        if _print_once(f"orden-repetida-{order_id}", ttl=30):
+                            print(Fore.YELLOW + f"Orden REAL repetida ignorada: {order_id}")
+                        cyc = None
+                        order_id = None
+                    if RESET_CICLO_EN_ENTRADA_REAL and not cyc:
                         estado_bot["ciclo_forzado"] = 1
-                        if cyc and int(cyc) > 1:
-                            print(Fore.YELLOW + f"Orden maestro C{cyc} ignorada por seguridad: en entrada REAL reinicio a C1.")
-                        else:
-                            print(Fore.YELLOW + "Entrada REAL detectada: reinicio de martingala a C1 por seguridad.")
+                        print(Fore.YELLOW + "Entrada REAL detectada: reinicio de martingala a C1 por seguridad.")
                     elif cyc:
-                        estado_bot["ciclo_forzado"] = cyc
-                        print(Fore.YELLOW + f"Orden maestro detectada: arrancaré en ciclo #{cyc}.")
+                        ciclo_prev = estado_bot.get("ciclo_forzado")
+                        ciclo_resuelto, ciclo_src, co, cf = resolver_ciclo_operativo(ciclo_orden=cyc, ciclo_forzado=ciclo_prev, modo_real=True, order_id=order_id)
+                        estado_bot["ciclo_forzado"] = ciclo_resuelto
+                        if ciclo_src == "orden_maestro" and order_id:
+                            globals()["ORDEN_REAL_CONSUMIDA_ID"] = order_id
+                        print(Fore.YELLOW + f"Orden maestro detectada: arrancaré en ciclo #{ciclo_resuelto}.")
+                        if _print_once(f"ciclo-resuelto-entry-{ciclo_resuelto}-{ciclo_src}", ttl=20):
+                            print(Fore.YELLOW + f"Ciclo resuelto REAL: orden=C{co or '-'} forzado=C{cf or '-'} final=C{ciclo_resuelto} src={ciclo_src}")
 
                     # Silenciar ruido guiado por maestro (BLOQUE 3)
                     if quiet or (str(src).upper() == "MANUAL"):
@@ -1275,11 +1300,22 @@ async def check_token_and_reconnect(ws, current_token):
                     if not (MODO_SILENCIOSO and estado_bot.get("modo_manual")) and not estado_bot.get("barra_activa", False):
                         if _print_once("rea-REAL", ttl=180):
                             print(Fore.YELLOW + "Reafirmación de REAL (sin reset de martingala)")
-                    cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
-                    if RESET_CICLO_EN_ENTRADA_REAL:
+                    cyc, _, quiet, src, order_id = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
+                    if order_id and order_id == ORDEN_REAL_CONSUMIDA_ID:
+                        if _print_once(f"orden-repetida-{order_id}", ttl=30):
+                            print(Fore.YELLOW + f"Orden REAL repetida ignorada: {order_id}")
+                        cyc = None
+                        order_id = None
+                    if RESET_CICLO_EN_ENTRADA_REAL and not cyc:
                         estado_bot["ciclo_forzado"] = 1
                     elif cyc:
-                        estado_bot["ciclo_forzado"] = cyc
+                        ciclo_prev = estado_bot.get("ciclo_forzado")
+                        ciclo_resuelto, ciclo_src, co, cf = resolver_ciclo_operativo(ciclo_orden=cyc, ciclo_forzado=ciclo_prev, modo_real=True, order_id=order_id)
+                        estado_bot["ciclo_forzado"] = ciclo_resuelto
+                        if ciclo_src == "orden_maestro" and order_id:
+                            globals()["ORDEN_REAL_CONSUMIDA_ID"] = order_id
+                        if _print_once(f"ciclo-resuelto-reaf-{ciclo_resuelto}-{ciclo_src}", ttl=20):
+                            print(Fore.YELLOW + f"Ciclo resuelto REAL: orden=C{co or '-'} forzado=C{cf or '-'} final=C{ciclo_resuelto} src={ciclo_src}")
 
                     if quiet or (str(src).upper() == "MANUAL"):
                         asyncio.create_task(_silencio_temporal(90, fuente=src))
@@ -1611,6 +1647,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                         "puntaje_estrategia": float(round(float(puntaje01), 6)),
                         "result_bin": 1 if resultado == "GANANCIA" else 0 if resultado == "PÉRDIDA" else "",
                         "trade_status": "CERRADO",
+                        "modo_operacion": "REAL" if token_antes == TOKEN_REAL else "DEMO",
                         "epoch": int(epoch_val),
                         "ts": ts_val,
                         "ia_prob_en_juego": ia_prob_en_juego,
@@ -1843,6 +1880,7 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
                 "puntaje_estrategia": float(round(float(puntaje01), 6)),
                 "result_bin": 1 if resultado == "GANANCIA" else 0 if resultado == "PÉRDIDA" else "",
                 "trade_status": "CERRADO",
+                "modo_operacion": "REAL" if token_usado == TOKEN_REAL else "DEMO",
                 "epoch": int(epoch_val),
                 "ts": ts_val,
             }
@@ -1948,6 +1986,27 @@ async def mostrar_saldos():
     _last_saldo_ts = time.time()
 
 
+def resolver_ciclo_operativo(ciclo_orden=None, ciclo_forzado=None, modo_real=False, order_id=None):
+    try:
+        co = int(ciclo_orden) if ciclo_orden else None
+    except Exception:
+        co = None
+    try:
+        cf = int(ciclo_forzado) if ciclo_forzado else None
+    except Exception:
+        cf = None
+
+    co = max(1, min(co, MAX_CICLOS)) if co else None
+    cf = max(1, min(cf, MAX_CICLOS)) if cf else None
+
+    if modo_real and cf and cf > 1 and (not co or co < cf):
+        return cf, "ciclo_forzado_protege_contra_orden_vieja", co, cf
+    if co:
+        return co, "orden_maestro", co, cf
+    if cf:
+        return cf, "ciclo_forzado", co, cf
+    return 1, "fallback_C1", co, cf
+
 # ==================== LOOP PRINCIPAL ====================
 async def ejecutar_panel():
     global ultimo_token
@@ -2045,9 +2104,17 @@ async def ejecutar_panel():
             martingala = MARTINGALA_REAL if modo_real else MARTINGALA_DEMO
 
             sep_ciclo()
-            ciclo_orden, _ts, _quiet, _src = leer_orden_real(NOMBRE_BOT)
+            ciclo_orden, _ts, _quiet, _src, order_id = leer_orden_real(NOMBRE_BOT)
             ciclo_forzado = estado_bot.get("ciclo_forzado")
-            ciclo = ciclo_orden or ciclo_forzado or 1
+            if order_id and order_id == ORDEN_REAL_CONSUMIDA_ID:
+                if _print_once(f"orden-repetida-main-{order_id}", ttl=30):
+                    print(Fore.YELLOW + f"Orden REAL repetida ignorada: {order_id}")
+                ciclo_orden = None
+                order_id = None
+            ciclo, ciclo_src, co, cf = resolver_ciclo_operativo(ciclo_orden=ciclo_orden, ciclo_forzado=ciclo_forzado, modo_real=modo_real, order_id=order_id)
+            if modo_real and ciclo_src == "orden_maestro" and order_id:
+                globals()["ORDEN_REAL_CONSUMIDA_ID"] = order_id
+            print(Fore.YELLOW + f"Ciclo resuelto REAL: orden=C{co or '-'} forzado=C{cf or '-'} final=C{ciclo} src={ciclo_src}" if modo_real else Fore.YELLOW + f"Ciclo resuelto: C{ciclo} ({ciclo_src})")
 
             estado_bot["ciclo_forzado"] = None
             estado_bot["reinicios_consecutivos"] = 0
