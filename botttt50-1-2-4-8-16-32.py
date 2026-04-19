@@ -1503,10 +1503,9 @@ async def buscar_estrategia(ws, ciclo, token):
         # Nueva lógica: si todos salieron inválidos y la racha de 1006 es alta, pide reconexión
         if len(activos_invalidos) == len(ACTIVOS) and _ws_fail_streak >= len(ACTIVOS):
             if _print_once("ws-reopen-needed", ttl=15):
-                print(Fore.YELLOW + Style.BRIGHT + "Múltiples 1006 detectados en barrido. Señalando reconexión limpia del WS...")
+                print(Fore.YELLOW + Style.BRIGHT + "Múltiples 1006 detectados en barrido. Reabriendo WS antes de seguir buscando estrategia...")
             ws_reset_needed.set()
-            # No seguimos martillando: pequeño respiro
-            await asyncio.sleep(1.0 + random.uniform(0.0, 0.5))  # Jitter
+            return "REINTENTAR", None, None, None, None, None, None, None, None, None
         await asyncio.sleep(15 + random.uniform(0.0, 0.5))  # Jitter para pausas
     print(Fore.RED + Style.BRIGHT + f"No se encontró activo válido tras 10 intentos para Martingala #{ciclo}. Reintentando MISMO ciclo...")
     try:
@@ -2216,8 +2215,13 @@ async def ejecutar_panel():
                 ws, current_token = await check_token_and_reconnect(ws, current_token)
 
                 if reinicio_forzado.is_set():
-                    estado_bot["ciclo_forzado"] = ciclo
-                    print(Fore.YELLOW + Style.BRIGHT + f"Reinicio forzado tras buscar estrategia. Mantengo ciclo #{ciclo}.")
+                    token_archivo_now = leer_token_desde_archivo()
+                    if current_token == TOKEN_REAL or token_archivo_now == TOKEN_REAL:
+                        estado_bot["ciclo_forzado"] = None
+                        print(Fore.YELLOW + "Pase a REAL detectado: no transfiero ciclo DEMO; obedeceré orden del maestro o fallback C1.")
+                    else:
+                        estado_bot["ciclo_forzado"] = ciclo
+                        print(Fore.YELLOW + Style.BRIGHT + f"Reinicio forzado en DEMO: mantengo ciclo #{ciclo}.")
                     reinicio_forzado.clear()
                     await asyncio.sleep(2)
                     indefinidos_consecutivos = 0
@@ -2225,8 +2229,13 @@ async def ejecutar_panel():
 
                 modo_real_now = (current_token == TOKEN_REAL)
                 if modo_real_now != modo_real:
-                    estado_bot["ciclo_forzado"] = ciclo
-                    print(Fore.YELLOW + Style.BRIGHT + "Token cambió justo antes de validar saldo/compra. Reinicio limpio para mantener sincronía con el maestro.")
+                    token_archivo_now = leer_token_desde_archivo()
+                    if current_token == TOKEN_REAL or token_archivo_now == TOKEN_REAL:
+                        estado_bot["ciclo_forzado"] = None
+                        print(Fore.YELLOW + "Pase a REAL detectado: no transfiero ciclo DEMO; obedeceré orden del maestro o fallback C1.")
+                    else:
+                        estado_bot["ciclo_forzado"] = ciclo
+                        print(Fore.YELLOW + Style.BRIGHT + f"Reinicio forzado en DEMO: mantengo ciclo #{ciclo}.")
                     reinicio_forzado.set()
                     break
 
