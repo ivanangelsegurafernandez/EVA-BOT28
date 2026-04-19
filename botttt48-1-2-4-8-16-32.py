@@ -1287,6 +1287,8 @@ async def check_token_and_reconnect(ws, current_token):
             reinicio_forzado.set()
             return ws, current_token  # dejar que esperar_resultado lo desprenda
         else:
+            estado_bot["token_origen_interrupcion"] = current_token
+            estado_bot["token_destino_interrupcion"] = token_desde_archivo
             print(Fore.YELLOW + Style.BRIGHT + f"Token cambió a {'REAL' if token_desde_archivo == TOKEN_REAL else 'DEMO'}. Reconectando...")
             try:
                 await ws.close()
@@ -1317,12 +1319,9 @@ async def check_token_and_reconnect(ws, current_token):
                         estado_bot["ciclo_forzado"] = 1
                         print(Fore.YELLOW + "Entrada REAL detectada: reinicio de martingala a C1 por seguridad.")
                     elif cyc:
-                        ciclo_prev = estado_bot.get("ciclo_forzado")
-                        ciclo_resuelto, ciclo_src, co, cf = resolver_ciclo_operativo(ciclo_orden=cyc, ciclo_forzado=ciclo_prev, modo_real=True, order_id=order_id)
-                        estado_bot["ciclo_forzado"] = ciclo_resuelto
-                        print(Fore.YELLOW + f"Orden maestro detectada: arrancaré en ciclo #{ciclo_resuelto}.")
-                        if _print_once(f"ciclo-resuelto-entry-{ciclo_resuelto}-{ciclo_src}", ttl=20):
-                            print(Fore.YELLOW + f"Ciclo resuelto REAL: orden=C{co or '-'} forzado=C{cf or '-'} final=C{ciclo_resuelto} src={ciclo_src}")
+                        estado_bot["ciclo_forzado"] = None
+                        estado_bot["orden_real_pendiente_ciclo"] = int(cyc)
+                        print(Fore.YELLOW + f"Orden maestro detectada: arrancaré en ciclo #{int(cyc)}.")
 
                     # Silenciar ruido guiado por maestro (BLOQUE 3)
                     if quiet or (str(src).upper() == "MANUAL"):
@@ -1343,11 +1342,8 @@ async def check_token_and_reconnect(ws, current_token):
                     if RESET_CICLO_EN_ENTRADA_REAL and not cyc:
                         estado_bot["ciclo_forzado"] = 1
                     elif cyc:
-                        ciclo_prev = estado_bot.get("ciclo_forzado")
-                        ciclo_resuelto, ciclo_src, co, cf = resolver_ciclo_operativo(ciclo_orden=cyc, ciclo_forzado=ciclo_prev, modo_real=True, order_id=order_id)
-                        estado_bot["ciclo_forzado"] = ciclo_resuelto
-                        if _print_once(f"ciclo-resuelto-reaf-{ciclo_resuelto}-{ciclo_src}", ttl=20):
-                            print(Fore.YELLOW + f"Ciclo resuelto REAL: orden=C{co or '-'} forzado=C{cf or '-'} final=C{ciclo_resuelto} src={ciclo_src}")
+                        estado_bot["ciclo_forzado"] = None
+                        estado_bot["orden_real_pendiente_ciclo"] = int(cyc)
 
                     if quiet or (str(src).upper() == "MANUAL"):
                         asyncio.create_task(_silencio_temporal(90, fuente=src))
@@ -2031,12 +2027,10 @@ def resolver_ciclo_operativo(ciclo_orden=None, ciclo_forzado=None, modo_real=Fal
     co = max(1, min(co, MAX_CICLOS)) if co else None
     cf = max(1, min(cf, MAX_CICLOS)) if cf else None
 
-    if modo_real and cf and cf > 1 and (not co or co < cf):
-        return cf, "ciclo_forzado_protege_contra_orden_vieja", co, cf
-    if co:
+    if modo_real and co:
         return co, "orden_maestro", co, cf
     if cf:
-        return cf, "ciclo_forzado", co, cf
+        return cf, "ciclo_forzado_sin_orden_maestro", co, cf
     return 1, "fallback_C1", co, cf
 
 # ==================== LOOP PRINCIPAL ====================
@@ -2138,9 +2132,8 @@ async def ejecutar_panel():
             sep_ciclo()
             ciclo_orden, _ts, _quiet, _src, order_id = leer_orden_real(NOMBRE_BOT)
             ciclo_forzado = estado_bot.get("ciclo_forzado")
-            if modo_real and reinicio_forzado.is_set() and ciclo_forzado:
-                ciclo_orden = None
-                order_id = None
+            if modo_real and not ciclo_orden:
+                ciclo_orden = estado_bot.get("orden_real_pendiente_ciclo")
             if order_id and order_id == ORDEN_REAL_CONSUMIDA_ID:
                 if _print_once(f"orden-repetida-main-{order_id}", ttl=30):
                     print(Fore.YELLOW + f"Orden REAL repetida ignorada: {order_id}")
@@ -2149,6 +2142,8 @@ async def ejecutar_panel():
             ciclo, ciclo_src, co, cf = resolver_ciclo_operativo(ciclo_orden=ciclo_orden, ciclo_forzado=ciclo_forzado, modo_real=modo_real, order_id=order_id)
             print(Fore.YELLOW + f"Ciclo resuelto REAL: orden=C{co or '-'} forzado=C{cf or '-'} final=C{ciclo} src={ciclo_src}" if modo_real else Fore.YELLOW + f"Ciclo resuelto: C{ciclo} ({ciclo_src})")
 
+            if modo_real:
+                estado_bot["orden_real_pendiente_ciclo"] = None
             estado_bot["ciclo_forzado"] = None
             estado_bot["reinicios_consecutivos"] = 0
             N = len(martingala)
@@ -2165,9 +2160,15 @@ async def ejecutar_panel():
                 if reinicio_forzado.is_set():
                     origen = estado_bot.pop("token_origen_interrupcion", None)
                     destino = estado_bot.pop("token_destino_interrupcion", None)
-                    if origen == TOKEN_DEMO and destino == TOKEN_REAL:
-                        estado_bot["ciclo_forzado"] = None
-                        print(Fore.YELLOW + "Pase DEMO→REAL detectado: descarto ciclo DEMO local y obedeceré orden del maestro.")
+                    token_archivo_now = leer_token_desde_archivo()
+                    if current_token == TOKEN_REAL or token_archivo_now == TOKEN_REAL or destino == TOKEN_REAL:
+                        ciclo_orden_now, _ts_now, _quiet_now, _src_now, order_id_now = leer_orden_real(NOMBRE_BOT)
+                        if ciclo_orden_now:
+                            estado_bot["ciclo_forzado"] = None
+                            print(Fore.YELLOW + "Pase a REAL con orden maestro: descarto ciclo DEMO local y obedeceré orden REAL.")
+                        else:
+                            estado_bot["ciclo_forzado"] = None
+                            print(Fore.YELLOW + "Pase a REAL sin orden fresca: descarto ciclo DEMO local; fallback será C1.")
                     else:
                         estado_bot["ciclo_forzado"] = ciclo
                         proximo = estado_bot.get("ciclo_forzado") or ciclo
