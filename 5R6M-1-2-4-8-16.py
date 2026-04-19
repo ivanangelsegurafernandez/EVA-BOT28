@@ -155,7 +155,7 @@ init(autoreset=True)
 
 # === BLOQUE 2 — CONFIGURACIÓN GLOBAL (MARTINGALA, HUD, AUDIO, IA) ===
 # === CONFIGURACIÓN DE MARTINGALA ===
-MARTI_ESCALADO = [1, 2, 4, 8]  # Escalado ajustado a 4 pasos
+MARTI_ESCALADO = [1, 2, 4, 8, 16]  # Escalado oficial de 5 ciclos
 MONTO_TOL = 0.01  # Tolerancia para redondeos
 SONAR_TAMBIEN_EN_DEMO = False  # Activar sonidos para victorias en DEMO
 SONAR_SOLO_EN_GATEWIN = True   # Solo sonar dentro de la ventana GateWIN
@@ -2318,9 +2318,23 @@ def _escribir_orden_real_raw(bot: str, ciclo: int):
     Escritura RAW de orden_real (sin activar_real_inmediato, sin recursión).
     """
     ciclo = max(1, min(int(ciclo), MAX_CICLOS))
-    payload = {"bot": bot, "ciclo": ciclo, "ts": time.time()}
+    ts_now = time.time()
+    order_id = f"{bot}|C{ciclo}|{int(ts_now * 1000)}"
+    payload = {
+        "bot": bot,
+        "ciclo": ciclo,
+        "ts": ts_now,
+        "ttl": 120,
+        "order_id": order_id,
+        "src": str(globals().get("_REAL_ROUTE_SOURCE", "LXV_5V1X") or "LXV_5V1X"),
+    }
     try:
         _atomic_write(path_orden(bot), json.dumps(payload, ensure_ascii=False))
+        try:
+            if isinstance(estado_bots, dict) and bot in estado_bots and isinstance(estado_bots.get(bot), dict):
+                estado_bots[bot]["last_real_order_id"] = order_id
+        except Exception:
+            pass
         agregar_evento(f"📝 Orden REAL escrita para {bot}: ciclo #{ciclo}")
     except Exception as e:
         try:
@@ -7243,7 +7257,7 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
     i_status = _col("trade_status", "status")
     i_monto = _col("monto", "stake", "buy_price", "amount")
     i_ciclo = _col("ciclo", "ciclo_martingala", "ciclo_actual", "marti_ciclo", "martingale_step")
-    i_token = _col("token", "account", "account_type", "cuenta", "modo", "mode")
+    i_token = _col("token", "account", "account_type", "cuenta", "modo", "mode", "modo_operacion", "token_operacion", "modo_cuenta", "cuenta_operacion")
     # payout_total puede venir explícito o calculable
     # (extraer_payout_total ya se encarga, pero igual ayudamos con nombres)
     i_payout_total = _col("payout_total")
@@ -7275,14 +7289,21 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
             if st not in ("CERRADO", "CLOSED"):
                 continue
 
-        # Si el CSV informa token/cuenta, en REAL ignoramos cierres explícitos de DEMO.
+        # Si el CSV informa token/cuenta/modo_operacion, en REAL ignora cierres DEMO.
         if require_real_token and (i_token is not None) and (i_token < len(row)):
             tok_raw = str(row[i_token] or "").strip().upper()
             if tok_raw:
-                # Heurística robusta: DEMO en Deriv suele venir como VRTC*
                 es_demo = ("DEMO" in tok_raw) or tok_raw.startswith("VRTC")
                 es_real = ("REAL" in tok_raw) or tok_raw.startswith("CR")
                 if es_demo and not es_real:
+                    continue
+            elif expected_ciclo is not None:
+                try:
+                    if i_ciclo is not None and i_ciclo < len(row):
+                        cyc_tmp = int(float(_safe_float_local(row[i_ciclo])))
+                        if int(cyc_tmp) != int(expected_ciclo):
+                            continue
+                except Exception:
                     continue
 
         # resultado
@@ -7699,7 +7720,10 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
         _marti_audit_record("cierre_ganancia", ciclo=ciclo_operado, bot=bot, detalle="reinicio_a_C1")
         marti_audit_run_id = int(marti_audit_run_id) + 1
         marti_audit_ultimo_ciclo_ordenado = None
-        agregar_evento(f"✅ Martingala reiniciada en C1 por GANANCIA ({marti_audit_resumen_linea()}).")
+        agregar_evento(
+            f"✅ Martingala REAL ganada en C{int(ciclo_operado) if ciclo_operado else 1}: "
+            f"reinicio automático a C1 ({marti_audit_resumen_linea()})."
+        )
     elif res == "PÉRDIDA":
         # Registrar el bot operado en la corrida activa para forzar rotación C2..C{MAX_CICLOS}.
         if bot in BOT_NAMES and bot not in bots_usados_en_esta_marti:
