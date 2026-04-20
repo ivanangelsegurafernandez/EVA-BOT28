@@ -1470,9 +1470,17 @@ def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> d
         if not fresh_ok:
             return None
 
+        ciclo_objetivo = ciclo_martingala_siguiente()
+        rot_ok, rot_motivo, rot_info = validar_rotacion_bot_marti(out.get("bot_objetivo"), ciclo_objetivo)
+        if not rot_ok:
+            return None
+
         out["fresh_ok"] = True
         out["fresh_motivo"] = fresh_motivo
         out["fresh_info"] = fresh_info
+        out["rotacion_ok"] = True
+        out["rotacion_motivo"] = rot_motivo
+        out["rotacion_info"] = rot_info
         return out
 
     return None
@@ -7353,6 +7361,8 @@ _LXV_LASTCOL_DIAG_TS = 0.0
 _LXV_LASTCOL_DIAG_MSG = ""
 _LXV_FRESH_LAST_MSG = ""
 _LXV_FRESH_LAST_TS = 0.0
+_LXV_ROT_LAST_MSG = ""
+_LXV_ROT_LAST_TS = 0.0
 
 
 def _leer_probs_historicas_ia(max_rows: int = AUTO_REAL_LOG_MAX_ROWS) -> list[float]:
@@ -7931,6 +7941,99 @@ def marti_audit_resumen_linea() -> str:
         return "Audit run#? desvíos=? último=--"
 
 
+def _normalizar_lista_bots_usados_marti():
+    global bots_usados_en_esta_marti
+    try:
+        if not isinstance(bots_usados_en_esta_marti, list):
+            bots_usados_en_esta_marti = []
+        bots_usados_en_esta_marti = [
+            str(b).strip()
+            for b in bots_usados_en_esta_marti
+            if str(b).strip() in BOT_NAMES
+        ]
+    except Exception:
+        bots_usados_en_esta_marti = []
+    return bots_usados_en_esta_marti
+
+
+def _bot_usado_en_marti_actual(bot: str) -> bool:
+    try:
+        b = str(bot or "").strip()
+        usados = _normalizar_lista_bots_usados_marti()
+        return b in usados
+    except Exception:
+        return False
+
+
+def _registrar_bot_usado_marti(bot: str) -> None:
+    global bots_usados_en_esta_marti
+    try:
+        b = str(bot or "").strip()
+        if b not in BOT_NAMES:
+            return
+        usados = _normalizar_lista_bots_usados_marti()
+        if b not in usados:
+            usados.append(b)
+        bots_usados_en_esta_marti = usados
+    except Exception:
+        pass
+
+
+def _reset_rotacion_marti(motivo: str = "") -> None:
+    global bots_usados_en_esta_marti
+    try:
+        bots_usados_en_esta_marti = []
+        if motivo:
+            agregar_evento(f"♻️ Rotación Martingala reiniciada: {motivo}")
+    except Exception:
+        bots_usados_en_esta_marti = []
+
+
+def validar_rotacion_bot_marti(bot: str, ciclo_objetivo: int | None = None) -> tuple[bool, str, dict]:
+    """
+    Evita repetir el mismo bot dentro de una misma Martingala C1..C5.
+    C1 siempre puede iniciar si no hay Martingala activa.
+    C2..C5 deben usar bots distintos.
+    """
+    try:
+        b = str(bot or "").strip()
+        if b not in BOT_NAMES:
+            return False, "bot_invalido", {"bot": b}
+
+        usados = _normalizar_lista_bots_usados_marti()
+
+        try:
+            ciclo = int(ciclo_objetivo) if ciclo_objetivo is not None else int(ciclo_martingala_siguiente())
+        except Exception:
+            ciclo = 1
+
+        try:
+            perdidas = int(marti_ciclos_perdidos)
+        except Exception:
+            perdidas = 0
+
+        if ciclo <= 1 or perdidas <= 0:
+            if usados:
+                _reset_rotacion_marti("nuevo_C1")
+            return True, "rotacion_ok_c1", {"bot": b, "ciclo": ciclo, "usados": list(bots_usados_en_esta_marti)}
+
+        if b in usados:
+            return False, "bot_repetido_en_marti", {
+                "bot": b,
+                "ciclo": ciclo,
+                "usados": list(usados),
+            }
+
+        return True, "rotacion_ok", {
+            "bot": b,
+            "ciclo": ciclo,
+            "usados": list(usados),
+        }
+
+    except Exception as e:
+        return False, "rotacion_exception", {"error": repr(e)[:180]}
+
+
 def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_operado: int | None = None):
     """
     Actualiza el contador global de ciclos martingala para el HUD y la próxima
@@ -7950,7 +8053,7 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
     if res == "GANANCIA":
         marti_ciclos_perdidos = 0
         marti_paso = 0
-        bots_usados_en_esta_marti = []
+        _reset_rotacion_marti("ganancia_real")
         _marti_audit_record("cierre_ganancia", ciclo=ciclo_operado, bot=bot, detalle="reinicio_a_C1")
         marti_audit_run_id = int(marti_audit_run_id) + 1
         marti_audit_ultimo_ciclo_ordenado = None
@@ -7960,8 +8063,8 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
         )
     elif res == "PÉRDIDA":
         # Registrar el bot operado en la corrida activa para forzar rotación C2..C{MAX_CICLOS}.
-        if bot in BOT_NAMES and bot not in bots_usados_en_esta_marti:
-            bots_usados_en_esta_marti.append(bot)
+        if bot in BOT_NAMES:
+            _registrar_bot_usado_marti(bot)
 
         # Robustez anti-desincronización:
         # si conocemos el ciclo realmente operado, el próximo estado de pérdidas
@@ -7978,7 +8081,7 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
         if int(marti_ciclos_perdidos) >= int(MAX_CICLOS):
             marti_ciclos_perdidos = 0
             marti_paso = 0
-            bots_usados_en_esta_marti = []
+            _reset_rotacion_marti("tope_marti")
             _marti_audit_record("cierre_tope", ciclo=ciclo_operado, bot=bot, detalle=f"tope=C{int(MAX_CICLOS)}")
             marti_audit_run_id = int(marti_audit_run_id) + 1
             marti_audit_ultimo_ciclo_ordenado = None
@@ -12303,6 +12406,11 @@ def forzar_real_manual(bot: str, ciclo: int):
         if not escribir_orden_real(bot, ciclo):
             agregar_evento(f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL.")
             return
+        _registrar_bot_usado_marti(bot)
+        try:
+            agregar_evento(f"🔁 Bot registrado en rotación Martingala: {bot} | usados={','.join(_normalizar_lista_bots_usados_marti())}")
+        except Exception:
+            pass
 
         estado_bots[bot]["reintentar_ciclo"] = True
         estado_bots[bot]["ciclo_actual"] = ciclo
@@ -14493,22 +14601,43 @@ async def main():
                                         globals()["_LXV_FRESH_LAST_MSG"] = msg_fresh
                                         globals()["_LXV_FRESH_LAST_TS"] = float(now_fresh)
                                 else:
-                                    candidatos = [(1.0, bot_lxv, 0.0, 0.0, 0.0, 0, 0.0, 0.0)]
-                                    edad_ok = float((fresh_info or {}).get("edad_x", 0.0) or 0.0)
-                                    max_ok = float((fresh_info or {}).get("max_age", LXV_FRESH_X_MAX_AGE_S) or LXV_FRESH_X_MAX_AGE_S)
-                                    col_ok = (fresh_info or {}).get("col_visible", lxv_decision.get("col_visible", "--"))
-                                    fresh_mode = "time_only_40pct"
-                                    try:
-                                        if isinstance(fresh_info, dict):
-                                            fresh_mode = str(fresh_info.get("fresh_mode", "time_only_40pct"))
-                                    except Exception:
-                                        pass
-                                    agregar_evento(
-                                        f"🧭 LXV LASTCOL {lxv_decision.get('pattern','--')} → {bot_lxv} "
-                                        f"(col_visible={lxv_decision.get('col_visible','--')}, xs={lxv_decision.get('xs_consideradas',[])}, "
-                                        f"xg={lxv_decision.get('x_ganadora','--')}, fresh=OK edad={edad_ok:.2f}s max={max_ok:.2f}s mode={fresh_mode})"
-                                    )
-                                    agregar_evento(f"🧭 LXV FRESH_X OK → {bot_lxv} edad={edad_ok:.2f}s max={max_ok:.2f}s mode={fresh_mode} col={col_ok}")
+                                    ciclo_objetivo_lxv = ciclo_martingala_siguiente()
+                                    rot_ok, rot_motivo, rot_info = validar_rotacion_bot_marti(bot_lxv, ciclo_objetivo_lxv)
+                                    if not rot_ok:
+                                        candidatos = []
+                                        now_rot = time.time()
+                                        usados_rot = []
+                                        try:
+                                            if isinstance(rot_info, dict):
+                                                usados_rot = list(rot_info.get("usados", []) or [])
+                                        except Exception:
+                                            usados_rot = []
+                                        usados_txt = ",".join([str(u).strip() for u in usados_rot if str(u).strip()]) or "-"
+                                        msg_rot = (
+                                            f"🔁 LXV 5V1X descartado por rotación: {bot_lxv} ya usado en esta Martingala "
+                                            f"| ciclo=C{int(ciclo_objetivo_lxv)} | usados={usados_txt}"
+                                        )
+                                        if (msg_rot != _LXV_ROT_LAST_MSG) or ((now_rot - float(_LXV_ROT_LAST_TS or 0.0)) >= float(LXV_FRESH_EVENT_COOLDOWN_S)):
+                                            agregar_evento(msg_rot)
+                                            globals()["_LXV_ROT_LAST_MSG"] = msg_rot
+                                            globals()["_LXV_ROT_LAST_TS"] = float(now_rot)
+                                    else:
+                                        candidatos = [(1.0, bot_lxv, 0.0, 0.0, 0.0, 0, 0.0, 0.0)]
+                                        edad_ok = float((fresh_info or {}).get("edad_x", 0.0) or 0.0)
+                                        max_ok = float((fresh_info or {}).get("max_age", LXV_FRESH_X_MAX_AGE_S) or LXV_FRESH_X_MAX_AGE_S)
+                                        col_ok = (fresh_info or {}).get("col_visible", lxv_decision.get("col_visible", "--"))
+                                        fresh_mode = "time_only_40pct"
+                                        try:
+                                            if isinstance(fresh_info, dict):
+                                                fresh_mode = str(fresh_info.get("fresh_mode", "time_only_40pct"))
+                                        except Exception:
+                                            pass
+                                        agregar_evento(
+                                            f"🧭 LXV LASTCOL {lxv_decision.get('pattern','--')} → {bot_lxv} "
+                                            f"(col_visible={lxv_decision.get('col_visible','--')}, xs={lxv_decision.get('xs_consideradas',[])}, "
+                                            f"xg={lxv_decision.get('x_ganadora','--')}, fresh=OK edad={edad_ok:.2f}s max={max_ok:.2f}s mode={fresh_mode})"
+                                        )
+                                        agregar_evento(f"🧭 LXV FRESH_X OK → {bot_lxv} edad={edad_ok:.2f}s max={max_ok:.2f}s mode={fresh_mode} col={col_ok}")
                         else:
                             try:
                                 now_lxv = time.time()
@@ -14609,6 +14738,13 @@ async def main():
 
                                     ok_real = escribir_orden_real(mejor_bot, ciclo_auto)
                                     if ok_real:
+                                        _registrar_bot_usado_marti(mejor_bot)
+                                        try:
+                                            agregar_evento(
+                                                f"🔁 Bot registrado en rotación Martingala: {mejor_bot} | usados={','.join(_normalizar_lista_bots_usados_marti())}"
+                                            )
+                                        except Exception:
+                                            pass
                                         estado_bots[mejor_bot]["fuente"] = "IA_AUTO"
                                         estado_bots[mejor_bot]["ciclo_actual"] = ciclo_auto
                                         activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else mejor_bot
