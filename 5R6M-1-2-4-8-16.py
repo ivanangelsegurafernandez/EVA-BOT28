@@ -1425,24 +1425,11 @@ def validar_frescura_x_lxv(lxv_decision, columnas):
 
 
 def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> dict | None:
-    """Ruta única de selección REAL: solo LXV desde columna visible HUD + LXV_FRESH_X."""
+    """Ruta única de selección REAL: solo LXV desde columna visible HUD."""
     cols = construir_columnas_lxv(estado)
     out = detectar_lxv(cols, estado, contexto=contexto)
-
-    if (
-        isinstance(out, dict)
-        and str(out.get("bot_objetivo")) in BOT_NAMES
-        and str(out.get("pattern")) == "5V1X"
-    ):
-        fresh_ok, fresh_motivo, fresh_info = validar_frescura_x_lxv(out, cols)
-        if not fresh_ok:
-            return None
-
-        out["fresh_ok"] = True
-        out["fresh_motivo"] = fresh_motivo
-        out["fresh_info"] = fresh_info
+    if isinstance(out, dict) and str(out.get("bot_objetivo")) in BOT_NAMES and str(out.get("pattern")) == "5V1X":
         return out
-
     return None
 
 salir = False
