@@ -1086,7 +1086,7 @@ LXV_PRIORIDAD_HISTORICA = {bot: int(len(BOT_NAMES) - i) for i, bot in enumerate(
 LXV_RUNTIME_PATTERN = "5V1X"  # patrón único válido para promoción REAL automática
 LXV_FRESH_X_ENABLE = True
 LXV_INTERVAL_S = 60.0
-LXV_FRESH_X_RATIO = 0.20
+LXV_FRESH_X_RATIO = 0.40
 LXV_FRESH_X_MAX_AGE_S = LXV_INTERVAL_S * LXV_FRESH_X_RATIO
 LXV_FRESH_EVENT_COOLDOWN_S = 8.0
 
@@ -1350,78 +1350,114 @@ def _leer_estado_eventos_lxv(bot):
 
 
 def validar_frescura_x_lxv(lxv_decision, columnas):
-    if not LXV_FRESH_X_ENABLE:
-        return True, "fresh_disabled", {}
-    if not isinstance(lxv_decision, dict):
-        return False, "decision_invalida", {}
-    if str(lxv_decision.get("pattern")) != "5V1X":
-        return False, "decision_invalida", {}
-    bot_x = str(lxv_decision.get("bot_objetivo", "") or "").strip()
-    if bot_x not in BOT_NAMES:
-        return False, "decision_invalida", {}
-
+    """
+    Filtro oficial LXV_FRESH_X:
+    La señal 5V1X solo depende de la última columna visible y de la edad temporal de la X.
+    No valida columna anterior.
+    No exige transición V->X.
+    """
     try:
-        col_visible = int(lxv_decision.get("col_visible"))
-    except Exception:
-        return False, "columnas_insuficientes", {}
+        if not bool(LXV_FRESH_X_ENABLE):
+            return True, "fresh_disabled", {}
 
-    col_actual = None
-    col_previa = None
-    for col in list(columnas or []):
+        if not isinstance(lxv_decision, dict):
+            return False, "decision_invalida", {}
+
+        if str(lxv_decision.get("pattern", "")) != "5V1X":
+            return False, "pattern_invalido", {}
+
+        bot_x = str(lxv_decision.get("bot_objetivo", "") or "").strip()
+        if bot_x not in BOT_NAMES:
+            return False, "bot_objetivo_invalido", {"bot_x": bot_x}
+
+        cols = list(columnas or [])
+        if not cols:
+            return False, "sin_columnas", {}
+
+        col_visible_dec = lxv_decision.get("col_visible", None)
+        col_actual = None
+
+        if col_visible_dec is not None:
+            try:
+                col_visible_int = int(col_visible_dec)
+                for c in cols:
+                    if int((c or {}).get("col_visible", -9999)) == col_visible_int:
+                        col_actual = c
+                        break
+            except Exception:
+                col_actual = None
+
+        if col_actual is None:
+            col_actual = max(cols, key=lambda c: int((c or {}).get("col_visible", -1)))
+
+        marcas_actuales = col_actual.get("marcas", {}) if isinstance(col_actual, dict) else {}
+        if not isinstance(marcas_actuales, dict):
+            return False, "lastcol_invalida", {}
+
+        col_visible = int(col_actual.get("col_visible", lxv_decision.get("col_visible", -1)) or -1)
+
+        # La última columna debe estar completa y debe ser exactamente 5V1X.
+        if not all(marcas_actuales.get(b) in ("V", "X") for b in BOT_NAMES):
+            return False, "lastcol_incompleta", {"col_visible": col_visible}
+
+        verdes = [b for b in BOT_NAMES if marcas_actuales.get(b) == "V"]
+        xs = [b for b in BOT_NAMES if marcas_actuales.get(b) == "X"]
+
+        if len(verdes) != 5 or len(xs) != 1:
+            return False, "pattern_ya_no_valido", {
+                "verdes": len(verdes),
+                "xs": len(xs),
+                "col_visible": col_visible,
+            }
+
+        if xs[0] != bot_x or marcas_actuales.get(bot_x) != "X":
+            return False, "bot_x_no_es_x_actual", {
+                "bot_x": bot_x,
+                "xs": xs,
+                "marca": marcas_actuales.get(bot_x),
+            }
+
+        # NO validar columna anterior.
+        # NO usar marca previa de la X.
+        # NO exigir que la X venga de una V.
+        # La única frescura válida es edad temporal de la X.
+
+        estado_x = _leer_estado_eventos_lxv(bot_x)
+        if not isinstance(estado_x, dict) or not estado_x.get("ok", False):
+            return False, "csv_no_disponible_x", estado_x if isinstance(estado_x, dict) else {}
+
+        last_closed_ts = estado_x.get("last_closed_ts")
+        if last_closed_ts is None:
+            return False, "x_ts_invalido", estado_x
+
         try:
-            cidx = int((col or {}).get("col_visible", -999))
-            if cidx == col_visible:
-                col_actual = col
-            elif cidx == (col_visible - 1):
-                col_previa = col
+            edad_x = time.time() - float(last_closed_ts)
         except Exception:
-            continue
-    if not isinstance(col_actual, dict) or not isinstance(col_previa, dict):
-        return False, "columnas_insuficientes", {}
+            return False, "x_ts_invalido", estado_x
 
-    marcas_actuales = col_actual.get("marcas", {}) if isinstance(col_actual.get("marcas", {}), dict) else {}
-    marcas_previas = col_previa.get("marcas", {}) if isinstance(col_previa.get("marcas", {}), dict) else {}
-    verdes = [b for b in BOT_NAMES if marcas_actuales.get(b) == "V"]
-    xs = [b for b in BOT_NAMES if marcas_actuales.get(b) == "X"]
-    if len(verdes) != 5 or len(xs) != 1:
-        return False, "pattern_ya_no_valido", {}
-    if marcas_actuales.get(bot_x) != "X":
-        return False, "bot_x_no_es_x_actual", {}
+        if edad_x < 0:
+            return False, "x_ts_futuro", {"edad_x": edad_x, "bot_x": bot_x}
 
-    marca_previa_x = marcas_previas.get(bot_x)
-    if marca_previa_x != "V":
-        return False, "x_no_nueva_columna_anterior", {"prev": marca_previa_x}
+        max_age = float(LXV_FRESH_X_MAX_AGE_S)
 
-    estado_x = _leer_estado_eventos_lxv(bot_x)
-    if not estado_x.get("ok", False):
-        return False, "csv_no_disponible_x", estado_x
+        if edad_x > max_age:
+            return False, "x_antigua", {
+                "bot_x": bot_x,
+                "edad_x": edad_x,
+                "max_age": max_age,
+                "col_visible": col_visible,
+            }
 
-    last_pretrade_idx = estado_x.get("last_pretrade_idx")
-    last_closed_idx = estado_x.get("last_closed_idx")
-    if last_pretrade_idx is not None and last_closed_idx is not None and int(last_pretrade_idx) > int(last_closed_idx):
-        return False, "x_ya_en_nuevo_pretrade", estado_x
+        return True, "x_fresca_ok", {
+            "bot_x": bot_x,
+            "edad_x": edad_x,
+            "max_age": max_age,
+            "col_visible": col_visible,
+            "fresh_mode": "time_only_40pct",
+        }
 
-    edad_x = time.time() - float(estado_x.get("last_closed_ts"))
-    if edad_x < 0:
-        return False, "x_ts_futuro", {"edad_x": edad_x}
-    if edad_x > float(LXV_FRESH_X_MAX_AGE_S):
-        return False, "x_antigua", {"edad_x": edad_x, "max": LXV_FRESH_X_MAX_AGE_S}
-
-    for bot_v in verdes:
-        estado_v = _leer_estado_eventos_lxv(bot_v)
-        if not estado_v.get("ok", False):
-            return False, f"csv_no_disponible_verde:{bot_v}", estado_v
-        pv = estado_v.get("last_pretrade_idx")
-        cv = estado_v.get("last_closed_idx")
-        if pv is not None and cv is not None and int(pv) > int(cv):
-            return False, f"verde_en_transicion:{bot_v}", estado_v
-
-    return True, "x_fresca_ok", {
-        "bot_x": bot_x,
-        "edad_x": edad_x,
-        "col_visible": col_visible,
-        "max_age": LXV_FRESH_X_MAX_AGE_S,
-    }
+    except Exception as e:
+        return False, "fresh_exception", {"error": repr(e)[:180]}
 
 
 def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> dict | None:
@@ -14442,7 +14478,16 @@ async def main():
                                 fresh_ok, fresh_motivo, fresh_info = validar_frescura_x_lxv(lxv_decision, lxv_columnas)
                                 if not fresh_ok:
                                     now_fresh = time.time()
-                                    msg_fresh = f"🧭 LXV 5V1X descartado: {fresh_motivo}"
+                                    edad_txt = ""
+                                    try:
+                                        if isinstance(fresh_info, dict):
+                                            if "edad_x" in fresh_info:
+                                                edad_txt += f" edad={float(fresh_info.get('edad_x')):.1f}s"
+                                            if "max_age" in fresh_info:
+                                                edad_txt += f" max={float(fresh_info.get('max_age')):.1f}s"
+                                    except Exception:
+                                        edad_txt = ""
+                                    msg_fresh = f"🧭 LXV 5V1X descartado: {fresh_motivo}{edad_txt}"
                                     if (msg_fresh != _LXV_FRESH_LAST_MSG) or ((now_fresh - float(_LXV_FRESH_LAST_TS or 0.0)) >= float(LXV_FRESH_EVENT_COOLDOWN_S)):
                                         agregar_evento(msg_fresh)
                                         globals()["_LXV_FRESH_LAST_MSG"] = msg_fresh
@@ -14450,13 +14495,20 @@ async def main():
                                 else:
                                     candidatos = [(1.0, bot_lxv, 0.0, 0.0, 0.0, 0, 0.0, 0.0)]
                                     edad_ok = float((fresh_info or {}).get("edad_x", 0.0) or 0.0)
+                                    max_ok = float((fresh_info or {}).get("max_age", LXV_FRESH_X_MAX_AGE_S) or LXV_FRESH_X_MAX_AGE_S)
                                     col_ok = (fresh_info or {}).get("col_visible", lxv_decision.get("col_visible", "--"))
+                                    fresh_mode = "time_only_40pct"
+                                    try:
+                                        if isinstance(fresh_info, dict):
+                                            fresh_mode = str(fresh_info.get("fresh_mode", "time_only_40pct"))
+                                    except Exception:
+                                        pass
                                     agregar_evento(
                                         f"🧭 LXV LASTCOL {lxv_decision.get('pattern','--')} → {bot_lxv} "
                                         f"(col_visible={lxv_decision.get('col_visible','--')}, xs={lxv_decision.get('xs_consideradas',[])}, "
-                                        f"xg={lxv_decision.get('x_ganadora','--')}, fresh=OK edad={edad_ok:.2f}s)"
+                                        f"xg={lxv_decision.get('x_ganadora','--')}, fresh=OK edad={edad_ok:.2f}s max={max_ok:.2f}s mode={fresh_mode})"
                                     )
-                                    agregar_evento(f"🧭 LXV FRESH_X OK → {bot_lxv} edad={edad_ok:.2f}s col={col_ok}")
+                                    agregar_evento(f"🧭 LXV FRESH_X OK → {bot_lxv} edad={edad_ok:.2f}s max={max_ok:.2f}s mode={fresh_mode} col={col_ok}")
                         else:
                             try:
                                 now_lxv = time.time()
