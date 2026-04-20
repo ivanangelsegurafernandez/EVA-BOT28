@@ -1084,6 +1084,11 @@ reinicio_forzado = asyncio.Event()
 # Mayor valor = mayor prioridad histórica (legado de compatibilidad).
 LXV_PRIORIDAD_HISTORICA = {bot: int(len(BOT_NAMES) - i) for i, bot in enumerate(BOT_NAMES)}
 LXV_RUNTIME_PATTERN = "5V1X"  # patrón único válido para promoción REAL automática
+LXV_FRESH_X_ENABLE = True
+LXV_INTERVAL_S = 60.0
+LXV_FRESH_X_RATIO = 0.20
+LXV_FRESH_X_MAX_AGE_S = LXV_INTERVAL_S * LXV_FRESH_X_RATIO
+LXV_FRESH_EVENT_COOLDOWN_S = 8.0
 
 
 def _marca_lxv_desde_resultado(resultado) -> str | None:
@@ -1235,6 +1240,188 @@ def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = Non
         }
     except Exception:
         return None
+
+
+def _parse_ts_lxv(value):
+    try:
+        if value is None:
+            return None
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            v = float(value)
+            return v if np.isfinite(v) else None
+        txt = str(value).strip()
+        if not txt:
+            return None
+        txt_num = txt.replace(",", ".")
+        if re.fullmatch(r"[-+]?\d+(\.\d+)?", txt_num):
+            v = float(txt_num)
+            return v if np.isfinite(v) else None
+        iso = txt.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        return float(dt.timestamp())
+    except Exception:
+        try:
+            dt = pd.to_datetime(value, utc=True, errors="coerce")
+            if pd.isna(dt):
+                return None
+            return float(dt.timestamp())
+        except Exception:
+            return None
+
+
+def _leer_estado_eventos_lxv(bot):
+    out = {
+        "ok": False,
+        "bot": bot,
+        "last_closed_idx": None,
+        "last_closed_result": None,
+        "last_closed_ts": None,
+        "last_pretrade_idx": None,
+        "last_pretrade_ts": None,
+        "error": "",
+    }
+    path = os.path.join(script_dir, f"registro_enriquecido_{bot}.csv")
+    if not os.path.exists(path):
+        out["error"] = f"csv_no_disponible:{bot}"
+        return out
+
+    df = None
+    for enc in ("utf-8", "latin-1", "windows-1252"):
+        try:
+            df = pd.read_csv(path, engine="python", on_bad_lines="skip", encoding=enc)
+            break
+        except Exception:
+            df = None
+    if df is None or df.empty:
+        out["error"] = f"csv_no_disponible:{bot}"
+        return out
+
+    col_map = {str(c).strip().lower(): c for c in df.columns}
+    col_status = col_map.get("trade_status")
+    col_resultado = col_map.get("resultado")
+    col_ts = col_map.get("ts")
+    if not col_status or not col_resultado or not col_ts:
+        out["error"] = f"csv_no_disponible:{bot}"
+        return out
+
+    norm_status = globals().get("normalizar_trade_status")
+    norm_resultado = globals().get("normalizar_resultado")
+
+    last_closed_idx = None
+    last_closed_result = None
+    last_closed_ts = None
+    last_pretrade_idx = None
+    last_pretrade_ts = None
+
+    for idx, row in df.iterrows():
+        try:
+            status_raw = row.get(col_status, "")
+            status = norm_status(status_raw) if callable(norm_status) else str(status_raw or "").strip().upper()
+            resultado_raw = row.get(col_resultado, "")
+            resultado = norm_resultado(resultado_raw) if callable(norm_resultado) else str(resultado_raw or "").strip().upper()
+            ts_epoch = _parse_ts_lxv(row.get(col_ts, None))
+
+            if status == "PRE_TRADE":
+                last_pretrade_idx = int(idx)
+                last_pretrade_ts = ts_epoch
+
+            if status == "CERRADO" and resultado in ("GANANCIA", "PÉRDIDA"):
+                last_closed_idx = int(idx)
+                last_closed_result = resultado
+                last_closed_ts = ts_epoch
+        except Exception:
+            continue
+
+    out["last_closed_idx"] = last_closed_idx
+    out["last_closed_result"] = last_closed_result
+    out["last_closed_ts"] = last_closed_ts
+    out["last_pretrade_idx"] = last_pretrade_idx
+    out["last_pretrade_ts"] = last_pretrade_ts
+
+    if last_closed_idx is None:
+        out["error"] = "cerrado_no_disponible"
+        return out
+    if last_closed_ts is None:
+        out["error"] = "x_ts_invalido"
+        return out
+
+    out["ok"] = True
+    return out
+
+
+def validar_frescura_x_lxv(lxv_decision, columnas):
+    if not LXV_FRESH_X_ENABLE:
+        return True, "fresh_disabled", {}
+    if not isinstance(lxv_decision, dict):
+        return False, "decision_invalida", {}
+    if str(lxv_decision.get("pattern")) != "5V1X":
+        return False, "decision_invalida", {}
+    bot_x = str(lxv_decision.get("bot_objetivo", "") or "").strip()
+    if bot_x not in BOT_NAMES:
+        return False, "decision_invalida", {}
+
+    try:
+        col_visible = int(lxv_decision.get("col_visible"))
+    except Exception:
+        return False, "columnas_insuficientes", {}
+
+    col_actual = None
+    col_previa = None
+    for col in list(columnas or []):
+        try:
+            cidx = int((col or {}).get("col_visible", -999))
+            if cidx == col_visible:
+                col_actual = col
+            elif cidx == (col_visible - 1):
+                col_previa = col
+        except Exception:
+            continue
+    if not isinstance(col_actual, dict) or not isinstance(col_previa, dict):
+        return False, "columnas_insuficientes", {}
+
+    marcas_actuales = col_actual.get("marcas", {}) if isinstance(col_actual.get("marcas", {}), dict) else {}
+    marcas_previas = col_previa.get("marcas", {}) if isinstance(col_previa.get("marcas", {}), dict) else {}
+    verdes = [b for b in BOT_NAMES if marcas_actuales.get(b) == "V"]
+    xs = [b for b in BOT_NAMES if marcas_actuales.get(b) == "X"]
+    if len(verdes) != 5 or len(xs) != 1:
+        return False, "pattern_ya_no_valido", {}
+    if marcas_actuales.get(bot_x) != "X":
+        return False, "bot_x_no_es_x_actual", {}
+
+    marca_previa_x = marcas_previas.get(bot_x)
+    if marca_previa_x != "V":
+        return False, "x_no_nueva_columna_anterior", {"prev": marca_previa_x}
+
+    estado_x = _leer_estado_eventos_lxv(bot_x)
+    if not estado_x.get("ok", False):
+        return False, "csv_no_disponible_x", estado_x
+
+    last_pretrade_idx = estado_x.get("last_pretrade_idx")
+    last_closed_idx = estado_x.get("last_closed_idx")
+    if last_pretrade_idx is not None and last_closed_idx is not None and int(last_pretrade_idx) > int(last_closed_idx):
+        return False, "x_ya_en_nuevo_pretrade", estado_x
+
+    edad_x = time.time() - float(estado_x.get("last_closed_ts"))
+    if edad_x < 0:
+        return False, "x_ts_futuro", {"edad_x": edad_x}
+    if edad_x > float(LXV_FRESH_X_MAX_AGE_S):
+        return False, "x_antigua", {"edad_x": edad_x, "max": LXV_FRESH_X_MAX_AGE_S}
+
+    for bot_v in verdes:
+        estado_v = _leer_estado_eventos_lxv(bot_v)
+        if not estado_v.get("ok", False):
+            return False, f"csv_no_disponible_verde:{bot_v}", estado_v
+        pv = estado_v.get("last_pretrade_idx")
+        cv = estado_v.get("last_closed_idx")
+        if pv is not None and cv is not None and int(pv) > int(cv):
+            return False, f"verde_en_transicion:{bot_v}", estado_v
+
+    return True, "x_fresca_ok", {
+        "bot_x": bot_x,
+        "edad_x": edad_x,
+        "col_visible": col_visible,
+        "max_age": LXV_FRESH_X_MAX_AGE_S,
+    }
 
 
 def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> dict | None:
@@ -7119,6 +7306,8 @@ def ia_prob_valida(bot: str, max_age_s: float = 10.0) -> bool:
 _AUTO_REAL_CACHE = {"ts": 0.0, "thr": float(IA_ACTIVACION_REAL_THR), "n": 0, "max": 0.0}
 _LXV_LASTCOL_DIAG_TS = 0.0
 _LXV_LASTCOL_DIAG_MSG = ""
+_LXV_FRESH_LAST_MSG = ""
+_LXV_FRESH_LAST_TS = 0.0
 
 
 def _leer_probs_historicas_ia(max_rows: int = AUTO_REAL_LOG_MAX_ROWS) -> list[float]:
@@ -14241,11 +14430,24 @@ async def main():
                         if isinstance(lxv_decision, dict):
                             bot_lxv = str(lxv_decision.get("bot_objetivo", "") or "").strip()
                             if bot_lxv in BOT_NAMES:
-                                candidatos = [(1.0, bot_lxv, 0.0, 0.0, 0.0, 0, 0.0, 0.0)]
-                                agregar_evento(
-                                    f"🧭 LXV LASTCOL {lxv_decision.get('pattern','--')} → {bot_lxv} "
-                                    f"(col_visible={lxv_decision.get('col_visible','--')}, xs={lxv_decision.get('xs_consideradas',[])}, xg={lxv_decision.get('x_ganadora','--')})"
-                                )
+                                fresh_ok, fresh_motivo, fresh_info = validar_frescura_x_lxv(lxv_decision, lxv_columnas)
+                                if not fresh_ok:
+                                    now_fresh = time.time()
+                                    msg_fresh = f"🧭 LXV 5V1X descartado: {fresh_motivo}"
+                                    if (msg_fresh != _LXV_FRESH_LAST_MSG) or ((now_fresh - float(_LXV_FRESH_LAST_TS or 0.0)) >= float(LXV_FRESH_EVENT_COOLDOWN_S)):
+                                        agregar_evento(msg_fresh)
+                                        globals()["_LXV_FRESH_LAST_MSG"] = msg_fresh
+                                        globals()["_LXV_FRESH_LAST_TS"] = float(now_fresh)
+                                else:
+                                    candidatos = [(1.0, bot_lxv, 0.0, 0.0, 0.0, 0, 0.0, 0.0)]
+                                    edad_ok = float((fresh_info or {}).get("edad_x", 0.0) or 0.0)
+                                    col_ok = (fresh_info or {}).get("col_visible", lxv_decision.get("col_visible", "--"))
+                                    agregar_evento(
+                                        f"🧭 LXV LASTCOL {lxv_decision.get('pattern','--')} → {bot_lxv} "
+                                        f"(col_visible={lxv_decision.get('col_visible','--')}, xs={lxv_decision.get('xs_consideradas',[])}, "
+                                        f"xg={lxv_decision.get('x_ganadora','--')}, fresh=OK edad={edad_ok:.2f}s)"
+                                    )
+                                    agregar_evento(f"🧭 LXV FRESH_X OK → {bot_lxv} edad={edad_ok:.2f}s col={col_ok}")
                         else:
                             try:
                                 now_lxv = time.time()
