@@ -1455,11 +1455,39 @@ def validar_frescura_x_lxv(lxv_decision, columnas):
             "edad_x": edad_x,
             "max_age": max_age,
             "col_visible": col_visible,
+            "last_closed_ts": float(last_closed_ts),
             "fresh_mode": "time_only_40pct",
         }
 
     except Exception as e:
         return False, "fresh_exception", {"error": repr(e)[:180]}
+
+
+def resolver_oportunidad_lxv_id(lxv_decision: dict | None, fresh_info: dict | None = None) -> int | None:
+    """
+    Genera un identificador monotónico de oportunidad LXV operable.
+    No usa `col_visible` para anti-repeat.
+    """
+    global LXV_OPORTUNIDAD_ID, LXV_ULTIMA_FIRMA_OPORTUNIDAD
+    try:
+        if not isinstance(lxv_decision, dict):
+            return None
+        if str(lxv_decision.get("pattern", "")) != "5V1X":
+            return None
+        bot = str(lxv_decision.get("bot_objetivo", "") or "").strip()
+        if bot not in BOT_NAMES:
+            return None
+        info = fresh_info if isinstance(fresh_info, dict) else {}
+        ts = info.get("last_closed_ts", None)
+        if ts is None:
+            return None
+        firma = (bot, round(float(ts), 3))
+        if firma != LXV_ULTIMA_FIRMA_OPORTUNIDAD:
+            LXV_OPORTUNIDAD_ID = int(LXV_OPORTUNIDAD_ID) + 1
+            LXV_ULTIMA_FIRMA_OPORTUNIDAD = firma
+        return int(LXV_OPORTUNIDAD_ID)
+    except Exception:
+        return None
 
 
 def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> dict | None:
@@ -7999,7 +8027,7 @@ def _reset_rotacion_marti(motivo: str = "") -> None:
     try:
         bots_usados_en_esta_marti = []
         if motivo:
-            agregar_evento(f"♻️ Rotación Martingala reiniciada: {motivo}")
+            agregar_evento(f"♻️ Auditoría de secuencia reiniciada: {motivo}")
     except Exception:
         bots_usados_en_esta_marti = []
 
@@ -8083,7 +8111,7 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
             f"reinicio automático a C1 ({marti_audit_resumen_linea()})."
         )
     elif res == "PÉRDIDA":
-        # Registrar el bot operado en la corrida activa para forzar rotación C2..C{MAX_CICLOS}.
+        # Registrar solo para auditoría visual/histórica (no bloquea selección REAL).
         if bot in BOT_NAMES:
             _registrar_bot_usado_marti(bot)
 
@@ -8122,7 +8150,7 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
     if res == "PÉRDIDA" and bots_usados_en_esta_marti:
         try:
             usados = ",".join(bots_usados_en_esta_marti)
-            agregar_evento(f"🔁 Rotación martingala activa: usados={usados} | próximo ciclo=C{ciclo_sig}")
+            agregar_evento(f"🔎 Auditoría secuencia bots: usados={usados} | próximo ciclo=C{ciclo_sig}")
         except Exception:
             pass
     agregar_evento(
@@ -12392,7 +12420,7 @@ def forzar_real_manual(bot: str, ciclo: int):
             return
         _registrar_bot_usado_marti(bot)
         try:
-            agregar_evento(f"🔁 Bot registrado en rotación Martingala: {bot} | usados={','.join(_normalizar_lista_bots_usados_marti())}")
+            agregar_evento(f"🔎 Bot registrado en auditoría de secuencia: {bot} | usados={','.join(_normalizar_lista_bots_usados_marti())}")
         except Exception:
             pass
 
@@ -14714,6 +14742,9 @@ async def main():
                                     # liberarlo antes de emitir la nueva orden para no bloquear rotación.
                                     owner_prev = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
                                     if owner_prev and owner_prev != mejor_bot and ciclo_auto > 1:
+                                        cerrar_por_fin_de_ciclo(owner_prev, f"Handoff secuencia C{ciclo_auto}→{mejor_bot}")
+                                    owner_prev = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+                                    if owner_prev and owner_prev != mejor_bot and ciclo_auto > 1:
                                         cerrar_por_fin_de_ciclo(owner_prev, f"Handoff rotación C{ciclo_auto}→{mejor_bot}")
 
                                     ok_real = escribir_orden_real(
@@ -14725,7 +14756,7 @@ async def main():
                                         _registrar_bot_usado_marti(mejor_bot)
                                         try:
                                             agregar_evento(
-                                                f"🔁 Bot registrado en rotación Martingala: {mejor_bot} | usados={','.join(_normalizar_lista_bots_usados_marti())}"
+                                                f"🔎 Bot registrado en auditoría de secuencia: {mejor_bot} | usados={','.join(_normalizar_lista_bots_usados_marti())}"
                                             )
                                         except Exception:
                                             pass
