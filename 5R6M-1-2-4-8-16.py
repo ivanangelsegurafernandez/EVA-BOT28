@@ -772,6 +772,9 @@ marti_ciclos_perdidos = 0
 # - Si el HUD está en C1, se puede repetir bot.
 # - Si el HUD está en C2..C{MAX_CICLOS}, se prioriza no repetir; puede haber fallback controlado.
 ultimo_bot_real = None
+ANTI_REPEAT_BOT_PENDIENTE = None
+ANTI_REPEAT_FIRMA_REAL = None
+ANTI_REPEAT_FIRMA_BLOQUEADA = None
 
 # Rotación por corrida de martingala REAL (C1..C5)
 # Guarda el orden de bots usados en la corrida activa para evitar repeticiones.
@@ -1454,6 +1457,7 @@ def validar_frescura_x_lxv(lxv_decision, columnas):
             "max_age": max_age,
             "col_visible": col_visible,
             "fresh_mode": "time_only_40pct",
+            "last_closed_ts": last_closed_ts,
         }
 
     except Exception as e:
@@ -1471,13 +1475,19 @@ def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> d
             return None
 
         ciclo_objetivo = ciclo_martingala_siguiente()
-        rot_ok, rot_motivo, rot_info = validar_rotacion_bot_marti(out.get("bot_objetivo"), ciclo_objetivo)
+        firma_lxv = firma_oportunidad_lxv(out.get("bot_objetivo"), fresh_info)
+        rot_ok, rot_motivo, rot_info = validar_rotacion_bot_marti(
+            out.get("bot_objetivo"),
+            ciclo_objetivo,
+            firma_oportunidad=firma_lxv,
+        )
         if not rot_ok:
             return None
 
         out["fresh_ok"] = True
         out["fresh_motivo"] = fresh_motivo
         out["fresh_info"] = fresh_info
+        out["anti_repeat_firma"] = firma_lxv
         out["rotacion_ok"] = True
         out["rotacion_motivo"] = rot_motivo
         out["rotacion_info"] = rot_info
@@ -7957,12 +7967,9 @@ def _normalizar_lista_bots_usados_marti():
 
 
 def _bot_usado_en_marti_actual(bot: str) -> bool:
-    try:
-        b = str(bot or "").strip()
-        usados = _normalizar_lista_bots_usados_marti()
-        return b in usados
-    except Exception:
-        return False
+    # Solo auditoría visual: nunca bloquear decisiones REAL por "usados".
+    _ = bot
+    return False
 
 
 def _registrar_bot_usado_marti(bot: str) -> None:
@@ -7989,46 +7996,74 @@ def _reset_rotacion_marti(motivo: str = "") -> None:
         bots_usados_en_esta_marti = []
 
 
-def validar_rotacion_bot_marti(bot: str, ciclo_objetivo: int | None = None) -> tuple[bool, str, dict]:
+def firma_oportunidad_lxv(bot, fresh_info):
     """
-    Evita repetir el mismo bot dentro de una misma Martingala C1..C5.
-    C1 siempre puede iniciar si no hay Martingala activa.
-    C2..C5 deben usar bots distintos.
+    Devuelve firma estable de oportunidad LXV.
+    Usa fresh_info["last_closed_ts"] si existe.
+    Formato: (bot, round(float(last_closed_ts), 3))
+    Si no hay last_closed_ts, devuelve None.
     """
+    try:
+        b = str(bot or "").strip()
+        if b not in BOT_NAMES:
+            return None
+        info = fresh_info if isinstance(fresh_info, dict) else {}
+        ts = info.get("last_closed_ts", None)
+        if ts is None:
+            return None
+        return (b, round(float(ts), 3))
+    except Exception:
+        return None
+
+
+def marcar_anti_repeat_post_real(bot, firma):
+    """
+    Se llama solo cuando se acaba de enviar una orden REAL correctamente.
+    Guarda el bot que acaba de invertir y la firma de esa oportunidad.
+    """
+    global ultimo_bot_real, ANTI_REPEAT_BOT_PENDIENTE, ANTI_REPEAT_FIRMA_REAL, ANTI_REPEAT_FIRMA_BLOQUEADA
+    ultimo_bot_real = bot
+    ANTI_REPEAT_BOT_PENDIENTE = bot
+    ANTI_REPEAT_FIRMA_REAL = firma
+    ANTI_REPEAT_FIRMA_BLOQUEADA = None
+
+
+def validar_rotacion_bot_marti(bot: str, ciclo_objetivo: int | None = None, firma_oportunidad=None) -> tuple[bool, str, dict]:
+    _ = ciclo_objetivo
+    global ANTI_REPEAT_BOT_PENDIENTE, ANTI_REPEAT_FIRMA_REAL, ANTI_REPEAT_FIRMA_BLOQUEADA
     try:
         b = str(bot or "").strip()
         if b not in BOT_NAMES:
             return False, "bot_invalido", {"bot": b}
 
-        usados = _normalizar_lista_bots_usados_marti()
+        if ANTI_REPEAT_BOT_PENDIENTE is None:
+            return True, "rotacion_ok", {"bot": b}
 
-        try:
-            ciclo = int(ciclo_objetivo) if ciclo_objetivo is not None else int(ciclo_martingala_siguiente())
-        except Exception:
-            ciclo = 1
+        if b != str(ANTI_REPEAT_BOT_PENDIENTE):
+            return True, "rotacion_ok_otro_bot", {"bot": b, "anti_repeat_bot_pendiente": ANTI_REPEAT_BOT_PENDIENTE}
 
-        try:
-            perdidas = int(marti_ciclos_perdidos)
-        except Exception:
-            perdidas = 0
+        if firma_oportunidad is None:
+            agregar_evento(f"⛔ Anti-repeat: {b} bloqueado solo esta oportunidad")
+            return False, "anti_repeat_sin_firma", {"bot": b}
 
-        if ciclo <= 1 or perdidas <= 0:
-            if usados:
-                _reset_rotacion_marti("nuevo_C1")
-            return True, "rotacion_ok_c1", {"bot": b, "ciclo": ciclo, "usados": list(bots_usados_en_esta_marti)}
+        if firma_oportunidad == ANTI_REPEAT_FIRMA_REAL:
+            agregar_evento(f"⛔ Anti-repeat: {b} bloqueado solo esta oportunidad")
+            return False, "anti_repeat_misma_firma_real", {"bot": b, "firma": firma_oportunidad}
 
-        if b in usados:
-            return False, "bot_repetido_en_marti", {
-                "bot": b,
-                "ciclo": ciclo,
-                "usados": list(usados),
-            }
+        if ANTI_REPEAT_FIRMA_BLOQUEADA is None:
+            ANTI_REPEAT_FIRMA_BLOQUEADA = firma_oportunidad
+            agregar_evento(f"⛔ Anti-repeat: {b} bloqueado solo esta oportunidad")
+            return False, "anti_repeat_oportunidad_inmediata", {"bot": b, "firma": firma_oportunidad}
 
-        return True, "rotacion_ok", {
-            "bot": b,
-            "ciclo": ciclo,
-            "usados": list(usados),
-        }
+        if firma_oportunidad == ANTI_REPEAT_FIRMA_BLOQUEADA:
+            agregar_evento(f"⛔ Anti-repeat: {b} bloqueado solo esta oportunidad")
+            return False, "anti_repeat_misma_firma_bloqueada", {"bot": b, "firma": firma_oportunidad}
+
+        ANTI_REPEAT_BOT_PENDIENTE = None
+        ANTI_REPEAT_FIRMA_REAL = None
+        ANTI_REPEAT_FIRMA_BLOQUEADA = None
+        agregar_evento(f"✅ Anti-repeat liberado: {b} puede volver a competir")
+        return True, "rotacion_ok_liberado", {"bot": b, "firma": firma_oportunidad}
 
     except Exception as e:
         return False, "rotacion_exception", {"error": repr(e)[:180]}
@@ -8174,58 +8209,8 @@ def elegir_candidato_rotacion_marti(
     allow_repeat_fallback: bool = False,
     repeat_min_prob: float = 0.70,
 ):
-    """
-    Rotación para REAL en C2..C{MAX_CICLOS}:
-    - Prioriza bots no usados en la corrida activa.
-    - Excluye además el último bot REAL operado para impedir repetición inmediata.
-    - Si no hay bot nuevo elegible:
-      * retorna None por defecto (modo estricto), o
-      * permite repetir SOLO si `allow_repeat_fallback=True` y la probabilidad
-        operativa del candidato cumple `repeat_min_prob`.
-
-    El fallback protege continuidad de ciclo C2..C6 sin abrir la compuerta a
-    repeticiones indiscriminadas.
-    """
-    try:
-        ciclo = int(ciclo_objetivo)
-    except Exception:
-        ciclo = 1
-
-    if ciclo <= 1 or not candidatos:
-        return candidatos[0] if candidatos else None
-
-    usados = [b for b in bots_usados_en_esta_marti if b in BOT_NAMES]
-    usados_set = set(usados)
-    if ultimo_bot_real in BOT_NAMES:
-        usados_set.add(str(ultimo_bot_real))
-
-    candidatos_nuevos = [c for c in candidatos if c[1] not in usados_set]
-    if candidatos_nuevos:
-        return candidatos_nuevos[0]
-
-    if bool(allow_repeat_fallback):
-        try:
-            min_prob = float(repeat_min_prob)
-        except Exception:
-            min_prob = 0.70
-        # Blindaje defensivo: mantener umbral dentro de rango probabilístico.
-        min_prob = max(0.0, min(1.0, min_prob))
-        for c in candidatos:
-            # Tupla esperada: (score, bot, p_model, p_oper, ...)
-            if not isinstance(c, (tuple, list)):
-                continue
-            if len(c) <= 2:
-                continue
-            p_oper = c[3] if len(c) > 3 else c[2]
-            try:
-                p_val = float(p_oper)
-                p_ok = (p_val == p_val) and (p_val >= min_prob)  # NaN-safe
-            except Exception:
-                p_ok = False
-            if p_ok:
-                return c
-
-    return None
+    _ = (ciclo_objetivo, allow_repeat_fallback, repeat_min_prob)
+    return candidatos[0] if candidatos else None
 
 # === FIN BLOQUE 9 ===
 
@@ -14602,21 +14587,17 @@ async def main():
                                         globals()["_LXV_FRESH_LAST_TS"] = float(now_fresh)
                                 else:
                                     ciclo_objetivo_lxv = ciclo_martingala_siguiente()
-                                    rot_ok, rot_motivo, rot_info = validar_rotacion_bot_marti(bot_lxv, ciclo_objetivo_lxv)
+                                    firma_lxv = firma_oportunidad_lxv(bot_lxv, fresh_info)
+                                    lxv_decision["anti_repeat_firma"] = firma_lxv
+                                    rot_ok, rot_motivo, rot_info = validar_rotacion_bot_marti(
+                                        bot_lxv,
+                                        ciclo_objetivo_lxv,
+                                        firma_oportunidad=firma_lxv,
+                                    )
                                     if not rot_ok:
                                         candidatos = []
                                         now_rot = time.time()
-                                        usados_rot = []
-                                        try:
-                                            if isinstance(rot_info, dict):
-                                                usados_rot = list(rot_info.get("usados", []) or [])
-                                        except Exception:
-                                            usados_rot = []
-                                        usados_txt = ",".join([str(u).strip() for u in usados_rot if str(u).strip()]) or "-"
-                                        msg_rot = (
-                                            f"🔁 LXV 5V1X descartado por rotación: {bot_lxv} ya usado en esta Martingala "
-                                            f"| ciclo=C{int(ciclo_objetivo_lxv)} | usados={usados_txt}"
-                                        )
+                                        msg_rot = f"⛔ Anti-repeat: {bot_lxv} bloqueado solo esta oportunidad"
                                         if (msg_rot != _LXV_ROT_LAST_MSG) or ((now_rot - float(_LXV_ROT_LAST_TS or 0.0)) >= float(LXV_FRESH_EVENT_COOLDOWN_S)):
                                             agregar_evento(msg_rot)
                                             globals()["_LXV_ROT_LAST_MSG"] = msg_rot
@@ -14738,6 +14719,7 @@ async def main():
 
                                     ok_real = escribir_orden_real(mejor_bot, ciclo_auto)
                                     if ok_real:
+                                        marcar_anti_repeat_post_real(mejor_bot, (lxv_decision or {}).get("anti_repeat_firma"))
                                         _registrar_bot_usado_marti(mejor_bot)
                                         try:
                                             agregar_evento(
