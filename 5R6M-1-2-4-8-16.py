@@ -772,10 +772,8 @@ marti_ciclos_perdidos = 0
 # - Cualquier bot puede invertir en cualquier ciclo C1..C{MAX_CICLOS}.
 # - Solo se bloquea la repetición inmediata del MISMO bot en la oportunidad/columna siguiente.
 ultimo_bot_real = None
-ultima_oportunidad_real = None
+ultima_columna_real = None
 ANTI_REPEAT_COLUMNAS = 1
-LXV_OPORTUNIDAD_ID = 0
-LXV_ULTIMA_FIRMA_OPORTUNIDAD = None
 
 # Rotación por corrida de martingala REAL (C1..C5)
 # Guarda el orden de bots usados en la corrida activa para evitar repeticiones.
@@ -1503,11 +1501,10 @@ def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> d
             return None
 
         ciclo_objetivo = ciclo_martingala_siguiente()
-        oportunidad_actual = resolver_oportunidad_lxv_id(out, fresh_info)
         rot_ok, rot_motivo, rot_info = validar_rotacion_bot_marti(
             out.get("bot_objetivo"),
             ciclo_objetivo,
-            oportunidad_actual=oportunidad_actual,
+            columna_actual=out.get("col_visible"),
         )
         if not rot_ok:
             return None
@@ -2791,8 +2788,8 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
     except Exception:
         pass
 
-def escribir_orden_real(bot: str, ciclo: int, oportunidad_actual: int | None = None) -> bool:
-    global REAL_OWNER_LOCK, ultimo_bot_real, ultima_oportunidad_real
+def escribir_orden_real(bot: str, ciclo: int, columna_visible: int | None = None) -> bool:
+    global REAL_OWNER_LOCK, ultimo_bot_real, ultima_columna_real
     """
     Wrapper oficial:
     - Escribe orden_real.json (RAW)
@@ -2839,9 +2836,9 @@ def escribir_orden_real(bot: str, ciclo: int, oportunidad_actual: int | None = N
         if bot in BOT_NAMES:
             ultimo_bot_real = str(bot)
         try:
-            ultima_oportunidad_real = int(oportunidad_actual) if oportunidad_actual is not None else None
+            ultima_columna_real = int(columna_visible) if columna_visible is not None else None
         except Exception:
-            ultima_oportunidad_real = None
+            ultima_columna_real = None
         _marti_audit_log_orden(ciclo, bot=bot, origen="escribir_orden_real")
         if int(ciclo) == 1:
             agregar_evento("🟢 MARTI-AUDIT: apertura explícita en C1 (nuevo ciclo confirmado).")
@@ -7739,8 +7736,7 @@ def detectar_martingala_perdida_completa(bot):
 # Reinicio completo - Corregido para no resetear métricas en modo suave
 def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True):
     global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos
-    global ultimo_bot_real, ultima_oportunidad_real, bots_usados_en_esta_marti, REAL_OWNER_LOCK
-    global LXV_OPORTUNIDAD_ID, LXV_ULTIMA_FIRMA_OPORTUNIDAD
+    global ultimo_bot_real, ultima_columna_real, bots_usados_en_esta_marti, REAL_OWNER_LOCK
     with file_lock():
         write_token_atomic(TOKEN_FILE, "REAL:none")
     
@@ -7800,9 +7796,7 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
     marti_activa = False
     marti_ciclos_perdidos = 0
     ultimo_bot_real = None
-    ultima_oportunidad_real = None
-    LXV_OPORTUNIDAD_ID = 0
-    LXV_ULTIMA_FIRMA_OPORTUNIDAD = None
+    ultima_columna_real = None
     bots_usados_en_esta_marti = []
     REAL_OWNER_LOCK = None
     LIMPIEZA_PANEL_HASTA = time.time() + limpiar_visual_segundos
@@ -8041,7 +8035,7 @@ def _reset_rotacion_marti(motivo: str = "") -> None:
 def validar_rotacion_bot_marti(
     bot: str,
     ciclo_objetivo: int | None = None,
-    oportunidad_actual: int | None = None,
+    columna_actual: int | None = None,
 ) -> tuple[bool, str, dict]:
     """
     Regla oficial anti-repeat:
@@ -8054,20 +8048,20 @@ def validar_rotacion_bot_marti(
             return False, "bot_invalido", {"bot": b}
 
         try:
-            op_actual = int(oportunidad_actual) if oportunidad_actual is not None else None
+            col_act = int(columna_actual) if columna_actual is not None else None
         except Exception:
-            op_actual = None
+            col_act = None
         try:
-            op_prev = int(ultima_oportunidad_real) if ultima_oportunidad_real is not None else None
+            col_prev = int(ultima_columna_real) if ultima_columna_real is not None else None
         except Exception:
-            op_prev = None
+            col_prev = None
 
         info = {
             "bot": b,
             "ciclo": int(ciclo_objetivo) if ciclo_objetivo is not None else int(ciclo_martingala_siguiente()),
             "ultimo_bot_real": ultimo_bot_real,
-            "ultima_oportunidad_real": op_prev,
-            "oportunidad_actual": op_actual,
+            "ultima_columna_real": col_prev,
+            "columna_actual": col_act,
             "anti_repeat_columnas": int(ANTI_REPEAT_COLUMNAS),
             "usados": list(_normalizar_lista_bots_usados_marti()),  # solo auditoría visual
         }
@@ -8076,12 +8070,12 @@ def validar_rotacion_bot_marti(
             return True, "anti_repeat_sin_historial", info
         if b != str(ultimo_bot_real):
             return True, "anti_repeat_bot_distinto", info
-        if op_prev is None or op_actual is None:
-            return True, "anti_repeat_sin_oportunidad", info
+        if col_prev is None or col_act is None:
+            return True, "anti_repeat_sin_columna", info
 
-        limite = int(op_prev) + int(ANTI_REPEAT_COLUMNAS)
-        info["limite_bloqueo"] = limite
-        if int(op_actual) <= limite:
+        delta = int(col_act) - int(col_prev)
+        info["delta_col"] = delta
+        if 0 <= delta <= int(ANTI_REPEAT_COLUMNAS):
             return False, "anti_repeat_bloqueado", info
         return True, "anti_repeat_liberado", info
 
@@ -12412,18 +12406,16 @@ def forzar_real_manual(bot: str, ciclo: int):
             estado_bots[bot]["ia_prob_senal"] = None
 
 
-        oportunidad_manual = None
+        col_manual = None
         try:
             cols_manual = construir_columnas_lxv(estado_bots)
             dec_manual = detectar_lxv(cols_manual, estado_bots, contexto={"prioridad_historica": LXV_PRIORIDAD_HISTORICA})
-            if isinstance(dec_manual, dict) and str(dec_manual.get("pattern", "")) == "5V1X":
-                fresh_ok_m, _, fresh_info_m = validar_frescura_x_lxv(dec_manual, cols_manual)
-                if fresh_ok_m:
-                    oportunidad_manual = resolver_oportunidad_lxv_id(dec_manual, fresh_info_m)
+            if isinstance(dec_manual, dict):
+                col_manual = dec_manual.get("col_visible")
         except Exception:
-            oportunidad_manual = None
+            col_manual = None
 
-        if not escribir_orden_real(bot, ciclo, oportunidad_actual=oportunidad_manual):
+        if not escribir_orden_real(bot, ciclo, columna_visible=col_manual):
             agregar_evento(f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL.")
             return
         _registrar_bot_usado_marti(bot)
@@ -14622,11 +14614,10 @@ async def main():
                                         globals()["_LXV_FRESH_LAST_TS"] = float(now_fresh)
                                 else:
                                     ciclo_objetivo_lxv = ciclo_martingala_siguiente()
-                                    oportunidad_actual_lxv = resolver_oportunidad_lxv_id(lxv_decision, fresh_info)
                                     rot_ok, rot_motivo, rot_info = validar_rotacion_bot_marti(
                                         bot_lxv,
                                         ciclo_objetivo_lxv,
-                                        oportunidad_actual=oportunidad_actual_lxv,
+                                        columna_actual=lxv_decision.get("col_visible"),
                                     )
                                     if not rot_ok:
                                         candidatos = []
@@ -14752,11 +14743,14 @@ async def main():
                                     owner_prev = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
                                     if owner_prev and owner_prev != mejor_bot and ciclo_auto > 1:
                                         cerrar_por_fin_de_ciclo(owner_prev, f"Handoff secuencia C{ciclo_auto}→{mejor_bot}")
+                                    owner_prev = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+                                    if owner_prev and owner_prev != mejor_bot and ciclo_auto > 1:
+                                        cerrar_por_fin_de_ciclo(owner_prev, f"Handoff rotación C{ciclo_auto}→{mejor_bot}")
 
                                     ok_real = escribir_orden_real(
                                         mejor_bot,
                                         ciclo_auto,
-                                        oportunidad_actual=oportunidad_actual_lxv,
+                                        columna_visible=(lxv_decision or {}).get("col_visible"),
                                     )
                                     if ok_real:
                                         _registrar_bot_usado_marti(mejor_bot)
